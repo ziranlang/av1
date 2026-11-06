@@ -1,4 +1,5 @@
 using Codec :: #import "image_codec/api"
+Simd :: #import "std/simd"
 
 // AV1 scalar CDEF direction/filter semantics. Reference tables also appear in
 // libaom d772e334cc724105040382a977ebb10dfd393293, av1/common/cdef_block.c.
@@ -93,9 +94,6 @@ CdefDampingShift :: (threshold: s32, damping: s32) -> u32 {
     shift := damping - log; if shift < 0 { shift = 0 }
     return cast(u32)shift
 }
-CdefFloor16 :: (value: s32) -> s32 {
-    return ifx value < 0 then -((-value + 15) / 16) else value / 16
-}
 
 #scope_export
 // Input starts at the top-left of a two-sample halo. Missing neighbors must
@@ -150,8 +148,10 @@ CdefPadded :: struct { samples: [256]u16; }
 
 // The filter of a validated block padded to 16 samples per row: halo row r,
 // column c is samples[r * 16 + c], written to output rows output_stride
-// apart. Each pass filters eight samples, one row of an 8-wide block or two
-// rows of a 4-wide one, so a tap's loop over them is straight-line code.
+// apart. Each pass filters eight samples as one s16x8 vector, one row of an
+// 8-wide block or two rows of a 4-wide one. Every intermediate fits s16:
+// samples and the missing value are at most 30000, constrained differences
+// at most 240 and the weighted sum at most 12 * 4 * 240.
 // A missing neighbor is 30000, at least 25905 above any sample; shifted by at
 // most 10 - log2(threshold) its magnitude still exceeds the threshold, so its
 // constrained difference is zero and it is left out of the maximum only.
@@ -160,7 +160,7 @@ CdefPadded :: struct { samples: [256]u16; }
 // clamp is skipped.
 CdefFilterPadded :: (block: *CdefPadded, width: s32, height: s32,
     primary_strength: s32, secondary_strength: s32, damping: s32, direction: s32, bit_depth: s32,
-    output: []u16, output_stride: s32) {
+    output: []u16, output_stride: s32) #target {
     scale := cast(s32)(cast(u32)1 << cast(u32)(bit_depth - 8))
     directions: [32]s32 = .[-1,1,-2,2,0,1,-1,2,0,1,0,2,0,1,1,2,1,1,2,2,1,0,2,1,1,0,2,0,1,0,2,-1]
     primary_taps: [4]s32 = .[4,2,3,3]
@@ -190,59 +190,58 @@ CdefFilterPadded :: (block: *CdefPadded, width: s32, height: s32,
         }
     }
     clamp := primary_strength != 0 && secondary_strength != 0
-    // In a 4-wide block lane k is column k & 3 of row first + (k >> 2); the
-    // second row starts 16 samples on, 12 past the fourth lane.
-    pitch := (cast(s64)width & 4) * 3
     rows: s64 = ifx width == 4 then 2 else 1
+    zero := Simd.Zero(s16x8)
+    missing := Simd.Splat(s16x8, cast(s16)CdefMissingSample)
+    eight := Simd.Splat(s16x8, 8)
     for pass: 0..7 {
         first := pass * rows
         if first >= cast(s64)height || first > 7 { break }
         line := first * 16
-        // Every intermediate fits s16: samples and the missing value are at
-        // most 30000, constrained differences at most 240 and the weighted
-        // sum at most 12 * 4 * 240.
-        currents: [8]s16; sums: [8]s16; lows: [8]s16; highs: [8]s16
-        for lane: 0..7 {
-            current := cast(s16)block.samples[line + 34 + lane + (lane >> 2) * pitch]
-            currents[lane] = current; lows[lane] = current; highs[lane] = current
+        // In a 4-wide block the second row's four samples are the upper lanes.
+        current: s16x8
+        if width == 4 {
+            upper := Simd.Reinterpret(u64x2, Simd.LoadLow(u16x8, block.samples, line + 34))
+            lower := Simd.Reinterpret(u64x2, Simd.LoadLow(u16x8, block.samples, line + 50))
+            current = Simd.Reinterpret(s16x8, Simd.InterleaveLow(upper, lower))
+        } else {
+            current = Simd.Reinterpret(s16x8, Simd.Load(u16x8, block.samples, line + 34))
         }
+        sums := zero; lows := current; highs := current
         for tap: 0..11 {
             if tap >= cast(s64)taps { break }
             // Offsets lie in 0..68, so every read stays in the block.
             offset := tap_offsets[tap]
-            threshold := cast(s16)tap_thresholds[tap]; shift := cast(s16)(tap_shifts[tap] & 15)
-            weight := cast(s16)tap_weights[tap]
+            threshold := Simd.Splat(s16x8, cast(s16)tap_thresholds[tap])
+            shift := tap_shifts[tap] & 15
+            weight := Simd.Splat(s16x8, cast(s16)tap_weights[tap])
             if offset < 0 || offset > 68 { continue }
-            neighbors: [8]s16
-            for lane: 0..3 { neighbors[lane] = cast(s16)block.samples[line + offset + lane] }
-            for lane: 4..7 { neighbors[lane] = cast(s16)block.samples[line + offset + lane + pitch] }
-            for lane: 0..7 {
-                value := neighbors[lane]
-                difference := value - currents[lane]
-                magnitude := ifx difference < 0 then -difference else difference
-                constrained := threshold - (magnitude >> shift)
-                if constrained < 0 { constrained = 0 }
-                if constrained > magnitude { constrained = magnitude }
-                sums[lane] += weight * (ifx difference < 0 then -constrained else constrained)
-                if value < lows[lane] { lows[lane] = value }
-                real: s16 = ifx value == CdefMissingSample then 0 else value
-                if real > highs[lane] { highs[lane] = real }
+            value: s16x8
+            if width == 4 {
+                upper := Simd.Reinterpret(u64x2, Simd.LoadLow(u16x8, block.samples, line + offset))
+                lower := Simd.Reinterpret(u64x2, Simd.LoadLow(u16x8, block.samples, line + offset + 16))
+                value = Simd.Reinterpret(s16x8, Simd.InterleaveLow(upper, lower))
+            } else {
+                value = Simd.Reinterpret(s16x8, Simd.Load(u16x8, block.samples, line + offset))
             }
+            difference := Simd.Sub(value, current)
+            magnitude := Simd.Abs(difference)
+            constrained := Simd.Max(zero, Simd.Sub(threshold, Simd.ShiftRight(magnitude, shift)))
+            constrained = Simd.Min(constrained, magnitude)
+            signed := Simd.Select(Simd.Less(difference, zero), Simd.Neg(constrained), constrained)
+            sums = Simd.Add(sums, Simd.Mul(weight, signed))
+            lows = Simd.Min(lows, value)
+            highs = Simd.Max(highs, Simd.AndNot(value, Simd.Equal(value, missing)))
         }
-        results: [8]s32
-        for lane: 0..7 {
-            sum := cast(s32)sums[lane]
-            negative: s32 = ifx sum < 0 then 1 else 0
-            value := cast(s32)currents[lane] + CdefFloor16(8 + sum - negative)
-            if clamp {
-                if value < cast(s32)lows[lane] { value = cast(s32)lows[lane] }
-                if value > cast(s32)highs[lane] { value = cast(s32)highs[lane] }
-            }
-            results[lane] = value
-        }
-        for lane: 0..7 {
-            row := first + (lane >> 2) * (rows - 1); column := lane & (cast(s64)width - 1)
-            output[row * output_stride + column] = cast(u16)results[lane]
+        // (8 + sum - (sum < 0)) >> 4, the comparison being -1 where sum < 0.
+        result := Simd.Add(current, Simd.ShiftRight(Simd.Add(Simd.Add(sums, eight), Simd.Less(sums, zero)), 4))
+        if clamp { result = Simd.Min(Simd.Max(result, lows), highs) }
+        out := Simd.Reinterpret(u16x8, result)
+        if width == 4 {
+            Simd.StoreLow(output, first * output_stride, out)
+            Simd.StoreLow(output, (first + 1) * output_stride, Simd.ShiftBytesRight(out, 8))
+        } else {
+            Simd.Store(output, first * output_stride, out)
         }
     }
 }

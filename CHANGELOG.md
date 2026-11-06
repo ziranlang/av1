@@ -12,3 +12,4 @@
 - Faster entropy decoding, inverse transforms, dequantization and 4-wide CDEF.
 - Faster CDEF direction search and filtering.
 - Faster self-guided restoration.
+- CDEF filtering on SIMD vectors.

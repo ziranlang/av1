@@ -424,6 +424,9 @@ validated before filtering; errors and cancellation return no committed samples.
 The primary strength accepts the intermediate high-bit-depth values produced
 by normative luma variance adjustment. `CdefFilterPadded` is the filter alone for a validated block padded to 16
 samples per row, written at any output stride; the frame CDEF pass uses it.
+It filters eight samples per `std/simd` `s16x8` vector and is a `#target`
+procedure, so native x86-64 C picks SSE2, SSSE3, SSE4.1 or AVX2 at run time;
+every target gives the same bits.
 `CdefDirectionOf` is the direction search alone for an 8x8 block of real
 samples, also used by the frame pass.
 
@@ -871,12 +874,17 @@ Then, on newer Ziran range proofs and the `#cold` modifier:
 - `filter/sgr.zi`: short guards restate the caller's bounds, so the box sums
   and the projection read and write without bounds checks.
 
-It now takes 9 to 196 ms per frame, the medians of one benchmark run: 2 to 6
-times libaom and 4 to 11 times dav1d. Entropy decoding is the largest remaining cost. The
+Then, on Ziran's `std/simd` vectors:
+
+- `filter/cdef.zi`: the filter runs each pass of eight samples as one
+  `s16x8` vector, with SSE2 to AVX2 chosen at run time.
+
+It now takes 9 to 176 ms per frame, the medians of one benchmark run: 2 to 5
+times libaom and 4 to 9 times dav1d. Entropy decoding is the largest remaining cost. The
 generated C still bounds-checks indices it cannot prove, such as row times
-stride, and calls the symbol decoder out of line. Only the C compiler's own
-vectorization is used: no hand-written SIMD path, thread, other machine,
-cold start or energy figure has been measured.
+stride, and calls the symbol decoder out of line. CDEF filtering is the only
+hand-written SIMD path; no thread, other machine, cold start or energy figure
+has been measured.
 
 ## Specification and provenance
 

@@ -22,7 +22,9 @@ def main():
         'TransformCoefficientContexts','TransformTypeResult','QuantizerIndex','CoefficientSymbol','TileGroupCursor','TileSpanResult']
     host=a.out/'native_layout.c'
     # Every generated product header; the test entry's own header declares main.
-    headers=''.join(f'#include "{path.name}"\n' for path in sorted((a.out/'source').glob('*.h')) if not path.name.startswith('av1_'))
+    # ziran_simd.h includes its per-tier fragment ziran_simd_ops.h itself.
+    headers=''.join(f'#include "{path.name}"\n' for path in sorted((a.out/'source').glob('*.h'))
+        if not path.name.startswith('av1_') and path.name!='ziran_simd_ops.h')
     host.write_text(headers+'#include <stdio.h>\n'+'int main(void) {\n'+
         ''.join(f'printf("{name} %zu\\n",sizeof({name}));\n' for name in types)+'return 0;\n}\n')
     command=shlex.split(os.environ.get('CC','cc'))+['-std=c11','-O2','-I'+str(a.out/'source'),
