@@ -98,8 +98,9 @@ RangeReady :: (decoder: *RangeDecoder) -> bool {
 
 // AV1 8.2.6 renormalization after the range shrank to the decoded symbol.
 RangeRenormalize :: (decoder: *RangeDecoder) {
-    shifts: s32
-    while decoder.range < 32768 { decoder.range <<= 1; shifts += 1 }
+    // The range is below 65536, so its leading zeros past 16 are the shift.
+    shifts := cast(s32)clz(decoder.range) - 16
+    decoder.range <<= cast(u32)shifts
     count := cast(s32)(ifx decoder.max_bits < shifts then (ifx decoder.max_bits > 0 then decoder.max_bits else 0) else cast(s64)shifts)
     padded := ReadBits(*decoder.bits, count) << cast(u32)(shifts - count)
     decoder.value = padded ^ (((decoder.value + 1) << cast(u32)shifts) - 1)

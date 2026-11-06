@@ -435,6 +435,8 @@ vertical three-tap coefficient sets. It validates the normative tap ranges,
 performs horizontal filtering before vertical filtering, and applies the
 bit-depth-specific signed rounding and intermediate clipping. Chroma callers
 must supply outer tap zero. Output has stride 8 and commits only on success.
+The frame post-filter calls the unchecked kernel `WienerFilterInto` on its
+in-range unit parameters, writing straight into the frame at its stride.
 
 `build-queue -- sh tests/av1_wiener.sh` passed 576 vectors against the pinned
 libaom scalar function and an independent normative reference, covering
@@ -447,6 +449,7 @@ up to 8x8 with the same three-pixel halo contract. It directly computes the
 two normative box-filter passes and signed projection with bounded 64-bit
 intermediates. All 16 parameter sets are supported. Projection coefficients
 use `LrSgrXqd` semantics, including the implicit values for disabled passes.
+The frame post-filter calls the unchecked kernel `SgrFilterInto` the same way.
 
 `build-queue -- sh tests/av1_sgr.sh` passed 1,536 vectors against the pinned
 libaom scalar function and an independent normative reference. It covers
@@ -817,11 +820,23 @@ changes, each with identical output:
 - `transform/quantization.zi` and `decode/residual.zi`: coefficients and
   dequantized values go to tile buffers, not 4 to 16 KB returned structs.
 
-After them it takes 16 to 360 ms per frame: 3 to 9 times libaom and 6 to 18
-times dav1d. Entropy decoding is now the largest cost. The generated C still
-bounds-checks every index and calls small helpers in other modules out of
-line. No SIMD path, thread, other machine, cold start or energy figure has
-been measured.
+After them it took 16 to 360 ms per frame. The decoder then moved onto
+newer Ziran code generation, again with identical output:
+
+- Fixed tables are module constants, shared read-only data: transform
+  cosines, quantizers, smooth weights, filter-intra taps and the self-guided
+  parameters and reciprocals. Coefficient, transform-type and grain tables
+  stay procedures, since each tile or frame copies them into mutable state.
+- `entropy/range.zi`: renormalization shifts by `clz` of the range.
+- `filter/post_filter.zi`: restoration halos resolve each row and column
+  once, and Wiener and self-guided blocks are written straight into the frame.
+
+It now takes 14 to 313 ms per frame, best of three runs on a loaded machine:
+3 to 8 times libaom and 5 to 16 times dav1d. At 8 bits entropy decoding is
+the largest cost; at 10 bits CDEF and the self-guided box sums lead. The
+generated C still bounds-checks indices it cannot prove, such as row times
+stride, and calls the symbol decoder out of line. No SIMD path, thread,
+other machine, cold start or energy figure has been measured.
 
 ## Specification and provenance
 

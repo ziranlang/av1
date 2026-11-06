@@ -45,15 +45,28 @@ FilterWienerBlock :: (input: []u16, stride: s32, width: s32, height: s32,
     for y: 0..height + 5 { for x: 0..width + 5 {
         if cast(s64)input[y * stride + x] > maximum { result.error = Error(InvalidInput); return result }
     } }
+    result.error = CancellationError(cancellation)
+    if result.error.code != DecodeOK { return result }
+    // Output commits only after the last cancellation check.
+    samples: [64]u16
+    WienerFilterInto(input, stride, width, height, horizontal, vertical, bit_depth, samples[:], 8)
+    result.error = CancellationError(cancellation)
+    if result.error.code != DecodeOK { return result }
+    result.samples = samples; result.width = width; result.height = height
+    return result
+}
+
+// The filter of a validated block, written to output rows output_stride apart.
+WienerFilterInto :: (input: []u16, stride: s32, width: s32, height: s32,
+    horizontal: []s32, vertical: []s32, bit_depth: s32, output: []u16, output_stride: s32) {
+    maximum := cast(s64)((cast(u64)1 << cast(u64)bit_depth) - 1)
     hfilter := WienerFilter(horizontal); vfilter := WienerFilter(vertical)
     round0: s32 = ifx bit_depth == 12 then 5 else 3
     round1: s32 = 14 - round0
     offset := cast(s64)(cast(u64)1 << cast(u64)(bit_depth + 7 - round0 - 1))
     limit := cast(s64)((cast(u64)1 << cast(u64)(bit_depth + 1 + 7 - round0)) - 1)
-    intermediate: [112]s64; samples: [64]u16
+    intermediate: [112]s64
     for y: 0..height + 5 {
-        result.error = CancellationError(cancellation)
-        if result.error.code != DecodeOK { return result }
         for x: 0..width - 1 {
             sum: s64
             for tap: 0..6 { sum += cast(s64)hfilter[tap] * cast(s64)input[y * stride + x + tap] }
@@ -64,18 +77,12 @@ FilterWienerBlock :: (input: []u16, stride: s32, width: s32, height: s32,
         }
     }
     for y: 0..height - 1 {
-        result.error = CancellationError(cancellation)
-        if result.error.code != DecodeOK { return result }
         for x: 0..width - 1 {
             sum: s64
             for tap: 0..6 { sum += cast(s64)vfilter[tap] * intermediate[(y + tap) * 8 + x] }
             value := WienerRound(sum, round1)
             if value < 0 { value = 0 }; if value > maximum { value = maximum }
-            samples[y * 8 + x] = cast(u16)value
+            output[y * output_stride + x] = cast(u16)value
         }
     }
-    result.error = CancellationError(cancellation)
-    if result.error.code != DecodeOK { return result }
-    result.samples = samples; result.width = width; result.height = height
-    return result
 }

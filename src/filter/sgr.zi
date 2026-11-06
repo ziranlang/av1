@@ -6,12 +6,14 @@ using Codec :: #import "image_codec/api"
 SgrBlock :: struct { samples: [64]u16; width: s32; height: s32; error: DecodeError; }
 
 // Sgr_Params row set: [r0, e0, r1, e1]; index 0/2 are the pass radii.
+SgrParameterTable :: s32.[
+    2,12,1,4,2,15,1,6,2,18,1,8,2,21,1,9,
+    2,24,1,10,2,29,1,11,2,36,1,12,2,45,1,13,
+    2,56,1,14,2,68,1,15,0,0,1,5,0,0,1,8,
+    0,0,1,11,0,0,1,14,2,30,0,0,2,75,0,0]
+
 SgrParameters :: (set: s32, pass: s32) -> s32 {
-    parameters: [64]s32 = .[2,12,1,4,2,15,1,6,2,18,1,8,2,21,1,9,
-        2,24,1,10,2,29,1,11,2,36,1,12,2,45,1,13,
-        2,56,1,14,2,68,1,15,0,0,1,5,0,0,1,8,
-        0,0,1,11,0,0,1,14,2,30,0,0,2,75,0,0]
-    return parameters[set * 4 + pass]
+    return SgrParameterTable[set * 4 + pass]
 }
 
 #scope_file
@@ -25,29 +27,25 @@ SgrRound :: (value: s64, shift: s32) -> s64 {
 }
 // A2 of each z, the reciprocal step of AV1 7.17.3: 1 at z 0,
 // (z * 256 + z / 2) / (z + 1) below 255 and 256 from 255 on.
-SgrXByXPlus1 :: () -> [256]u16 {
-    values: [256]u16 = .[
-        1,128,171,192,205,213,219,224,228,230,233,235,236,238,239,240,
-        241,242,243,243,244,244,245,245,246,246,247,247,247,247,248,248,
-        248,248,249,249,249,249,249,250,250,250,250,250,250,250,251,251,
-        251,251,251,251,251,251,251,251,252,252,252,252,252,252,252,252,
-        252,252,252,252,252,252,252,252,252,253,253,253,253,253,253,253,
-        253,253,253,253,253,253,253,253,253,253,253,253,253,253,253,253,
-        253,253,253,253,253,253,254,254,254,254,254,254,254,254,254,254,
-        254,254,254,254,254,254,254,254,254,254,254,254,254,254,254,254,
-        254,254,254,254,254,254,254,254,254,254,254,254,254,254,254,254,
-        254,254,254,254,254,254,254,254,254,254,254,254,254,254,254,254,
-        254,254,254,254,254,254,254,254,254,254,255,255,255,255,255,255,
-        255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,
-        255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,
-        255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,
-        255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,
-        255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,256
-    ]
-    return values
-}
+SgrXByXPlus1 :: u16.[
+    1,128,171,192,205,213,219,224,228,230,233,235,236,238,239,240,
+    241,242,243,243,244,244,245,245,246,246,247,247,247,247,248,248,
+    248,248,249,249,249,249,249,250,250,250,250,250,250,250,251,251,
+    251,251,251,251,251,251,251,251,252,252,252,252,252,252,252,252,
+    252,252,252,252,252,252,252,252,252,253,253,253,253,253,253,253,
+    253,253,253,253,253,253,253,253,253,253,253,253,253,253,253,253,
+    253,253,253,253,253,253,254,254,254,254,254,254,254,254,254,254,
+    254,254,254,254,254,254,254,254,254,254,254,254,254,254,254,254,
+    254,254,254,254,254,254,254,254,254,254,254,254,254,254,254,254,
+    254,254,254,254,254,254,254,254,254,254,254,254,254,254,254,254,
+    254,254,254,254,254,254,254,254,254,254,255,255,255,255,255,255,
+    255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,
+    255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,
+    255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,
+    255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,
+    255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,256]
 SgrBox :: (input: []u16, stride: s32, width: s32, height: s32,
-    set: s32, pass: s32, bit_depth: s32, x_by_xplus1: []u16, cancellation: *Cancellation) -> SgrPass {
+    set: s32, pass: s32, bit_depth: s32, cancellation: *Cancellation) -> SgrPass {
     result: SgrPass
     radius := SgrParameters(set, pass * 2)
     if radius == 0 { return result }
@@ -84,7 +82,7 @@ SgrBox :: (input: []u16, stride: s32, width: s32, height: s32,
             d := SgrRound(b, bit_depth - 8)
             p := a * n - d * d; if p < 0 { p = 0 }
             z := SgrRound(p * scale, 20)
-            a2 := cast(s64)x_by_xplus1[ifx z < 255 then z else 255]
+            a2 := cast(s64)SgrXByXPlus1[ifx z < 255 then z else 255]
             a_values[iy * 10 + ix] = a2
             b_values[iy * 10 + ix] = SgrRound((256 - a2) * b * reciprocal, 12)
         }
@@ -144,17 +142,26 @@ FilterSgrBlock :: (input: []u16, stride: s32, width: s32, height: s32,
     for y: 0..height + 5 { for x: 0..width + 5 {
         if cast(s64)input[y * stride + x] > maximum { result.error = Error(InvalidInput); return result }
     } }
-    x_by_xplus1 := SgrXByXPlus1()
-    pass0 := SgrBox(input, stride, width, height, set, 0, bit_depth, x_by_xplus1[:], cancellation)
-    if pass0.error.code != DecodeOK { result.error = pass0.error; return result }
-    pass1 := SgrBox(input, stride, width, height, set, 1, bit_depth, x_by_xplus1[:], cancellation)
-    if pass1.error.code != DecodeOK { result.error = pass1.error; return result }
+    result.error = CancellationError(cancellation)
+    if result.error.code != DecodeOK { return result }
+    // Output commits only after the last cancellation check.
+    samples: [64]u16
+    SgrFilterInto(input, stride, width, height, set, projection0, projection1, bit_depth, samples[:], 8)
+    result.error = CancellationError(cancellation)
+    if result.error.code != DecodeOK { return result }
+    result.samples = samples; result.width = width; result.height = height
+    return result
+}
+
+// The filter of a validated block, written to output rows output_stride apart.
+SgrFilterInto :: (input: []u16, stride: s32, width: s32, height: s32,
+    set: s32, projection0: s32, projection1: s32, bit_depth: s32, output: []u16, output_stride: s32) {
+    maximum := cast(s64)((cast(u64)1 << cast(u64)bit_depth) - 1)
+    pass0 := SgrBox(input, stride, width, height, set, 0, bit_depth, null)
+    pass1 := SgrBox(input, stride, width, height, set, 1, bit_depth, null)
     radius0 := SgrParameters(set, 0); radius1 := SgrParameters(set, 2)
     w0 := cast(s64)projection0; w1 := cast(s64)projection1; w2 := 128 - w0 - w1
-    samples: [64]u16
     for y: 0..height - 1 {
-        result.error = CancellationError(cancellation)
-        if result.error.code != DecodeOK { return result }
         for x: 0..width - 1 {
             u := cast(s64)input[(y + 3) * stride + x + 3] * 16
             v := w1 * u
@@ -162,11 +169,7 @@ FilterSgrBlock :: (input: []u16, stride: s32, width: s32, height: s32,
             v += w2 * (ifx radius1 != 0 then pass1.samples[y * 8 + x] else u)
             value := SgrRound(v, 11)
             if value < 0 { value = 0 }; if value > maximum { value = maximum }
-            samples[y * 8 + x] = cast(u16)value
+            output[y * output_stride + x] = cast(u16)value
         }
     }
-    result.error = CancellationError(cancellation)
-    if result.error.code != DecodeOK { return result }
-    result.samples = samples; result.width = width; result.height = height
-    return result
 }

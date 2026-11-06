@@ -39,11 +39,9 @@ GetQuantizationSteps :: (qindex: s32, delta_dc: s32, delta_ac: s32, depth: s32,
     dc := qindex + delta_dc; ac := qindex + delta_ac
     if dc < 0 { dc = 0 }; if dc > 255 { dc = 255 }
     if ac < 0 { ac = 0 }; if ac > 255 { ac = 255 }
-    table: [512]s16
-    if depth == 8 { table = Av1Quantizers8() }
-    else if depth == 10 { table = Av1Quantizers10() }
-    else { table = Av1Quantizers12() }
-    result.dc = cast(s32)table[dc]; result.ac = cast(s32)table[256 + ac]
+    if depth == 8 { result.dc = cast(s32)Av1Quantizers8[dc]; result.ac = cast(s32)Av1Quantizers8[256 + ac] }
+    else if depth == 10 { result.dc = cast(s32)Av1Quantizers10[dc]; result.ac = cast(s32)Av1Quantizers10[256 + ac] }
+    else { result.dc = cast(s32)Av1Quantizers12[dc]; result.ac = cast(s32)Av1Quantizers12[256 + ac] }
     return result
 }
 

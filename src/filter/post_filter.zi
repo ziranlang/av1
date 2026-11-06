@@ -132,22 +132,6 @@ PostRestorationInput :: struct {
     plane: s32; end_x: s32; end_y: s32; stripe_start: s32; stripe_end: s32;
 }
 
-// 7.17.6: rows inside the current stripe come from CDEF output, at most two
-// rows beyond it from the deblocked frame. An empty cdef view means CDEF was
-// the identity and both sources are the deblocked frame.
-PostSourceSample :: (frame: *IntraFrame, deblocked: []u16, cdef: []u16,
-    input: *PostRestorationInput, x: s32, y: s32) -> u16 {
-    cx := PostClip(x, 0, input.end_x); cy := PostClip(y, 0, input.end_y)
-    if cy < input.stripe_start {
-        return deblocked[PostIndex(frame, input.plane, cx, PostMax(input.stripe_start - 2, cy))]
-    }
-    if cy > input.stripe_end {
-        return deblocked[PostIndex(frame, input.plane, cx, PostMin(input.stripe_end + 2, cy))]
-    }
-    at := PostIndex(frame, input.plane, cx, cy)
-    return ifx cdef.count == 0 then deblocked[at] else cdef[at]
-}
-
 #scope_export
 // Whole-frame loop filter (7.14.1), modifying samples in place. Returns at
 // once when both luma levels are zero, as decode_frame_wrapup requires.
@@ -273,30 +257,36 @@ ApplyIntraRestoration :: (frame: *IntraFrame, deblocked: []u16, cdef: []u16, out
                     (cast(s64)unit_row * frame.restoration_columns[plane] + unit_column) * IntraRestorationFields
                 kind := cast(s32)frame.restoration[at]
                 if kind != 0 {
+                    // 7.17.6: rows inside the current stripe come from CDEF
+                    // output, at most two rows beyond it from the deblocked
+                    // frame. Columns and each row's source resolve once.
+                    columns: [14]s32
+                    for j: 0..w + 5 { columns[j] = PostClip(x0 + cast(s32)j - 3, 0, input.end_x) }
                     halo: [196]u16
-                    for i: 0..h + 5 { for j: 0..w + 5 {
-                        halo[i * 14 + j] = PostSourceSample(frame, deblocked, cdef, *input,
-                            x0 + cast(s32)j - 3, y0 + cast(s32)i - 3)
-                    } }
-                    filtered: [64]u16
+                    for i: 0..h + 5 {
+                        cy := PostClip(y0 + cast(s32)i - 3, 0, input.end_y)
+                        source := ifx cdef.count == 0 then deblocked else cdef
+                        if cy < input.stripe_start { cy = PostMax(input.stripe_start - 2, cy); source = deblocked }
+                        else if cy > input.stripe_end { cy = PostMin(input.stripe_end + 2, cy); source = deblocked }
+                        line := PostIndex(frame, plane, 0, cy)
+                        for j: 0..w + 5 { halo[i * 14 + j] = source[line + columns[j]] }
+                    }
+                    // The unit's parameters were read in range, and the
+                    // halo holds clipped samples: the kernels write the
+                    // block straight into the output plane.
+                    destination := output[PostIndex(frame, plane, x0, y0):]
                     if kind == 1 {
                         vertical: [3]s32; horizontal: [3]s32
                         for k: 0..2 {
                             vertical[k] = cast(s32)frame.restoration[at + 1 + k]
                             horizontal[k] = cast(s32)frame.restoration[at + 4 + k]
                         }
-                        block := FilterWienerBlock(halo[:], 14, w, h, horizontal[:], vertical[:], frame.bit_depth, cancellation)
-                        if block.error.code != DecodeOK { return block.error }
-                        filtered = block.samples
+                        WienerFilterInto(halo[:], 14, w, h, horizontal[:], vertical[:], frame.bit_depth,
+                            destination, frame.plane_stride[plane])
                     } else {
-                        block := FilterSgrBlock(halo[:], 14, w, h, cast(s32)frame.restoration[at + 7],
-                            cast(s32)frame.restoration[at + 8], cast(s32)frame.restoration[at + 9], frame.bit_depth, cancellation)
-                        if block.error.code != DecodeOK { return block.error }
-                        filtered = block.samples
-                    }
-                    for i: 0..h - 1 {
-                        line := PostIndex(frame, plane, x0, y0 + cast(s32)i)
-                        for j: 0..w - 1 { output[line + j] = filtered[i * 8 + j] }
+                        SgrFilterInto(halo[:], 14, w, h, cast(s32)frame.restoration[at + 7],
+                            cast(s32)frame.restoration[at + 8], cast(s32)frame.restoration[at + 9], frame.bit_depth,
+                            destination, frame.plane_stride[plane])
                     }
                 }
                 x0 += 8

@@ -63,7 +63,7 @@ def main():
     if not values or list(map(int,values[1].split(',')))!=modes+[0]:raise SystemExit('filter mode CDF provenance mismatch')
     tap_text=upstream.split('av1_filter_intra_taps[FILTER_INTRA_MODES][8][8]) = {',1)[1].split('\n};',1)[0]
     native_taps=list(map(int,re.findall(r'-?\d+',tap_text)))
-    values=re.search(r'taps: \[280\]s8 = \.\[([^]]+)\]',kernels,re.S)
+    values=re.search(r'IntraFilterTaps :: s8\.\[([^]]+)\]',kernels,re.S)
     if len(native_taps)!=320 or not values or list(map(int,values[1].split(',')))!=[v for i,v in enumerate(native_taps) if i%8!=7]:
         raise SystemExit('filter tap provenance mismatch')
     shapes={(16,16):6,(16,8):5,(8,16):4,(8,8):3,(16,4):17,(4,16):16}

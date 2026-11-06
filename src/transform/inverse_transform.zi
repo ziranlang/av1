@@ -9,26 +9,24 @@ TransformKindDCT :: 0
 TransformKindADST :: 1
 TransformKindIdentity :: 2
 
-Cos128Table :: () -> [65]s32 {
-    values: [65]s32 = .[
-        4096,4095,4091,4085,4076,4065,4052,4036,4017,3996,3973,3948,3920,3889,3857,3822,
-        3784,3745,3703,3659,3612,3564,3513,3461,3406,3349,3290,3229,3166,3102,3035,2967,
-        2896,2824,2751,2675,2598,2520,2440,2359,2276,2191,2106,2019,1931,1842,1751,1660,
-        1567,1474,1380,1285,1189,1092,995,897,799,700,601,501,401,301,201,101,0,
-    ]; return values
-}
+// cos128(angle) * 4096 for angles 0..64, read through Cos128.
+Cos128Values :: s32.[
+    4096,4095,4091,4085,4076,4065,4052,4036,4017,3996,3973,3948,3920,3889,3857,3822,
+    3784,3745,3703,3659,3612,3564,3513,3461,3406,3349,3290,3229,3166,3102,3035,2967,
+    2896,2824,2751,2675,2598,2520,2440,2359,2276,2191,2106,2019,1931,1842,1751,1660,
+    1567,1474,1380,1285,1189,1092,995,897,799,700,601,501,401,301,201,101,0]
 
 Round2Signed :: (value: s64, bits: u32) -> s64 {
     if bits == 0 { return value }
     return (value + (cast(s64)1 << (bits - 1))) >> bits
 }
 
-Cos128 :: (table: []s32, angle: s64) -> s64 {
+Cos128 :: (angle: s64) -> s64 {
     a := angle & 255
-    if a <= 64 { return cast(s64)table[a] }
-    if a <= 128 { return -cast(s64)table[128 - a] }
-    if a <= 192 { return -cast(s64)table[a - 128] }
-    return cast(s64)table[256 - a]
+    if a <= 64 { return cast(s64)Cos128Values[a] }
+    if a <= 128 { return -cast(s64)Cos128Values[128 - a] }
+    if a <= 192 { return -cast(s64)Cos128Values[a - 128] }
+    return cast(s64)Cos128Values[256 - a]
 }
 
 // Reverses the low `bits` (at most 8) bits of x: an 8-bit swap network,
@@ -42,8 +40,8 @@ Brev :: (bits: s64, x: s64) -> s64 {
 }
 
 // B(a,b,angle,flip): rotation, rounded by 12 bits, optionally exchanged.
-Butterfly :: (t: []s64, table: []s32, a: s64, b: s64, angle: s64, flip: bool) {
-    c := Cos128(table, angle); s := Cos128(table, angle - 64)
+Butterfly :: (t: []s64, a: s64, b: s64, angle: s64, flip: bool) {
+    c := Cos128(angle); s := Cos128(angle - 64)
     x := Round2Signed(t[a] * c - t[b] * s, 12)
     y := Round2Signed(t[a] * s + t[b] * c, 12)
     if flip { t[a] = y; t[b] = x } else { t[a] = x; t[b] = y }
@@ -60,46 +58,46 @@ Hadamard :: (t: []s64, a: s64, b: s64, flip: bool, r: u32) {
     t[first] = sum; t[second] = difference
 }
 
-InverseDCT :: (t: []s64, n: s64, r: u32, table: []s32) {
+InverseDCT :: (t: []s64, n: s64, r: u32) {
     count := cast(s64)1 << cast(u32)n
     copy: [64]s64
     for i: 0..count - 1 { copy[i] = t[i] }
     for i: 0..count - 1 { t[i] = copy[Brev(n, i)] }
-    if n == 6 { for i: 0..15 { Butterfly(t, table, 32 + i, 63 - i, 63 - 4 * Brev(4, i), false) } }
-    if n >= 5 { for i: 0..7 { Butterfly(t, table, 16 + i, 31 - i, 6 + (Brev(3, 7 - i) << 3), false) } }
+    if n == 6 { for i: 0..15 { Butterfly(t, 32 + i, 63 - i, 63 - 4 * Brev(4, i), false) } }
+    if n >= 5 { for i: 0..7 { Butterfly(t, 16 + i, 31 - i, 6 + (Brev(3, 7 - i) << 3), false) } }
     if n == 6 { for i: 0..15 { Hadamard(t, 32 + i * 2, 33 + i * 2, (i & 1) == 1, r) } }
-    if n >= 4 { for i: 0..3 { Butterfly(t, table, 8 + i, 15 - i, 12 + (Brev(2, 3 - i) << 4), false) } }
+    if n >= 4 { for i: 0..3 { Butterfly(t, 8 + i, 15 - i, 12 + (Brev(2, 3 - i) << 4), false) } }
     if n >= 5 { for i: 0..7 { Hadamard(t, 16 + 2 * i, 17 + 2 * i, (i & 1) == 1, r) } }
     if n == 6 { for i: 0..3 { for j: 0..1 {
-        Butterfly(t, table, 62 - i * 4 - j, 33 + i * 4 + j, 60 - 16 * Brev(2, i) + 64 * j, true)
+        Butterfly(t, 62 - i * 4 - j, 33 + i * 4 + j, 60 - 16 * Brev(2, i) + 64 * j, true)
     } } }
-    if n >= 3 { for i: 0..1 { Butterfly(t, table, 4 + i, 7 - i, 56 - 32 * i, false) } }
+    if n >= 3 { for i: 0..1 { Butterfly(t, 4 + i, 7 - i, 56 - 32 * i, false) } }
     if n >= 4 { for i: 0..3 { Hadamard(t, 8 + 2 * i, 9 + 2 * i, (i & 1) == 1, r) } }
     if n >= 5 { for i: 0..1 { for j: 0..1 {
-        Butterfly(t, table, 30 - 4 * i - j, 17 + 4 * i + j, 24 + (j << 6) + ((1 - i) << 5), true)
+        Butterfly(t, 30 - 4 * i - j, 17 + 4 * i + j, 24 + (j << 6) + ((1 - i) << 5), true)
     } } }
     if n == 6 { for i: 0..7 { for j: 0..1 { Hadamard(t, 32 + i * 4 + j, 35 + i * 4 - j, (i & 1) == 1, r) } } }
-    for i: 0..1 { Butterfly(t, table, 2 * i, 2 * i + 1, 32 + 16 * i, i == 0) }
+    for i: 0..1 { Butterfly(t, 2 * i, 2 * i + 1, 32 + 16 * i, i == 0) }
     if n >= 3 { for i: 0..1 { Hadamard(t, 4 + 2 * i, 5 + 2 * i, i == 1, r) } }
-    if n >= 4 { for i: 0..1 { Butterfly(t, table, 14 - i, 9 + i, 48 + 64 * i, true) } }
+    if n >= 4 { for i: 0..1 { Butterfly(t, 14 - i, 9 + i, 48 + 64 * i, true) } }
     if n >= 5 { for i: 0..3 { for j: 0..1 { Hadamard(t, 16 + 4 * i + j, 19 + 4 * i - j, (i & 1) == 1, r) } } }
     if n == 6 { for i: 0..1 { for j: 0..3 {
-        Butterfly(t, table, 61 - i * 8 - j, 34 + i * 8 + j, 56 - i * 32 + (j >> 1) * 64, true)
+        Butterfly(t, 61 - i * 8 - j, 34 + i * 8 + j, 56 - i * 32 + (j >> 1) * 64, true)
     } } }
     for i: 0..1 { Hadamard(t, i, 3 - i, false, r) }
-    if n >= 3 { Butterfly(t, table, 6, 5, 32, true) }
+    if n >= 3 { Butterfly(t, 6, 5, 32, true) }
     if n >= 4 { for i: 0..1 { for j: 0..1 { Hadamard(t, 8 + 4 * i + j, 11 + 4 * i - j, i == 1, r) } } }
-    if n >= 5 { for i: 0..3 { Butterfly(t, table, 29 - i, 18 + i, 48 + (i >> 1) * 64, true) } }
+    if n >= 5 { for i: 0..3 { Butterfly(t, 29 - i, 18 + i, 48 + (i >> 1) * 64, true) } }
     if n == 6 { for i: 0..3 { for j: 0..3 { Hadamard(t, 32 + 8 * i + j, 39 + 8 * i - j, (i & 1) == 1, r) } } }
     if n >= 3 { for i: 0..3 { Hadamard(t, i, 7 - i, false, r) } }
-    if n >= 4 { for i: 0..1 { Butterfly(t, table, 13 - i, 10 + i, 32, true) } }
+    if n >= 4 { for i: 0..1 { Butterfly(t, 13 - i, 10 + i, 32, true) } }
     if n >= 5 { for i: 0..1 { for j: 0..3 { Hadamard(t, 16 + i * 8 + j, 23 + i * 8 - j, i == 1, r) } } }
-    if n == 6 { for i: 0..7 { Butterfly(t, table, 59 - i, 36 + i, ifx i < 4 then 48 else 112, true) } }
+    if n == 6 { for i: 0..7 { Butterfly(t, 59 - i, 36 + i, ifx i < 4 then 48 else 112, true) } }
     if n >= 4 { for i: 0..7 { Hadamard(t, i, 15 - i, false, r) } }
-    if n >= 5 { for i: 0..3 { Butterfly(t, table, 27 - i, 20 + i, 32, true) } }
+    if n >= 5 { for i: 0..3 { Butterfly(t, 27 - i, 20 + i, 32, true) } }
     if n == 6 { for i: 0..7 { Hadamard(t, 32 + i, 47 - i, false, r); Hadamard(t, 48 + i, 63 - i, true, r) } }
     if n >= 5 { for i: 0..15 { Hadamard(t, i, 31 - i, false, r) } }
-    if n == 6 { for i: 0..7 { Butterfly(t, table, 55 - i, 40 + i, 32, true) } }
+    if n == 6 { for i: 0..7 { Butterfly(t, 55 - i, 40 + i, 32, true) } }
     if n == 6 { for i: 0..31 { Hadamard(t, i, 63 - i, false, r) } }
 }
 
@@ -133,28 +131,28 @@ ADSTOutputPermutation :: (t: []s64, n: s64) {
     }
 }
 
-InverseADST8 :: (t: []s64, r: u32, table: []s32) {
+InverseADST8 :: (t: []s64, r: u32) {
     ADSTInputPermutation(t, 3)
-    for i: 0..3 { Butterfly(t, table, 2 * i, 2 * i + 1, 60 - 16 * i, true) }
+    for i: 0..3 { Butterfly(t, 2 * i, 2 * i + 1, 60 - 16 * i, true) }
     for i: 0..3 { Hadamard(t, i, 4 + i, false, r) }
-    for i: 0..1 { Butterfly(t, table, 4 + 3 * i, 5 + i, 48 - 32 * i, true) }
+    for i: 0..1 { Butterfly(t, 4 + 3 * i, 5 + i, 48 - 32 * i, true) }
     for i: 0..1 { for j: 0..1 { Hadamard(t, 4 * j + i, 2 + 4 * j + i, false, r) } }
-    for i: 0..1 { Butterfly(t, table, 2 + 4 * i, 3 + 4 * i, 32, true) }
+    for i: 0..1 { Butterfly(t, 2 + 4 * i, 3 + 4 * i, 32, true) }
     ADSTOutputPermutation(t, 3)
 }
 
-InverseADST16 :: (t: []s64, r: u32, table: []s32) {
+InverseADST16 :: (t: []s64, r: u32) {
     ADSTInputPermutation(t, 4)
-    for i: 0..7 { Butterfly(t, table, 2 * i, 2 * i + 1, 62 - 8 * i, true) }
+    for i: 0..7 { Butterfly(t, 2 * i, 2 * i + 1, 62 - 8 * i, true) }
     for i: 0..7 { Hadamard(t, i, 8 + i, false, r) }
     for i: 0..1 {
-        Butterfly(t, table, 8 + 2 * i, 9 + 2 * i, 56 - 32 * i, true)
-        Butterfly(t, table, 13 + 2 * i, 12 + 2 * i, 8 + 32 * i, true)
+        Butterfly(t, 8 + 2 * i, 9 + 2 * i, 56 - 32 * i, true)
+        Butterfly(t, 13 + 2 * i, 12 + 2 * i, 8 + 32 * i, true)
     }
     for i: 0..3 { for j: 0..1 { Hadamard(t, 8 * j + i, 4 + 8 * j + i, false, r) } }
-    for i: 0..1 { for j: 0..1 { Butterfly(t, table, 4 + 8 * j + 3 * i, 5 + 8 * j + i, 48 - 32 * i, true) } }
+    for i: 0..1 { for j: 0..1 { Butterfly(t, 4 + 8 * j + 3 * i, 5 + 8 * j + i, 48 - 32 * i, true) } }
     for i: 0..1 { for j: 0..3 { Hadamard(t, 4 * j + i, 2 + 4 * j + i, false, r) } }
-    for i: 0..3 { Butterfly(t, table, 2 + 4 * i, 3 + 4 * i, 32, true) }
+    for i: 0..3 { Butterfly(t, 2 + 4 * i, 3 + 4 * i, 32, true) }
     ADSTOutputPermutation(t, 4)
 }
 
@@ -206,10 +204,10 @@ ValidateInverseTransform :: (width: s32, height: s32, tx_type: s32, bit_depth: s
     return Error(DecodeOK)
 }
 
-Inverse1D :: (t: []s64, kind: s32, n: s64, r: u32, table: []s32) {
-    if kind == TransformKindDCT { InverseDCT(t, n, r, table) }
+Inverse1D :: (t: []s64, kind: s32, n: s64, r: u32) {
+    if kind == TransformKindDCT { InverseDCT(t, n, r) }
     else if kind == TransformKindADST {
-        if n == 2 { InverseADST4(t) } else if n == 3 { InverseADST8(t, r, table) } else { InverseADST16(t, r, table) }
+        if n == 2 { InverseADST4(t) } else if n == 3 { InverseADST8(t, r) } else { InverseADST16(t, r) }
     } else { InverseIdentity(t, n) }
 }
 
@@ -233,7 +231,6 @@ InverseTransform2D :: (dequant: []s32, residual: []s32, width: s32, height: s32,
         value := cast(s64)dequant[i]
         if value < -input_limit || value >= input_limit { ClearResidual(residual); return Error(InvalidInput) }
     }
-    table := Cos128Table()
     log2w := cast(s64)TransformLog2(width); log2h := cast(s64)TransformLog2(height)
     row_kind := TransformRowKind(tx_type); column_kind := TransformColumnKind(tx_type)
     rect := log2w - log2h == 1 || log2h - log2w == 1
@@ -263,7 +260,7 @@ InverseTransform2D :: (dequant: []s32, residual: []s32, width: s32, height: s32,
             if rect { value = Round2Signed(value * 2896, 12) }
             t[j] = value
         }
-        Inverse1D(t[:width], row_kind, log2w, row_range, table[:])
+        Inverse1D(t[:width], row_kind, log2w, row_range)
         for j: 0..cast(s64)width - 1 {
             value := Round2Signed(t[j], row_shift)
             if value < column_low { value = column_low }; if value > column_high { value = column_high }
@@ -279,7 +276,7 @@ InverseTransform2D :: (dequant: []s32, residual: []s32, width: s32, height: s32,
             if t[i] != 0 { nonzero = true }
         }
         if !nonzero { continue }
-        Inverse1D(t[:height], column_kind, log2h, column_range, table[:])
+        Inverse1D(t[:height], column_kind, log2h, column_range)
         for i: 0..cast(s64)height - 1 { residual[i * width + j] = cast(s32)Round2Signed(t[i], 4) }
     }
     error = CancellationError(cancellation)
