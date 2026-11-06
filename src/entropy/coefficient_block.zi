@@ -29,6 +29,10 @@ CoefficientSummary :: struct {
     error: DecodeError;
 }
 
+// Working buffers of DecodeNonzeroCoefficients that a tile keeps, so a block
+// clears only the levels it reads instead of zeroing both arrays.
+CoefficientScratch :: struct { levels: [1296]u8; positions: [1024]u16; }
+
 CoefficientSummaryFailure :: (error: DecodeError) -> CoefficientSummary {
     result: CoefficientSummary; result.error = error; return result
 }
@@ -58,9 +62,9 @@ ReadCoefficientSkip :: (decoder: *RangeDecoder, cdfs: *CoefficientCDFs,
 ReadNonzeroCoefficients :: (decoder: *RangeDecoder, cdfs: *CoefficientCDFs,
     width: s32, height: s32, tx_class: s32, plane: s32, dc_context: s32,
     cancellation: *Cancellation = null) -> CoefficientBlock {
-    result: CoefficientBlock
+    result: CoefficientBlock; scratch: CoefficientScratch
     summary := DecodeNonzeroCoefficients(decoder, cdfs, width, height, tx_class, plane, dc_context,
-        result.quant[:], cancellation)
+        result.quant[:], *scratch, cancellation)
     if summary.error.code != DecodeOK { return CoefficientBlockFailure(summary.error) }
     result.eob = summary.eob; result.level = summary.level; result.dc_category = summary.dc_category
     result.coded_width = summary.coded_width; result.coded_height = summary.coded_height
@@ -71,10 +75,10 @@ ReadNonzeroCoefficients :: (decoder: *RangeDecoder, cdfs: *CoefficientCDFs,
 // at least the coded count. On failure quant holds partial values.
 DecodeNonzeroCoefficients :: (decoder: *RangeDecoder, cdfs: *CoefficientCDFs,
     width: s32, height: s32, tx_class: s32, plane: s32, dc_context: s32, quant: []s32,
-    cancellation: *Cancellation = null) -> CoefficientSummary {
+    scratch: *CoefficientScratch, cancellation: *Cancellation = null) -> CoefficientSummary {
     error := CancellationError(cancellation)
     if error.code != DecodeOK { return CoefficientSummaryFailure(error) }
-    if decoder == null || cdfs == null || plane < 0 || plane > 1 || dc_context < 0 || dc_context > 2 ||
+    if decoder == null || cdfs == null || scratch == null || plane < 0 || plane > 1 || dc_context < 0 || dc_context > 2 ||
         tx_class < 0 || tx_class > 2 {
         return CoefficientSummaryFailure(Error(InvalidInput))
     }
@@ -107,8 +111,8 @@ DecodeNonzeroCoefficients :: (decoder: *RangeDecoder, cdfs: *CoefficientCDFs,
     cw := ifx width < 32 then width else 32; ch := ifx height < 32 then height else 32
     log_width: s32 = 2
     while (cast(s32)1 << log_width) < cw { log_width += 1 }
-    positions: [1024]u16
-    CoefficientScanPrefix(positions[:], cw, ch, mode, eob)
+    positions := scratch.positions[:]
+    CoefficientScanPrefix(positions, cw, ch, mode, eob)
     // CDF rows of this block's size and plane, as SelectCoefficientCDF lays them out.
     row_plane := shape.size_context * 2 + plane
     base_cdfs := 213 + row_plane * 42 * 5
@@ -116,24 +120,25 @@ DecodeNonzeroCoefficients :: (decoder: *RangeDecoder, cdfs: *CoefficientCDFs,
     br_cdfs := 2313 + ((ifx shape.size_context > 3 then 3 else shape.size_context) * 2 + plane) * 21 * 5
     stride := CoefficientLevelStride(cw)
     for i: 0..shape.count - 1 { quant[i] = 0 }
-    result: CoefficientSummary; levels: [1296]u8
+    // Contexts read at most four rows and columns past the coded block.
+    levels := scratch.levels[:cast(s64)(ch + 4) * stride]
+    for i: 0..levels.count - 1 { levels[i] = 0 }
+    result: CoefficientSummary
     index := eob - 1
     while index >= 0 {
         position := cast(s32)positions[index]
         row := position >> log_width; column := position & (cw - 1)
-        contexts := CoefficientContextsAt(levels[:], stride, row, column,
-            width, height, index, tx_class, index == eob - 1)
         level: s32
         if index == eob - 1 {
-            at := eob_cdfs + contexts.base * 4
+            at := eob_cdfs + CoefficientEOBContext(width, height, index) * 4
             level = DecodeSymbol(decoder, cdfs.values[at:at + 4]) + 1
         } else {
-            at := base_cdfs + contexts.base * 5
+            at := base_cdfs + CoefficientBaseContext(levels, stride, row, column, width, height, tx_class) * 5
             level = DecodeSymbol(decoder, cdfs.values[at:at + 5])
         }
         if decoder.error.code != DecodeOK { return CoefficientSummaryFailure(decoder.error) }
         if level > 2 {
-            at := br_cdfs + contexts.br * 5
+            at := br_cdfs + CoefficientBrContext(levels, stride, row, column, tx_class) * 5
             for extension: 0..3 {
                 value := DecodeSymbol(decoder, cdfs.values[at:at + 5])
                 if decoder.error.code != DecodeOK { return CoefficientSummaryFailure(decoder.error) }

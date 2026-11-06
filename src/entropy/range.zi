@@ -69,21 +69,24 @@ DecodeSymbol :: (decoder: *RangeDecoder, cdf: []u16) -> s32 {
     decoder.range = prev - cur; decoder.value -= cur
     RangeRenormalize(decoder)
     if decoder.error.code != DecodeOK { return 0 }
-    if !decoder.disable_cdf_update {
-        rate: s32 = 3
-        if cdf[n] > 15 { rate += 1 }
-        if cdf[n] > 31 { rate += 1 }
-        rate += ifx n < 4 then 1 else 2
-        i: s32
-        while i < n - 1 {
-            current := cast(u32)cdf[i]
-            if i < symbol { current -= current >> cast(u32)rate }
-            else { current += (32768 - current) >> cast(u32)rate }
-            cdf[i] = cast(u16)current; i += 1
-        }
-        if cdf[n] < 32 { cdf[n] += 1 }
-    }
+    if !decoder.disable_cdf_update { AdaptCdf(cdf, n, symbol) }
     return symbol
+}
+
+// The adaptation of 8.2.6 after decoding symbol from the n-symbol cdf.
+AdaptCdf :: (cdf: []u16, n: s32, symbol: s32) {
+    rate: s32 = 3
+    if cdf[n] > 15 { rate += 1 }
+    if cdf[n] > 31 { rate += 1 }
+    rate += ifx n < 4 then 1 else 2
+    i: s32
+    while i < n - 1 {
+        current := cast(u32)cdf[i]
+        if i < symbol { current -= current >> cast(u32)rate }
+        else { current += (32768 - current) >> cast(u32)rate }
+        cdf[i] = cast(u16)current; i += 1
+    }
+    if cdf[n] < 32 { cdf[n] += 1 }
 }
 
 // Valid state before a symbol; otherwise records the error.
@@ -100,9 +103,11 @@ RangeReady :: (decoder: *RangeDecoder) -> bool {
 RangeRenormalize :: (decoder: *RangeDecoder) {
     // The range is below 65536, so its leading zeros past 16 are the shift.
     shifts := cast(s32)clz(decoder.range) - 16
+    // No shift reads nothing and leaves the value: the state stays valid.
+    if shifts == 0 { return }
     decoder.range <<= cast(u32)shifts
     count := cast(s32)(ifx decoder.max_bits < shifts then (ifx decoder.max_bits > 0 then decoder.max_bits else 0) else cast(s64)shifts)
-    padded := ReadBits(*decoder.bits, count) << cast(u32)(shifts - count)
+    padded := ReadShortBits(*decoder.bits, count) << cast(u32)(shifts - count)
     decoder.value = padded ^ (((decoder.value + 1) << cast(u32)shifts) - 1)
     decoder.max_bits -= shifts
     if decoder.bits.error.code != DecodeOK { decoder.error = decoder.bits.error; return }

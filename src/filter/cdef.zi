@@ -129,8 +129,8 @@ CdefPadded :: struct { samples: [256]u16; }
 
 // The filter of a validated block padded to 16 samples per row: halo row r,
 // column c is samples[r * 16 + c], written to output rows output_stride
-// apart. Each block row filters eight columns at once, so a tap's loop over
-// the row is straight-line code; only the first width columns are stored.
+// apart. Each pass filters eight samples, one row of an 8-wide block or two
+// rows of a 4-wide one, so a tap's loop over them is straight-line code.
 // A missing neighbor is 30000, at least 25905 above any sample; shifted by at
 // most 10 - log2(threshold) its magnitude still exceeds the threshold, so its
 // constrained difference is zero and it is left out of the maximum only.
@@ -169,45 +169,56 @@ CdefFilterPadded :: (block: *CdefPadded, width: s32, height: s32,
         }
     }
     clamp := primary_strength != 0 && secondary_strength != 0
-    for row: 0..7 {
-        if cast(s32)row >= height { break }
-        line := row * 16
+    // In a 4-wide block lane k is column k & 3 of row first + (k >> 2); the
+    // second row starts 16 samples on, 12 past the fourth lane.
+    pitch: s64 = ifx width == 4 then 12 else 0
+    rows: s64 = ifx width == 4 then 2 else 1
+    for pass: 0..7 {
+        first := pass * rows
+        if cast(s32)first >= height { break }
+        line := first * 16
         // Every intermediate fits s16: samples and the missing value are at
         // most 30000, constrained differences at most 240 and the weighted
         // sum at most 12 * 4 * 240.
         currents: [8]s16; sums: [8]s16; lows: [8]s16; highs: [8]s16
-        for column: 0..7 {
-            current := cast(s16)block.samples[line + 34 + column]
-            currents[column] = current; lows[column] = current; highs[column] = current; sums[column] = 0
+        for lane: 0..7 {
+            current := cast(s16)block.samples[line + 34 + lane + (lane >> 2) * pitch]
+            currents[lane] = current; lows[lane] = current; highs[lane] = current
         }
         for tap: 0..taps - 1 {
             offset := tap_offsets[tap] & 127
             threshold := cast(s16)tap_thresholds[tap]; shift := cast(s16)(tap_shifts[tap] & 15)
             weight := cast(s16)tap_weights[tap]
-            for column: 0..7 {
-                value := cast(s16)block.samples[line + offset + column]
-                difference := value - currents[column]
+            neighbors: [8]s16
+            for lane: 0..3 { neighbors[lane] = cast(s16)block.samples[line + offset + lane] }
+            for lane: 4..7 { neighbors[lane] = cast(s16)block.samples[line + offset + lane + pitch] }
+            for lane: 0..7 {
+                value := neighbors[lane]
+                difference := value - currents[lane]
                 magnitude := ifx difference < 0 then -difference else difference
                 constrained := threshold - (magnitude >> shift)
                 if constrained < 0 { constrained = 0 }
                 if constrained > magnitude { constrained = magnitude }
-                sums[column] += weight * (ifx difference < 0 then -constrained else constrained)
-                if value < lows[column] { lows[column] = value }
+                sums[lane] += weight * (ifx difference < 0 then -constrained else constrained)
+                if value < lows[lane] { lows[lane] = value }
                 real: s16 = ifx value == CdefMissingSample then 0 else value
-                if real > highs[column] { highs[column] = real }
+                if real > highs[lane] { highs[lane] = real }
             }
         }
         results: [8]s32
-        for column: 0..7 {
-            sum := cast(s32)sums[column]
+        for lane: 0..7 {
+            sum := cast(s32)sums[lane]
             negative: s32 = ifx sum < 0 then 1 else 0
-            value := cast(s32)currents[column] + CdefFloor16(8 + sum - negative)
+            value := cast(s32)currents[lane] + CdefFloor16(8 + sum - negative)
             if clamp {
-                if value < cast(s32)lows[column] { value = cast(s32)lows[column] }
-                if value > cast(s32)highs[column] { value = cast(s32)highs[column] }
+                if value < cast(s32)lows[lane] { value = cast(s32)lows[lane] }
+                if value > cast(s32)highs[lane] { value = cast(s32)highs[lane] }
             }
-            results[column] = value
+            results[lane] = value
         }
-        for column: 0..width - 1 { output[cast(s64)row * output_stride + column] = cast(u16)results[column & 7] }
+        for lane: 0..7 {
+            row := first + (lane >> 2) * (rows - 1); column := lane & (cast(s64)width - 1)
+            output[row * output_stride + column] = cast(u16)results[lane]
+        }
     }
 }

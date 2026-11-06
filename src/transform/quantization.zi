@@ -91,7 +91,8 @@ DequantizeInto :: (quant: []s32, width: s32, height: s32, qindex: s32,
             return Error(InvalidInput)
         }
     }
-    denominator := ifx width * height > 1024 then 4 else ifx width * height > 256 then 2 else 1
+    // The masked product is never negative, so dividing by 1, 2 or 4 shifts.
+    shift: u32 = ifx width * height > 1024 then 2 else ifx width * height > 256 then 1 else 0
     limit := cast(s64)1 << cast(u32)(depth + 7)
     if cw < width || ch < height { for i: 0..width * height - 1 { samples[i] = 0 } }
     for row: 0..ch - 1 {
@@ -103,7 +104,7 @@ DequantizeInto :: (quant: []s32, width: s32, height: s32, qindex: s32,
             if weights.count != 0 { q = (q * cast(s64)weights[at] + 16) >> 5 }
             level := cast(s64)quant[at]; negative := level < 0
             if negative { level = -level }
-            value := ((level * q) & 16777215) / cast(s64)denominator
+            value := ((level * q) & 16777215) >> shift
             if negative { value = -value }
             if value < -limit { value = -limit }
             if value >= limit { value = limit - 1 }

@@ -68,7 +68,7 @@ IntraCoefficients :: (tile: *IntraTile, block: *IntraBlock, plane: s32, start_x:
             tx_type = resolved.value
         }
         coefficients := DecodeNonzeroCoefficients(*tile.decoder, *tile.cdfs.coefficients, tx_w, tx_h,
-            TransformClass(tx_type), plane_type, contexts.dc, tile.quant[:], tile.cancellation)
+            TransformClass(tx_type), plane_type, contexts.dc, tile.quant[:], *tile.coefficient_scratch, tile.cancellation)
         if coefficients.error.code != DecodeOK { return coefficients.error }
         level = coefficients.level; dc = coefficients.dc_category
         stride := frame.plane_stride[plane]

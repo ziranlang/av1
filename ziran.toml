@@ -4,7 +4,7 @@ module_roots = ["src"]
 
 [toolchain]
 git = "https://github.com/ziranlang/ziran.git"
-ref = "03e01d08d9f12a68693294a3bd12f6c758290e45"
+ref = "872a53e5c8c91ced9fb1911d6b442b9a2c2802e8"
 
 [exports]
 decoder = "src/decoder.zi"

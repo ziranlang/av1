@@ -9,3 +9,4 @@
 - Faster coefficient decoding, CDEF and self-guided restoration.
 - Faster decoding with shared constant tables and direct restoration output.
 - Faster CDEF, Wiener and self-guided restoration.
+- Faster entropy decoding, inverse transforms, dequantization and 4-wide CDEF.

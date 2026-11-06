@@ -48,6 +48,8 @@ import each other with package-local file imports; `decoder` is the only export.
 - `NewBits(input,begin,end)` creates an MSB-first syntax `BitReader` over an
   absolute byte interval. `ReadBits(reader*,count)` reads 0–32 bits. Failed
   reads return zero, preserve the cursor, and retain the first `DecodeError`.
+  `ReadShortBits` is the same read for at most 16 bits, from one three-byte
+  window when the interval allows.
   `AlignBits` requires zero alignment bits; `FinishBits` requires a one followed
   by zero bits to the interval end. Neither operation decodes entropy symbols.
   `ReadSignedBits` handles 1–32-bit two's-complement literals; `ReadNS` handles
@@ -72,7 +74,8 @@ import each other with package-local file imports; `decoder` is the only export.
   bounded virtual zero padding. Reads past the permitted padding return
   `TruncatedInput` at the interval end. `FinishRange` verifies `exit_symbol`'s
   one bit and zero tail and rejects reuse after success. Callers must finish a
-  tile; decoding a symbol alone does not validate its termination. `DecodeSymbol` is the same decode without the CDF scan, for CDFs the decoder owns.
+  tile; decoding a symbol alone does not validate its termination. `DecodeSymbol` is the same decode without the CDF scan, for CDFs the decoder owns;
+  `AdaptCdf` is its adaptation step alone.
 
 Input slices borrow caller storage synchronously; keep it alive and unchanged.
 There are no allocations, threads, globals or retained callbacks in V01.
@@ -633,6 +636,8 @@ Default contexts cover all nineteen sizes; one-dimensional contexts cover the
 nine sizes with longest side at most 16. No CDF, input or decoder state mutates.
 Invalid dimensions, positions, classes, slice counts and cancellation return
 zero context fields with an error. `CoefficientContextsAt` selects over levels padded with four zero columns and rows (`CoefficientLevelStride`).
+`CoefficientEOBContext`, `CoefficientBaseContext` and `CoefficientBrContext`
+are its three selections, for callers that need only one.
 
 `build-queue -- sh tests/av1_coefficient_context.sh` passed 111 native level
 planes and 108,096 context-field comparisons at 27,024 positions. Zero,
@@ -673,7 +678,9 @@ coefficient integration is described below and used by the frame decoder.
 `ReadNonzeroCoefficients`. Keeping them separate lets the caller read luma
 transform-type syntax between skip and nonzero coefficients, as required by
 the specification. The caller resolves the legal transform class and neighbor
-contexts. No transform-type syntax is omitted inside this component. `DecodeNonzeroCoefficients` writes the coefficients into a caller buffer instead of returning them.
+contexts. No transform-type syntax is omitted inside this component. `DecodeNonzeroCoefficients` writes the coefficients into a caller buffer instead of returning them,
+using a caller `CoefficientScratch` for the levels and scan positions; the
+tile keeps one.
 
 The reader covers nineteen transform sizes, the permitted 2D/horizontal/vertical
 coefficient classes, all EOB areas, reverse base/BR levels, forward signs and
@@ -839,8 +846,21 @@ newer Ziran code generation, again with identical output:
   restoration unit, box sums slide along each row, and Wiener rounding
   shifts instead of dividing.
 
-It now takes 11 to 223 ms per frame, best of three runs: 2 to 7 times libaom
-and 4 to 14 times dav1d. Entropy decoding is the largest remaining cost. The
+A further set, again with identical output:
+
+- `entropy/range.zi` and `syntax/bits.zi`: renormalization reads up to 16
+  bits from one three-byte window and returns at once when no shift is due.
+- `entropy/coefficient_*.zi`: levels and scan positions live in tile scratch,
+  and the BR context is selected only for levels above two.
+- `transform/inverse_transform.zi`: 1D kernels index one 64-value lane by
+  masked positions the compiler proves in range, and cosines come from one
+  signed table.
+- `transform/quantization.zi`: dequantization shifts instead of dividing.
+- `filter/cdef.zi`: 4-wide blocks filter two rows per pass, filling all
+  eight lanes.
+
+It now takes 10 to 203 ms per frame, best of three runs: 2 to 7 times libaom
+and 4 to 12 times dav1d. Entropy decoding is the largest remaining cost. The
 generated C still bounds-checks indices it cannot prove, such as row times
 stride, and calls the symbol decoder out of line. Only the C compiler's own
 vectorization is used: no hand-written SIMD path, thread, other machine,

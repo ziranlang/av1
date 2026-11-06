@@ -103,6 +103,7 @@ IntraTile :: struct {
     uv_palette: PaletteBlock;
     edges: IntraEdges;
     quant: [1024]s32;
+    coefficient_scratch: CoefficientScratch;
     dequant: [4096]s32;
     residual: [4096]s32;
     cfl_luma: [4096]u16;

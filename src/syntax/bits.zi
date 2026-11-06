@@ -45,6 +45,21 @@ ReadBits :: (reader: *BitReader, count: s32) -> u32 {
     return cast(u32)value
 }
 
+// ReadBits of at most 16 bits. Away from the end they lie in the next three
+// bytes, read at once; otherwise, or on any invalid state, ReadBits decides.
+ReadShortBits :: (reader: *BitReader, count: s32) -> u32 {
+    at := reader.byte; bit := reader.bit
+    if reader.error.code != DecodeOK || count < 0 || count > 16 || bit < 0 || bit > 7 || reader.begin < 0 || at < reader.begin ||
+        reader.end > reader.input.data.count || at + 3 > reader.end {
+        return ReadBits(reader, count)
+    }
+    data := reader.input.data
+    window := (cast(u32)data[at] << 16) | (cast(u32)data[at + 1] << 8) | cast(u32)data[at + 2]
+    total := bit + count
+    reader.byte = at + cast(s64)(total >> 3); reader.bit = total & 7
+    return (window >> cast(u32)(24 - total)) & ((cast(u32)1 << cast(u32)count) - 1)
+}
+
 ReadSignedBits :: (reader: *BitReader, count: s32) -> s32 {
     if reader.error.code != DecodeOK { return 0 }
     if count < 1 || count > 32 { reader.error = Error(InvalidInput, reader.byte); return 0 }

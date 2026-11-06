@@ -9,25 +9,32 @@ TransformKindDCT :: 0
 TransformKindADST :: 1
 TransformKindIdentity :: 2
 
-// cos128(angle) * 4096 for angles 0..64, read through Cos128.
-Cos128Values :: s32.[
+// cos128(angle) * 4096 for angles 0..255, the four quadrants of the
+// specification's 65-entry table resolved ahead.
+Cos128Signed :: s32.[
     4096,4095,4091,4085,4076,4065,4052,4036,4017,3996,3973,3948,3920,3889,3857,3822,
     3784,3745,3703,3659,3612,3564,3513,3461,3406,3349,3290,3229,3166,3102,3035,2967,
     2896,2824,2751,2675,2598,2520,2440,2359,2276,2191,2106,2019,1931,1842,1751,1660,
-    1567,1474,1380,1285,1189,1092,995,897,799,700,601,501,401,301,201,101,0]
+    1567,1474,1380,1285,1189,1092,995,897,799,700,601,501,401,301,201,101,
+    0,-101,-201,-301,-401,-501,-601,-700,-799,-897,-995,-1092,-1189,-1285,-1380,-1474,
+    -1567,-1660,-1751,-1842,-1931,-2019,-2106,-2191,-2276,-2359,-2440,-2520,-2598,-2675,-2751,-2824,
+    -2896,-2967,-3035,-3102,-3166,-3229,-3290,-3349,-3406,-3461,-3513,-3564,-3612,-3659,-3703,-3745,
+    -3784,-3822,-3857,-3889,-3920,-3948,-3973,-3996,-4017,-4036,-4052,-4065,-4076,-4085,-4091,-4095,
+    -4096,-4095,-4091,-4085,-4076,-4065,-4052,-4036,-4017,-3996,-3973,-3948,-3920,-3889,-3857,-3822,
+    -3784,-3745,-3703,-3659,-3612,-3564,-3513,-3461,-3406,-3349,-3290,-3229,-3166,-3102,-3035,-2967,
+    -2896,-2824,-2751,-2675,-2598,-2520,-2440,-2359,-2276,-2191,-2106,-2019,-1931,-1842,-1751,-1660,
+    -1567,-1474,-1380,-1285,-1189,-1092,-995,-897,-799,-700,-601,-501,-401,-301,-201,-101,
+    0,101,201,301,401,501,601,700,799,897,995,1092,1189,1285,1380,1474,
+    1567,1660,1751,1842,1931,2019,2106,2191,2276,2359,2440,2520,2598,2675,2751,2824,
+    2896,2967,3035,3102,3166,3229,3290,3349,3406,3461,3513,3564,3612,3659,3703,3745,
+    3784,3822,3857,3889,3920,3948,3973,3996,4017,4036,4052,4065,4076,4085,4091,4095]
 
 Round2Signed :: (value: s64, bits: u32) -> s64 {
     if bits == 0 { return value }
     return (value + (cast(s64)1 << (bits - 1))) >> bits
 }
 
-Cos128 :: (angle: s64) -> s64 {
-    a := angle & 255
-    if a <= 64 { return cast(s64)Cos128Values[a] }
-    if a <= 128 { return -cast(s64)Cos128Values[128 - a] }
-    if a <= 192 { return -cast(s64)Cos128Values[a - 128] }
-    return cast(s64)Cos128Values[256 - a]
-}
+Cos128 :: (angle: s64) -> s64 { return cast(s64)Cos128Signed[angle & 255] }
 
 // Reverses the low `bits` (at most 8) bits of x: an 8-bit swap network,
 // then the reversed byte shifted down to `bits` bits.
@@ -39,30 +46,36 @@ Brev :: (bits: s64, x: s64) -> s64 {
     return value >> cast(u32)(8 - bits)
 }
 
+// One row or column of a transform, at most 64 values. Indices are masked
+// to the lane, which keeps every access provably in range.
+TransformLane :: struct { values: [64]s64; }
+
 // B(a,b,angle,flip): rotation, rounded by 12 bits, optionally exchanged.
-Butterfly :: (t: []s64, a: s64, b: s64, angle: s64, flip: bool) {
+Butterfly :: (t: *TransformLane, a: s64, b: s64, angle: s64, flip: bool) {
     c := Cos128(angle); s := Cos128(angle - 64)
-    x := Round2Signed(t[a] * c - t[b] * s, 12)
-    y := Round2Signed(t[a] * s + t[b] * c, 12)
-    if flip { t[a] = y; t[b] = x } else { t[a] = x; t[b] = y }
+    x := Round2Signed(t.values[a & 63] * c - t.values[b & 63] * s, 12)
+    y := Round2Signed(t.values[a & 63] * s + t.values[b & 63] * c, 12)
+    if flip { t.values[a & 63] = y; t.values[b & 63] = x } else { t.values[a & 63] = x; t.values[b & 63] = y }
 }
 
 // H(a,b,flip,r): sum/difference clamped to signed r bits.
-Hadamard :: (t: []s64, a: s64, b: s64, flip: bool, r: u32) {
+Hadamard :: (t: *TransformLane, a: s64, b: s64, flip: bool, r: u32) {
     first := ifx flip then b else a; second := ifx flip then a else b
-    x := t[first]; y := t[second]
+    x := t.values[first & 63]; y := t.values[second & 63]
     high := (cast(s64)1 << (r - 1)) - 1; low := -high - 1
     sum := x + y; difference := x - y
     if sum < low { sum = low }; if sum > high { sum = high }
     if difference < low { difference = low }; if difference > high { difference = high }
-    t[first] = sum; t[second] = difference
+    t.values[first & 63] = sum; t.values[second & 63] = difference
 }
 
-InverseDCT :: (t: []s64, n: s64, r: u32) {
+InverseDCT :: (t: *TransformLane, n: s64, r: u32) {
     count := cast(s64)1 << cast(u32)n
-    copy: [64]s64
-    for i: 0..count - 1 { copy[i] = t[i] }
-    for i: 0..count - 1 { t[i] = copy[Brev(n, i)] }
+    // The bit-reversal permutation, as swaps in place.
+    for i: 0..count - 1 {
+        j := Brev(n, i)
+        if i < j { value := t.values[i & 63]; t.values[i & 63] = t.values[j & 63]; t.values[j & 63] = value }
+    }
     if n == 6 { for i: 0..15 { Butterfly(t, 32 + i, 63 - i, 63 - 4 * Brev(4, i), false) } }
     if n >= 5 { for i: 0..7 { Butterfly(t, 16 + i, 31 - i, 6 + (Brev(3, 7 - i) << 3), false) } }
     if n == 6 { for i: 0..15 { Hadamard(t, 32 + i * 2, 33 + i * 2, (i & 1) == 1, r) } }
@@ -101,37 +114,37 @@ InverseDCT :: (t: []s64, n: s64, r: u32) {
     if n == 6 { for i: 0..31 { Hadamard(t, i, 63 - i, false, r) } }
 }
 
-InverseADST4 :: (t: []s64) {
-    s0 := 1321 * t[0]; s1 := 2482 * t[0]; s2 := 3344 * t[1]; s3 := 3803 * t[2]
-    s4 := 1321 * t[2]; s5 := 2482 * t[3]; s6 := 3803 * t[3]
-    b7 := t[0] - t[2] + t[3]
+InverseADST4 :: (t: *TransformLane) {
+    s0 := 1321 * t.values[0]; s1 := 2482 * t.values[0]; s2 := 3344 * t.values[1]; s3 := 3803 * t.values[2]
+    s4 := 1321 * t.values[2]; s5 := 2482 * t.values[3]; s6 := 3803 * t.values[3]
+    b7 := t.values[0] - t.values[2] + t.values[3]
     s0 += s3; s1 -= s4; s3 = s2; s2 = 3344 * b7
     s0 += s5; s1 -= s6
     x3 := s0 + s1 - s3
-    t[0] = Round2Signed(s0 + s3, 12); t[1] = Round2Signed(s1 + s3, 12)
-    t[2] = Round2Signed(s2, 12); t[3] = Round2Signed(x3, 12)
+    t.values[0] = Round2Signed(s0 + s3, 12); t.values[1] = Round2Signed(s1 + s3, 12)
+    t.values[2] = Round2Signed(s2, 12); t.values[3] = Round2Signed(x3, 12)
 }
 
-ADSTInputPermutation :: (t: []s64, n: s64) {
+ADSTInputPermutation :: (t: *TransformLane, n: s64) {
     count := cast(s64)1 << cast(u32)n
     copy: [16]s64
-    for i: 0..count - 1 { copy[i] = t[i] }
-    for i: 0..count - 1 { t[i] = copy[ifx (i & 1) == 1 then i - 1 else count - i - 1] }
+    for i: 0..count - 1 { copy[i] = t.values[i & 63] }
+    for i: 0..count - 1 { t.values[i & 63] = copy[ifx (i & 1) == 1 then i - 1 else count - i - 1] }
 }
 
-ADSTOutputPermutation :: (t: []s64, n: s64) {
+ADSTOutputPermutation :: (t: *TransformLane, n: s64) {
     count := cast(s64)1 << cast(u32)n
     copy: [16]s64
-    for i: 0..count - 1 { copy[i] = t[i] }
+    for i: 0..count - 1 { copy[i] = t.values[i & 63] }
     for i: 0..count - 1 {
         a := (i >> 3) & 1; b := ((i >> 2) & 1) ^ ((i >> 3) & 1)
         c := ((i >> 1) & 1) ^ ((i >> 2) & 1); d := (i & 1) ^ ((i >> 1) & 1)
         index := ((d << 3) | (c << 2) | (b << 1) | a) >> cast(u32)(4 - n)
-        t[i] = ifx (i & 1) == 1 then -copy[index] else copy[index]
+        t.values[i & 63] = ifx (i & 1) == 1 then -copy[index] else copy[index]
     }
 }
 
-InverseADST8 :: (t: []s64, r: u32) {
+InverseADST8 :: (t: *TransformLane, r: u32) {
     ADSTInputPermutation(t, 3)
     for i: 0..3 { Butterfly(t, 2 * i, 2 * i + 1, 60 - 16 * i, true) }
     for i: 0..3 { Hadamard(t, i, 4 + i, false, r) }
@@ -141,7 +154,7 @@ InverseADST8 :: (t: []s64, r: u32) {
     ADSTOutputPermutation(t, 3)
 }
 
-InverseADST16 :: (t: []s64, r: u32) {
+InverseADST16 :: (t: *TransformLane, r: u32) {
     ADSTInputPermutation(t, 4)
     for i: 0..7 { Butterfly(t, 2 * i, 2 * i + 1, 62 - 8 * i, true) }
     for i: 0..7 { Hadamard(t, i, 8 + i, false, r) }
@@ -156,13 +169,13 @@ InverseADST16 :: (t: []s64, r: u32) {
     ADSTOutputPermutation(t, 4)
 }
 
-InverseIdentity :: (t: []s64, n: s64) {
+InverseIdentity :: (t: *TransformLane, n: s64) {
     count := cast(s64)1 << cast(u32)n
     for i: 0..count - 1 {
-        if n == 2 { t[i] = Round2Signed(t[i] * 5793, 12) }
-        else if n == 3 { t[i] = t[i] * 2 }
-        else if n == 4 { t[i] = Round2Signed(t[i] * 11586, 12) }
-        else { t[i] = t[i] * 4 }
+        if n == 2 { t.values[i & 63] = Round2Signed(t.values[i & 63] * 5793, 12) }
+        else if n == 3 { t.values[i & 63] = t.values[i & 63] * 2 }
+        else if n == 4 { t.values[i & 63] = Round2Signed(t.values[i & 63] * 11586, 12) }
+        else { t.values[i & 63] = t.values[i & 63] * 4 }
     }
 }
 
@@ -204,7 +217,7 @@ ValidateInverseTransform :: (width: s32, height: s32, tx_type: s32, bit_depth: s
     return Error(DecodeOK)
 }
 
-Inverse1D :: (t: []s64, kind: s32, n: s64, r: u32) {
+Inverse1D :: (t: *TransformLane, kind: s32, n: s64, r: u32) {
     if kind == TransformKindDCT { InverseDCT(t, n, r) }
     else if kind == TransformKindADST {
         if n == 2 { InverseADST4(t) } else if n == 3 { InverseADST8(t, r) } else { InverseADST16(t, r) }
@@ -240,7 +253,7 @@ InverseTransform2D :: (dequant: []s32, residual: []s32, width: s32, height: s32,
     row_range := cast(u32)(bit_depth + 8)
     column_range := cast(u32)(ifx bit_depth + 6 > 16 then bit_depth + 6 else 16)
     column_high := (cast(s64)1 << (column_range - 1)) - 1; column_low := -column_high - 1
-    t: [64]s64
+    lane: TransformLane
     for i: 0..cast(s64)height - 1 {
         if i >= 32 {
             for j: 0..cast(s64)width - 1 { residual[i * width + j] = 0 }
@@ -258,11 +271,11 @@ InverseTransform2D :: (dequant: []s32, residual: []s32, width: s32, height: s32,
         for j: 0..cast(s64)width - 1 {
             value := ifx j < 32 then cast(s64)dequant[i * width + j] else 0
             if rect { value = Round2Signed(value * 2896, 12) }
-            t[j] = value
+            lane.values[j] = value
         }
-        Inverse1D(t[:width], row_kind, log2w, row_range)
+        Inverse1D(*lane, row_kind, log2w, row_range)
         for j: 0..cast(s64)width - 1 {
-            value := Round2Signed(t[j], row_shift)
+            value := Round2Signed(lane.values[j], row_shift)
             if value < column_low { value = column_low }; if value > column_high { value = column_high }
             residual[i * width + j] = cast(s32)value
         }
@@ -272,12 +285,12 @@ InverseTransform2D :: (dequant: []s32, residual: []s32, width: s32, height: s32,
     for j: 0..cast(s64)width - 1 {
         nonzero := false
         for i: 0..cast(s64)height - 1 {
-            t[i] = cast(s64)residual[i * width + j]
-            if t[i] != 0 { nonzero = true }
+            lane.values[i] = cast(s64)residual[i * width + j]
+            if lane.values[i] != 0 { nonzero = true }
         }
         if !nonzero { continue }
-        Inverse1D(t[:height], column_kind, log2h, column_range)
-        for i: 0..cast(s64)height - 1 { residual[i * width + j] = cast(s32)Round2Signed(t[i], 4) }
+        Inverse1D(*lane, column_kind, log2h, column_range)
+        for i: 0..cast(s64)height - 1 { residual[i * width + j] = cast(s32)Round2Signed(lane.values[i], 4) }
     }
     error = CancellationError(cancellation)
     if error.code != DecodeOK { ClearResidual(residual); return error }
