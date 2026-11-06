@@ -868,9 +868,11 @@ Then, on newer Ziran range proofs and the `#cold` modifier:
   range.
 - `syntax/bits.zi`: `ReadBits` is one out-of-line cold definition, which
   keeps the symbol decoder's inlined renormalization small.
+- `filter/sgr.zi`: short guards restate the caller's bounds, so the box sums
+  and the projection read and write without bounds checks.
 
-It now takes 10 to 195 ms per frame, the medians of one benchmark run: 2 to 6
-times libaom and 4 to 12 times dav1d. Entropy decoding is the largest remaining cost. The
+It now takes 9 to 196 ms per frame, the medians of one benchmark run: 2 to 6
+times libaom and 4 to 11 times dav1d. Entropy decoding is the largest remaining cost. The
 generated C still bounds-checks indices it cannot prove, such as row times
 stride, and calls the symbol decoder out of line. Only the C compiler's own
 vectorization is used: no hand-written SIMD path, thread, other machine,

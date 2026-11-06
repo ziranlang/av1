@@ -50,7 +50,11 @@ SgrXByXPlus1 :: u16.[
 SgrBox :: (input: []u16, stride: s32, width: s32, height: s32,
     set: s32, pass: s32, bit_depth: s32, output: []s32) {
     radius := SgrParameters(set, pass * 2)
-    if radius == 0 { return }
+    // The caller validated these; as comparisons they prove the indexes
+    // below. Short guards keep each proof's fact set small.
+    if radius < 1 || radius > 2 { return }
+    if width < 1 || width > SgrMaximumWidth || height < 1 || height > 8 || stride < width + 6 || stride > 72 { return }
+    if input.count < cast(s64)(height + 5) * stride + width + 6 || output.count < cast(s64)height * SgrMaximumWidth { return }
     epsilon := cast(s64)SgrParameters(set, pass * 2 + 1)
     n := cast(s64)((2 * radius + 1) * (2 * radius + 1))
     n2e := n * n * epsilon
@@ -159,6 +163,11 @@ FilterSgrBlock :: (input: []u16, stride: s32, width: s32, height: s32,
 // output rows output_stride apart.
 SgrFilterInto :: (input: []u16, stride: s32, width: s32, height: s32,
     set: s32, projection0: s32, projection1: s32, bit_depth: s32, output: []u16, output_stride: s32) {
+    if width < 1 || width > SgrMaximumWidth || height < 1 || height > 8 || stride < width + 6 || stride > 72 { return }
+    if input.count < cast(s64)(height + 5) * stride + width + 6 || output_stride < width || output_stride > 4096 ||
+        output.count < (cast(s64)height - 1) * output_stride + width {
+        return
+    }
     maximum := cast(s64)((cast(u64)1 << cast(u64)bit_depth) - 1)
     pass0: [512]s32; pass1: [512]s32
     SgrBox(input, stride, width, height, set, 0, bit_depth, pass0[:])
