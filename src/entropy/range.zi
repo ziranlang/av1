@@ -75,6 +75,7 @@ DecodeSymbol :: (decoder: *RangeDecoder, cdf: []u16) -> s32 {
 
 // The adaptation of 8.2.6 after decoding symbol from the n-symbol cdf.
 AdaptCdf :: (cdf: []u16, n: s32, symbol: s32) {
+    if n < 0 || cast(s64)n >= cdf.count { return }
     rate: s32 = 3
     if cdf[n] > 15 { rate += 1 }
     if cdf[n] > 31 { rate += 1 }

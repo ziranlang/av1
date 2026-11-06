@@ -19,7 +19,9 @@ NewBits :: (input: BorrowedBytes, begin: s64, end: s64) -> BitReader {
 }
 
 // Sticky errors; failed reads return zero and do not consume any input.
-ReadBits :: (reader: *BitReader, count: s32) -> u32 {
+// Headers read it rarely and symbol decoding only near the end, so it stays
+// one out-of-line definition.
+ReadBits :: (reader: *BitReader, count: s32) -> u32 #cold {
     if reader.error.code != DecodeOK { return 0 }
     if count < 0 || count > 32 || reader.begin < 0 || reader.end < reader.begin ||
         reader.end > reader.input.data.count || reader.bit < 0 || reader.bit > 7 ||

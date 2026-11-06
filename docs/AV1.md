@@ -424,6 +424,8 @@ validated before filtering; errors and cancellation return no committed samples.
 The primary strength accepts the intermediate high-bit-depth values produced
 by normative luma variance adjustment. `CdefFilterPadded` is the filter alone for a validated block padded to 16
 samples per row, written at any output stride; the frame CDEF pass uses it.
+`CdefDirectionOf` is the direction search alone for an 8x8 block of real
+samples, also used by the frame pass.
 
 `build-queue -- sh tests/av1_cdef.sh` passed 768 direction and 1,806 filter
 vectors against the pinned libaom scalar functions and an independent reference
@@ -859,8 +861,16 @@ A further set, again with identical output:
 - `filter/cdef.zi`: 4-wide blocks filter two rows per pass, filling all
   eight lanes.
 
-It now takes 10 to 203 ms per frame, best of three runs: 2 to 7 times libaom
-and 4 to 12 times dav1d. Entropy decoding is the largest remaining cost. The
+Then, on newer Ziran range proofs and the `#cold` modifier:
+
+- `filter/cdef.zi`: the direction search runs in 32-bit values without
+  revalidating frame samples, and every tap read of the filter is proven in
+  range.
+- `syntax/bits.zi`: `ReadBits` is one out-of-line cold definition, which
+  keeps the symbol decoder's inlined renormalization small.
+
+It now takes 10 to 195 ms per frame, the medians of one benchmark run: 2 to 6
+times libaom and 4 to 12 times dav1d. Entropy decoding is the largest remaining cost. The
 generated C still bounds-checks indices it cannot prove, such as row times
 stride, and calls the symbol decoder out of line. Only the C compiler's own
 vectorization is used: no hand-written SIMD path, thread, other machine,

@@ -91,6 +91,12 @@ DequantizeInto :: (quant: []s32, width: s32, height: s32, qindex: s32,
             return Error(InvalidInput)
         }
     }
+    // Stated as comparisons, these let the compiler prove the indexes below.
+    if width < 4 || width > 64 || height < 4 || height > 64 || cw < 4 || cw > width || ch < 4 || ch > height ||
+        quant.count < cast(s64)ch * cw || samples.count < cast(s64)height * width ||
+        (weights.count != 0 && weights.count < cast(s64)ch * cw) {
+        return Error(InvalidInput)
+    }
     // The masked product is never negative, so dividing by 1, 2 or 4 shifts.
     shift: u32 = ifx width * height > 1024 then 2 else ifx width * height > 256 then 1 else 0
     limit := cast(s64)1 << cast(u32)(depth + 7)

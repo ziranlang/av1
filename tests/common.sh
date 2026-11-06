@@ -3,8 +3,9 @@ set -eu
 unset DISPLAY WAYLAND_DISPLAY WAYLAND_SOCKET XAUTHORITY DBUS_SESSION_BUS_ADDRESS DBUS_SYSTEM_BUS_ADDRESS SESSION_MANAGER XDG_RUNTIME_DIR
 export ZIRAN_DESKTOP_RECOVERY=0 HARMONY_DESKTOP_RECOVERY=0 YUE_DESKTOP_RECOVERY=0
 root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd -P)
-toolchain=${ZIRAN_ROOT:-$root/../../ziran}
-if test ! -x "$toolchain/build/bin/ziran"; then toolchain=$(ziran pkg path ziran); fi
+# The toolchain the package lock selects, or the checkout an ignored
+# ziran.local.toml override names; ZIRAN_ROOT replaces both.
+toolchain=${ZIRAN_ROOT:-$(cd "$root" && ziran pkg path ziran)}
 # Ziran binaries; the critical path runs on one snapshot of them.
 bin=${ZIRAN_BIN_DIR:-$toolchain/build/bin}
 ziran=${ZIRAN_BIN:-$bin/ziran}

@@ -16,25 +16,47 @@ FindCdefDirection :: (input: []u16, stride: s32, bit_depth: s32,
     if (bit_depth != 8 && bit_depth != 10 && bit_depth != 12) || stride < 8 || stride > 64 ||
         input.count < 7 * cast(s64)stride + 8 || input.count > 4096 { result.error = Error(InvalidInput); return result }
     maximum := cast(u32)((cast(u32)1 << cast(u32)bit_depth) - 1)
-    partial: [120]s64; cost: [8]s64
+    block: CdefLumaBlock
     for row: 0..7 {
-        result.error = CancellationError(cancellation)
-        if result.error.code != DecodeOK { return result }
         for column: 0..7 {
             value := input[row * stride + column]
             if cast(u32)value > maximum { result.error = Error(InvalidInput); return result }
-            x := cast(s64)(cast(s32)(value >> cast(u32)(bit_depth - 8)) - 128)
-            partial[row + column] += x
-            partial[15 + row + column / 2] += x
-            partial[30 + row] += x
-            partial[45 + 3 + row - column / 2] += x
-            partial[60 + 7 + row - column] += x
-            partial[75 + 3 - row / 2 + column] += x
-            partial[90 + column] += x
-            partial[105 + row / 2 + column] += x
+            block.samples[row * 8 + column] = value
         }
     }
-    divisors: [9]s64 = .[0,840,420,280,210,168,140,120,105]
+    found := CdefDirectionOf(*block, bit_depth)
+    result.error = CancellationError(cancellation)
+    if result.error.code != DecodeOK { return result }
+    result.direction = found.direction; result.variance = found.variance
+    return result
+}
+
+CdefLumaBlock :: struct { samples: [64]u16; }
+
+// The direction search alone, for an 8x8 block of real samples at bit_depth
+// 8, 10 or 12, row r column c at samples[r * 8 + c]. Centred on zero, a line
+// of n samples sums to at most 128 * n in magnitude, and its cost weight is
+// 840 / n, so every direction costs at most 128 * 128 * 840 * 64 and all
+// arithmetic fits 32 bits.
+CdefDirectionOf :: (block: *CdefLumaBlock, bit_depth: s32) -> CdefDirection {
+    result: CdefDirection
+    shift := cast(u32)(bit_depth - 8) & 7
+    partial: [120]s32
+    for row: 0..7 {
+        for column: 0..7 {
+            value := cast(s32)(block.samples[row * 8 + column] >> shift) - 128
+            partial[row + column] += value
+            partial[15 + row + column / 2] += value
+            partial[30 + row] += value
+            partial[45 + 3 + row - column / 2] += value
+            partial[60 + 7 + row - column] += value
+            partial[75 + 3 - row / 2 + column] += value
+            partial[90 + column] += value
+            partial[105 + row / 2 + column] += value
+        }
+    }
+    divisors: [9]s32 = .[0,840,420,280,210,168,140,120,105]
+    cost: [8]s32
     for i: 0..7 {
         cost[2] += partial[30 + i] * partial[30 + i]
         cost[6] += partial[90 + i] * partial[90 + i]
@@ -57,10 +79,9 @@ FindCdefDirection :: (input: []u16, stride: s32, bit_depth: s32,
     }
     best: s32
     for direction: 1..7 { if cost[direction] > cost[best] { best = cast(s32)direction } }
-    result.error = CancellationError(cancellation)
-    if result.error.code != DecodeOK { return result }
     result.direction = best
-    result.variance = cast(u32)((cost[best] - cost[(best + 4) & 7]) / 1024)
+    // The best cost is the largest, so the difference is never negative.
+    result.variance = cast(u32)((cost[best] - cost[(best + 4) & 7]) >> 10)
     return result
 }
 
@@ -171,11 +192,11 @@ CdefFilterPadded :: (block: *CdefPadded, width: s32, height: s32,
     clamp := primary_strength != 0 && secondary_strength != 0
     // In a 4-wide block lane k is column k & 3 of row first + (k >> 2); the
     // second row starts 16 samples on, 12 past the fourth lane.
-    pitch: s64 = ifx width == 4 then 12 else 0
+    pitch := (cast(s64)width & 4) * 3
     rows: s64 = ifx width == 4 then 2 else 1
     for pass: 0..7 {
         first := pass * rows
-        if cast(s32)first >= height { break }
+        if first >= cast(s64)height || first > 7 { break }
         line := first * 16
         // Every intermediate fits s16: samples and the missing value are at
         // most 30000, constrained differences at most 240 and the weighted
@@ -185,10 +206,13 @@ CdefFilterPadded :: (block: *CdefPadded, width: s32, height: s32,
             current := cast(s16)block.samples[line + 34 + lane + (lane >> 2) * pitch]
             currents[lane] = current; lows[lane] = current; highs[lane] = current
         }
-        for tap: 0..taps - 1 {
-            offset := tap_offsets[tap] & 127
+        for tap: 0..11 {
+            if tap >= cast(s64)taps { break }
+            // Offsets lie in 0..68, so every read stays in the block.
+            offset := tap_offsets[tap]
             threshold := cast(s16)tap_thresholds[tap]; shift := cast(s16)(tap_shifts[tap] & 15)
             weight := cast(s16)tap_weights[tap]
+            if offset < 0 || offset > 68 { continue }
             neighbors: [8]s16
             for lane: 0..3 { neighbors[lane] = cast(s16)block.samples[line + offset + lane] }
             for lane: 4..7 { neighbors[lane] = cast(s16)block.samples[line + offset + lane + pitch] }

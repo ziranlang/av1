@@ -239,6 +239,12 @@ InverseTransform2D :: (dequant: []s32, residual: []s32, width: s32, height: s32,
     count := cast(s64)width * height
     if error.code == DecodeOK && (dequant.count != count || residual.count != count) { error = Error(InvalidInput) }
     if error.code != DecodeOK { ClearResidual(residual); return error }
+    // Validation implies these; stated as comparisons, they let the compiler
+    // prove every i * width + j and lane index in range.
+    if width < 4 || width > 64 || height < 4 || height > 64 ||
+        dequant.count < cast(s64)height * width || residual.count < cast(s64)height * width {
+        ClearResidual(residual); return Error(InvalidInput)
+    }
     input_limit := cast(s64)1 << cast(u32)(bit_depth + 7)
     for i: 0..count - 1 {
         value := cast(s64)dequant[i]
@@ -261,7 +267,8 @@ InverseTransform2D :: (dequant: []s32, residual: []s32, width: s32, height: s32,
         }
         // Every 1D kernel maps zero input to zero output, so zero rows skip it.
         nonzero := false
-        for j: 0..cast(s64)(ifx width < 32 then width else 32) - 1 {
+        for j: 0..cast(s64)width - 1 {
+            if j >= 32 { break }
             if dequant[i * width + j] != 0 { nonzero = true; break }
         }
         if !nonzero {

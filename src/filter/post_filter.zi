@@ -186,11 +186,10 @@ ApplyIntraCdef :: (frame: *IntraFrame, source: []u16, destination: []u16, header
                 frame.mi[IntraMiAt(frame, row + 1, column + 1) + IntraMiSkip] != 0
             if stored != 0 && !skip {
                 index := cast(s32)stored - 1
-                luma: [64]u16
+                luma: CdefLumaBlock
                 base := PostIndex(frame, 0, column * 4, row * 4)
-                for i: 0..7 { for j: 0..7 { luma[i * 8 + j] = source[base + i * stride0 + j] } }
-                found := FindCdefDirection(luma[:], 8, frame.bit_depth, cancellation)
-                if found.error.code != DecodeOK { return found.error }
+                for i: 0..7 { for j: 0..7 { luma.samples[i * 8 + j] = source[base + i * stride0 + j] } }
+                found := CdefDirectionOf(*luma, frame.bit_depth)
                 primary := header.cdef_y_primary[index] << shift
                 secondary := header.cdef_y_secondary[index] << shift
                 direction: s32 = ifx primary == 0 then 0 else found.direction
