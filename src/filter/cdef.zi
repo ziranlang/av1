@@ -113,28 +113,39 @@ FilterCdefBlock :: (input: []u16, stride: s32, width: s32, height: s32,
     }
     result.error = CancellationError(cancellation)
     if result.error.code != DecodeOK { return result }
-    CdefFilterInto(input, stride, width, height, primary_strength, secondary_strength, damping, direction,
-        bit_depth, result.samples[:], 8)
+    block: CdefPadded
+    for row: 0..height + 3 { for column: 0..width + 3 { block.samples[row * 16 + column] = input[row * stride + column] } }
+    // Output commits only after the last cancellation check.
+    samples: [64]u16
+    CdefFilterPadded(*block, width, height, primary_strength, secondary_strength, damping, direction,
+        bit_depth, samples[:], 8)
     result.error = CancellationError(cancellation)
     if result.error.code != DecodeOK { return result }
-    result.width = width; result.height = height
+    result.samples = samples; result.width = width; result.height = height
     return result
 }
 
-// The filter of a validated block, written to output rows output_stride apart.
+CdefPadded :: struct { samples: [256]u16; }
+
+// The filter of a validated block padded to 16 samples per row: halo row r,
+// column c is samples[r * 16 + c], written to output rows output_stride
+// apart. Each block row filters eight columns at once, so a tap's loop over
+// the row is straight-line code; only the first width columns are stored.
+// A missing neighbor is 30000, at least 25905 above any sample; shifted by at
+// most 10 - log2(threshold) its magnitude still exceeds the threshold, so its
+// constrained difference is zero and it is left out of the maximum only.
 // Taps of a zero strength add nothing; with a single nonzero strength the
 // weights sum to 12, so the result already lies within the taps' range and the
 // clamp is skipped.
-CdefFilterInto :: (input: []u16, stride: s32, width: s32, height: s32,
+CdefFilterPadded :: (block: *CdefPadded, width: s32, height: s32,
     primary_strength: s32, secondary_strength: s32, damping: s32, direction: s32, bit_depth: s32,
     output: []u16, output_stride: s32) {
     scale := cast(s32)(cast(u32)1 << cast(u32)(bit_depth - 8))
-    // Pairs are (dy,dx), two distances for each of eight directions.
     directions: [32]s32 = .[-1,1,-2,2,0,1,-1,2,0,1,0,2,0,1,1,2,1,1,2,2,1,0,2,1,1,0,2,0,1,0,2,-1]
     primary_taps: [4]s32 = .[4,2,3,3]
-    // The taps of this block: offset from the centre sample, weight,
-    // threshold and damping shift, resolved once instead of per sample.
-    tap_offsets: [12]s32; tap_weights: [12]s32; tap_thresholds: [12]s32; tap_shifts: [12]u32
+    // Offsets are from the top-left halo sample to the neighbor of the
+    // centre sample (row 2, column 2), so they are never negative.
+    tap_offsets: [12]s64; tap_weights: [12]s32; tap_thresholds: [12]s32; tap_shifts: [12]s32
     taps: s32 = 0
     for tap: 0..1 {
         for family: 0..2 {
@@ -149,38 +160,54 @@ CdefFilterInto :: (input: []u16, stride: s32, width: s32, height: s32,
             if strength == 0 { continue }
             for side: 0..1 {
                 sign: s32 = ifx side == 0 then -1 else 1
-                tap_offsets[taps] = sign * (directions[(filter_direction * 2 + tap) * 2] * stride +
-                    directions[(filter_direction * 2 + tap) * 2 + 1])
+                tap_offsets[taps] = cast(s64)(34 + sign * (directions[(filter_direction * 2 + tap) * 2] * 16 +
+                    directions[(filter_direction * 2 + tap) * 2 + 1]))
                 tap_weights[taps] = weight; tap_thresholds[taps] = strength
-                tap_shifts[taps] = CdefDampingShift(strength, damping)
+                tap_shifts[taps] = cast(s32)CdefDampingShift(strength, damping)
                 taps += 1
             }
         }
     }
     clamp := primary_strength != 0 && secondary_strength != 0
-    for row: 0..height - 1 {
-        for column: 0..width - 1 {
-            centre := (row + 2) * stride + column + 2
-            current := cast(s32)input[centre]
-            minimum := current; maximum_sample := current; sum: s32
-            for tap: 0..taps - 1 {
-                sample := input[centre + tap_offsets[tap]]
-                if sample == CdefMissingSample { continue }
-                value := cast(s32)sample
-                difference := value - current
+    for row: 0..7 {
+        if cast(s32)row >= height { break }
+        line := row * 16
+        // Every intermediate fits s16: samples and the missing value are at
+        // most 30000, constrained differences at most 240 and the weighted
+        // sum at most 12 * 4 * 240.
+        currents: [8]s16; sums: [8]s16; lows: [8]s16; highs: [8]s16
+        for column: 0..7 {
+            current := cast(s16)block.samples[line + 34 + column]
+            currents[column] = current; lows[column] = current; highs[column] = current; sums[column] = 0
+        }
+        for tap: 0..taps - 1 {
+            offset := tap_offsets[tap] & 127
+            threshold := cast(s16)tap_thresholds[tap]; shift := cast(s16)(tap_shifts[tap] & 15)
+            weight := cast(s16)tap_weights[tap]
+            for column: 0..7 {
+                value := cast(s16)block.samples[line + offset + column]
+                difference := value - currents[column]
                 magnitude := ifx difference < 0 then -difference else difference
-                constrained := tap_thresholds[tap] - cast(s32)(cast(u32)magnitude >> tap_shifts[tap])
+                constrained := threshold - (magnitude >> shift)
                 if constrained < 0 { constrained = 0 }
                 if constrained > magnitude { constrained = magnitude }
-                sum += tap_weights[tap] * (ifx difference < 0 then -constrained else constrained)
-                if value < minimum { minimum = value }; if value > maximum_sample { maximum_sample = value }
+                sums[column] += weight * (ifx difference < 0 then -constrained else constrained)
+                if value < lows[column] { lows[column] = value }
+                real: s16 = ifx value == CdefMissingSample then 0 else value
+                if real > highs[column] { highs[column] = real }
             }
-            negative: s32 = ifx sum < 0 then 1 else 0
-            value := current + CdefFloor16(8 + sum - negative)
-            if clamp {
-                if value < minimum { value = minimum }; if value > maximum_sample { value = maximum_sample }
-            }
-            output[row * output_stride + column] = cast(u16)value
         }
+        results: [8]s32
+        for column: 0..7 {
+            sum := cast(s32)sums[column]
+            negative: s32 = ifx sum < 0 then 1 else 0
+            value := cast(s32)currents[column] + CdefFloor16(8 + sum - negative)
+            if clamp {
+                if value < cast(s32)lows[column] { value = cast(s32)lows[column] }
+                if value > cast(s32)highs[column] { value = cast(s32)highs[column] }
+            }
+            results[column] = value
+        }
+        for column: 0..width - 1 { output[cast(s64)row * output_stride + column] = cast(u16)results[column & 7] }
     }
 }

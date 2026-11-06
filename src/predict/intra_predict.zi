@@ -73,11 +73,6 @@ IntraSmoothWeights :: u8.[
     65,61,57,54,50,47,44,41,38,35,32,29,27,25,22,20,18,16,15,
     13,12,10,9,8,7,6,6,5,5,4,4,4]
 
-// Table reads inside loops go through these procedures: zi2zir rejects some
-// direct reads of a constant table there ("cannot bind aggregate constant").
-IntraSmoothWeight :: (at: s64) -> s32 { return cast(s32)IntraSmoothWeights[at] }
-IntraFilterTap :: (at: s64) -> s32 { return cast(s32)IntraFilterTaps[at] }
-
 // Intra_Filter_Taps[mode][output (i1 << 2) + j1][neighbor 0..6].
 IntraFilterTaps :: s8.[
     -6,10,0,0,0,12,0, -5,2,10,0,0,9,0, -3,1,1,10,0,7,0, -3,1,1,2,10,5,0,
@@ -291,10 +286,10 @@ PredictSmoothIntra :: (out: []u16, stride: s32, edges: *IntraEdges, mode: s32) {
     right := edges.above[IntraEdgeOffset + width - 1]
     for i: 0..cast(s64)height - 1 {
         line := i * stride
-        wy := IntraSmoothWeight(y_base + i)
+        wy := cast(s32)IntraSmoothWeights[y_base + i]
         left := edges.left[IntraEdgeOffset + i]
         for j: 0..cast(s64)width - 1 {
-            wx := IntraSmoothWeight(x_base + j)
+            wx := cast(s32)IntraSmoothWeights[x_base + j]
             above := edges.above[IntraEdgeOffset + j]
             value: s32
             if mode == 9 {
@@ -347,7 +342,7 @@ PredictRecursiveIntra :: (out: []u16, stride: s32, edges: *IntraEdges, filter_mo
             }
             for k: 0..7 {
                 sum: s32
-                for i: 0..6 { sum += IntraFilterTap((filter_mode * 8 + k) * 7 + i) * neighbors[i] }
+                for i: 0..6 { sum += cast(s32)IntraFilterTaps[(filter_mode * 8 + k) * 7 + i] * neighbors[i] }
                 value := ifx sum >= 0 then (sum + 8) >> 4 else -((-sum + 8) >> 4)
                 if value < 0 { value = 0 }
                 if value > maximum { value = maximum }
