@@ -13,7 +13,7 @@ for form in source saved; do
     "$ziran" build --target=c --exe --entry "$module:main" "$@" -o "$out/$form" "$input"
     "$out/$form/$module"
     "$ziran" bundle --entry "$module:main" "$@" -o "$out/$form.zx" "$input"
-    test "$("$bin/zi2zx-vm" run "$out/$form.zx")" = 0
+    test "$("$bin/zi2zx" run --vm "$out/$form.zx")" = 0
     "$ziran" build --target=go --pkg main --entry "$module:main" "$@" -o "$out/$form-go" "$input"
     printf 'package main\nfunc main() { if Av1KeyControlsVectors_Main() != 0 { panic("AV1 full key controls") } }\n' > "$out/$form-go/main.go"
     (cd "$out/$form-go" && GO111MODULE=off go build -o run . && ./run)
@@ -26,7 +26,7 @@ python3 - "$out" <<'PY'
 import json,pathlib,sys
 out=pathlib.Path(sys.argv[1]);receipt=json.loads((out/'oracle.json').read_text())
 receipt.update(command='build-queue -- sh tests/av1_key_controls.sh',exit_code=0,
-    forms=['source','saved IR'],targets=['C','Go','direct zi2zx-vm'],sanitizers=['ASan','UBSan'])
+    forms=['source','saved IR'],targets=['C','Go','zi2zx run --vm'],sanitizers=['ASan','UBSan'])
 (out/'receipt.json').write_text(json.dumps(receipt,indent=2)+'\n')
 PY
-printf '%s\n' 'AV1 full-key size/timing controls: pinned native headers/planes, source/saved C/Go/directVM + ASan/UBSan passed'
+printf '%s\n' 'AV1 full-key size/timing controls: pinned native headers/planes, source/saved C/Go/VM + ASan/UBSan passed'

@@ -34,8 +34,8 @@
     "name": "av1"
   },
   "toolchain": {
-    "commit": "079a48695f146b607ed7516bdf1d48706cd5f829",
-    "ref": "079a48695f146b607ed7516bdf1d48706cd5f829",
+    "commit": "56bcbef342a453a57c72bd380871da0d42edaa4c",
+    "ref": "56bcbef342a453a57c72bd380871da0d42edaa4c",
     "url": "https://github.com/ziranlang/ziran.git"
   }
 }

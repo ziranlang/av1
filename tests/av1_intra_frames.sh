@@ -18,7 +18,7 @@ for form in source saved; do
     "$ziran" build --target=c --exe --entry "$module:main" "$@" -o "$out/$form" "$input"
     "$out/$form/$module"
     "$ziran" bundle --entry "$module:main" "$@" -o "$out/$form.zx" "$input"
-    test "$("$bin/zi2zx-vm" run "$out/$form.zx")" = 0
+    test "$("$bin/zi2zx" run --vm "$out/$form.zx")" = 0
 done
 CFLAGS='-O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer' LDFLAGS='-fsanitize=address,undefined' \
     "$ziran" build --target=c --exe --entry "$module:main" --root "$out" \
@@ -28,7 +28,7 @@ python3 - "$out" <<'PY'
 import json,pathlib,sys
 out=pathlib.Path(sys.argv[1]);receipt=json.loads((out/'oracle.json').read_text())
 receipt.update(command='build-queue -- sh tests/av1_intra_frames.sh',exit_code=0,
-    forms=['source','saved IR'],targets=['Go','C','direct zi2zx-vm'],sanitizers=['ASan','UBSan'])
+    forms=['source','saved IR'],targets=['Go','C','zi2zx run --vm'],sanitizers=['ASan','UBSan'])
 (out/'receipt.json').write_text(json.dumps(receipt,indent=2)+'\n')
 PY
-printf '%s\n' 'AV1 intra frames: pinned libaom lossy/lossless stills (tiles, 128 SB, palette, CfL, filter intra, segmentation, delta q, 8/10/12-bit, mono/420/422/444) with and without deblocking/CDEF/loop restoration bit-exact, source/saved Go/C/directVM + ASan/UBSan passed'
+printf '%s\n' 'AV1 intra frames: pinned libaom lossy/lossless stills (tiles, 128 SB, palette, CfL, filter intra, segmentation, delta q, 8/10/12-bit, mono/420/422/444) with and without deblocking/CDEF/loop restoration bit-exact, source/saved Go/C/VM + ASan/UBSan passed'

@@ -38,7 +38,7 @@ for module in $modules; do
         "$ziran" build --target=c --exe --entry "$module:main" "$@" -o "$suite/$form" "$input"
         "$suite/$form/$module"
         "$ziran" bundle --entry "$module:main" "$@" -o "$suite/$form.zx" "$input"
-        test "$("$bin/zi2zx-vm" run "$suite/$form.zx")" = 0
+        test "$("$bin/zi2zx" run --vm "$suite/$form.zx")" = 0
         "$ziran" build --target=go --pkg main --entry "$module:main" "$@" -o "$suite/$form-go" "$input"
         go_entry=$(python3 -c 'import sys; print("".join(x.capitalize() for x in sys.argv[1].split("_")) + "_Main")' "$module")
         printf 'package main\nfunc main() { if %s() != 0 { panic("AV1 header parity") } }\n' "$go_entry" > "$suite/$form-go/main.go"
@@ -56,7 +56,7 @@ out = pathlib.Path(sys.argv[1])
 receipt = json.loads((out / 'oracle.json').read_text())
 receipt['frame_oracle'] = json.loads((out / 'frame_oracle.json').read_text())
 receipt.update(command='build-queue -- sh tests/av1_headers.sh', exit_code=0,
-    forms=['source', 'saved IR'], targets=['C', 'Go', 'direct zi2zx-vm'], sanitizers=['ASan', 'UBSan'])
+    forms=['source', 'saved IR'], targets=['C', 'Go', 'zi2zx run --vm'], sanitizers=['ASan', 'UBSan'])
 (out / 'receipt.json').write_text(json.dumps(receipt, indent=2) + '\n')
 PY
 fi

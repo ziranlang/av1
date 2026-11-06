@@ -15,7 +15,7 @@ for module in av1_lossless_vectors av1_coefficient_edges; do
         "$ziran" build --target=c --exe --entry "$module:main" "$@" -o "$suite/$form" "$input"
         "$suite/$form/$module"
         "$ziran" bundle --entry "$module:main" "$@" -o "$suite/$form.zx" "$input"
-        test "$("$bin/zi2zx-vm" run "$suite/$form.zx")" = 0
+        test "$("$bin/zi2zx" run --vm "$suite/$form.zx")" = 0
         "$ziran" build --target=go --pkg main --entry "$module:main" "$@" -o "$suite/$form-go" "$input"
         entry=$(python3 -c 'import sys; print("".join(x.capitalize() for x in sys.argv[1].split("_")) + "_Main")' "$module")
         printf 'package main\nfunc main() { if %s() != 0 { panic("AV1 lossless coefficient plane parity") } }\n' "$entry" > "$suite/$form-go/main.go"
@@ -34,9 +34,9 @@ receipt=dict(command='build-queue -- sh tests/av1_coefficients.sh',exit_code=0,
     oracle_revision=oracle['revision'],oracle_library_sha256=oracle['library_sha256'],
     encoder=oracle['encoder'],real_lossless_inputs=len(cases),decoded_planes=len(cases),
     invalid_prefixes=sum(len(case['data']) for case in cases),
-    depths=[8,10,12],forms=['source','saved IR'],targets=['C','Go','direct zi2zx-vm'],
+    depths=[8,10,12],forms=['source','saved IR'],targets=['C','Go','zi2zx run --vm'],
     sanitizers=['ASan','UBSan'],boundaries=json.loads((out/'edge_oracle.json').read_text()),
     scope='lossless 8x8 monochrome stills and Golomb boundary frames against native libaom')
 (out/'receipt.json').write_text(json.dumps(receipt,indent=2)+'\n')
 PY
-printf '%s\n' 'AV1 lossless coefficients/WHT: pinned native 8x8 planes and Golomb boundary frames, source/saved C/Go/directVM + ASan/UBSan passed'
+printf '%s\n' 'AV1 lossless coefficients/WHT: pinned native 8x8 planes and Golomb boundary frames, source/saved C/Go/VM + ASan/UBSan passed'

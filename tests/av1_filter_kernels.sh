@@ -14,7 +14,7 @@ def digest(path):
 files=[root/'src'/name for name in ('filter/deblock.zi','filter/cdef.zi','filter/wiener.zi','filter/sgr.zi',)]
 files += [root/'tests/common.sh',root/'tests/av1_lossless_oracle.py',root/'tests/av1_filter_kernels.sh']
 for name in ('deblock','cdef','wiener','sgr'):files.extend(sorted((root/'tests').glob(f'av1_{name}.*')));files.append(root/'tests'/f'av1_{name}_oracle.py')
-files += [bin/name for name in ('ziran','zi2zir','zi2c','zi2go','zi2zx','zi2zx-vm')]
+files += [bin/name for name in ('ziran','zi2zir','zi2c','zi2go','zi2zx')]
 (out/'inputs-before.json').write_text(json.dumps({str(p.resolve()):digest(p) for p in files},indent=2)+'\n')
 PY
 for stage in deblock cdef wiener sgr; do

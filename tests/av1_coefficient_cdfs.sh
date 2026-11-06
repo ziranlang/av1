@@ -12,7 +12,7 @@ files += [root/'tests'/name for name in ('av1_coefficient_cdfs.zi','av1_coeffici
 import os
 # The critical path runs on one binary snapshot; hash the binaries in use.
 bin_dir=pathlib.Path(os.environ.get('ZIRAN_BIN_DIR') or toolchain/'build/bin')
-files += [bin_dir/name for name in ('ziran','zi2zir','zi2c','zi2go','zi2zx','zi2zx-vm')]
+files += [bin_dir/name for name in ('ziran','zi2zir','zi2c','zi2go','zi2zx')]
 inputs={}
 for path in files:
     h=hashlib.sha256()
@@ -35,7 +35,7 @@ while IFS= read -r module; do
         "$ziran" build --target=c --exe --entry "$module:main" "$@" -o "$out/$module/$form" "$input"
         "$out/$module/$form/$module"
         "$ziran" bundle --entry "$module:main" "$@" -o "$out/$module/$form.zx" "$input"
-        test "$("$bin/zi2zx-vm" run "$out/$module/$form.zx")" = 0
+        test "$("$bin/zi2zx" run --vm "$out/$module/$form.zx")" = 0
         "$ziran" build --target=go --pkg main --entry "$module:main" "$@" -o "$out/$module/$form-go" "$input"
         printf 'package main\nfunc main() { if Av1CoefficientCdfVectors%s_Main() != 0 { panic("AV1 coefficient CDFs") } }\n' "${module##*_}" > "$out/$module/$form-go/main.go"
         (cd "$out/$module/$form-go" && GO111MODULE=off go build -o run . && ./run)
@@ -55,9 +55,9 @@ for name,expected in inputs.items():
         for block in iter(lambda:f.read(1024*1024),b''):h.update(block)
     if h.hexdigest()!=expected:raise SystemExit('Coefficient CDF input changed during run: '+name)
 receipt.update(command='build-queue -- sh tests/av1_coefficient_cdfs.sh',exit_code=0,
-    forms=['source','saved IR'],targets=['C','Go','direct zi2zx-vm'],sanitizers=['ASan','UBSan'],sanitizer_optimization='-O0',
+    forms=['source','saved IR'],targets=['C','Go','zi2zx run --vm'],sanitizers=['ASan','UBSan'],sanitizer_optimization='-O0',
     inputs=inputs,inputs_unchanged=True,
     scope='native default probabilities, bounded row addresses and tile-owned adaptive symbol reads; general coefficient/frame integration incomplete')
 (out/'receipt.json').write_text(json.dumps(receipt,indent=2)+'\n')
 PY
-printf '%s\n' 'AV1 coefficient CDFs: native defaults/selectors/adaptive symbols/independent ownership, source/saved C/Go/directVM + ASan/UBSan passed; general coefficient integration pending'
+printf '%s\n' 'AV1 coefficient CDFs: native defaults/selectors/adaptive symbols/independent ownership, source/saved C/Go/VM + ASan/UBSan passed; general coefficient integration pending'

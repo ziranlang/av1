@@ -1,11 +1,41 @@
 #!/bin/sh
-# Run through build-queue. This suite reports the current authored scope
+# Run directly, not under build-queue: the setup, every stage and each
+# conformance shard take their own build-queue ticket, so other projects
+# build between them. This suite reports the current authored scope
 # explicitly; no full-AV1 claim is implied and the AVIF facade default is unchanged.
 set -eu
-. "$(dirname -- "$0")/common.sh"
+root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd -P)
 # Every stage runs on one private copy of the Ziran binaries, so peers may
 # rebuild the shared toolchain while this suite runs.
 snapshot="$root/build/toolchain"
+queue=
+if command -v build-queue >/dev/null 2>&1; then queue='build-queue --'; fi
+step=${1:-}
+case "$step" in
+'')
+    cd "$root"
+    $queue sh tests/av1_critical_path.sh setup
+    for stage in obu_range headers entropy_tiles coefficient_cdf_data scalar_kernels transform_type inverse_transform intra_predict filter_intra directional palette chroma color_palette color_palette_boundaries key_frames key_controls coefficients still_partitions boundaries filter_kernels grain_kernels grain_frames intra_frames engine_parity obu_framing conformance; do
+        if test "$stage" = conformance; then
+            $queue env ZIRAN_BIN_DIR="$snapshot" ZIRAN_BIN="$snapshot/ziran" AV1_CONFORMANCE_SHARDS=prepare sh tests/av1_conformance.sh
+            shards=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["shards"])' build/scratch/av1-conformance/oracle.json)
+            shard=0
+            while test "$shard" -lt "$shards"; do
+                $queue env ZIRAN_BIN_DIR="$snapshot" ZIRAN_BIN="$snapshot/ziran" AV1_CONFORMANCE_SHARDS="$shard" sh tests/av1_conformance.sh
+                shard=$((shard + 1))
+            done
+        else
+            $queue env ZIRAN_BIN_DIR="$snapshot" ZIRAN_BIN="$snapshot/ziran" sh "tests/av1_$stage.sh"
+        fi
+        printf '%s\n' "$stage" >> build/scratch/av1/stages-passed.txt
+    done
+    $queue sh tests/av1_critical_path.sh finish
+    exit 0;;
+setup|finish) ;;
+*) printf 'usage: sh tests/av1_critical_path.sh\n' >&2; exit 1;;
+esac
+. "$root/tests/common.sh"
+if test "$step" = setup; then
 python3 - "$root" "$toolchain" "$bin" "$ziran" "$snapshot" <<'PY'
 import hashlib,json,pathlib,shutil,subprocess,sys
 root,toolchain,bin,ziran,snapshot=map(pathlib.Path,sys.argv[1:6]);out=root/'build/scratch/av1'
@@ -19,7 +49,7 @@ def tree(path):
     return {str(file.relative_to(path)):digest(file) for file in sorted(path.rglob('*')) if file.is_file()}
 shutil.rmtree(snapshot,ignore_errors=True);snapshot.mkdir(parents=True)
 binaries={}
-for name in ('ziran','zi2zir','zi2c','zi2go','zi2zx','zi2zx-vm'):
+for name in ('ziran','zi2zir','zi2c','zi2go','zi2zx'):
     source=ziran if name=='ziran' else bin/name
     before=digest(source);shutil.copy2(source,snapshot/name)
     if digest(source)!=before or digest(snapshot/name)!=before:raise SystemExit(f'Ziran binary changed while copying: {source}')
@@ -32,11 +62,8 @@ files=sorted((root/'src').rglob('*'))+sorted((root/'tests').glob('av1_*'))+[root
 (out/'sources-start.json').write_text(json.dumps({str(path.relative_to(root)):digest(path) for path in files if path.is_file()},indent=2)+'\n')
 (out/'stages-passed.txt').write_text('')
 PY
-export ZIRAN_BIN_DIR="$snapshot" ZIRAN_BIN="$snapshot/ziran"
-for stage in obu_range headers entropy_tiles coefficient_cdf_data scalar_kernels transform_type inverse_transform intra_predict filter_intra directional palette chroma color_palette color_palette_boundaries key_frames key_controls coefficients still_partitions boundaries filter_kernels grain_kernels grain_frames intra_frames engine_parity obu_framing conformance; do
-    sh "tests/av1_$stage.sh"
-    printf '%s\n' "$stage" >> "$root/build/scratch/av1/stages-passed.txt"
-done
+exit 0
+fi
 python3 - "$root" "$toolchain" "$snapshot" <<'PY'
 import datetime,hashlib,json,os,pathlib,subprocess,sys
 root,toolchain,snapshot=map(pathlib.Path,sys.argv[1:4])
@@ -47,7 +74,7 @@ def digest(path):
     return hasher.hexdigest()
 files=sorted((root/'src').rglob('*'))+sorted((root/'tests').glob('av1_*'))+[root/'tests/common.sh',root/'docs/AV1.md']
 before=json.loads((root/'build/scratch/av1/toolchain-start.json').read_text())
-binaries={name:digest(snapshot/name) for name in ('ziran','zi2zir','zi2c','zi2go','zi2zx','zi2zx-vm')}
+binaries={name:digest(snapshot/name) for name in ('ziran','zi2zir','zi2c','zi2go','zi2zx')}
 if before['binary_sha256']!=binaries:raise SystemExit('Toolchain snapshot changed during AV1 suite; no integrated pass receipt written')
 std={str(file.relative_to(toolchain/'std')):digest(file) for file in sorted((toolchain/'std').rglob('*')) if file.is_file()}
 sources={str(path.relative_to(root)):digest(path) for path in files if path.is_file()}
@@ -56,7 +83,7 @@ if json.loads((root/'build/scratch/av1/sources-start.json').read_text())!=source
 stages='obu_range headers entropy_tiles coefficient_cdf_data scalar_kernels transform_type inverse_transform intra_predict filter_intra directional palette chroma color_palette color_palette_boundaries key_frames key_controls coefficients still_partitions boundaries filter_kernels grain_kernels grain_frames intra_frames engine_parity obu_framing conformance'.split()
 if (root/'build/scratch/av1/stages-passed.txt').read_text().splitlines()!=stages:
     raise SystemExit('Owned AV1 stage completion list is incomplete; no integrated pass receipt written')
-receipt=dict(command='build-queue -- sh tests/av1_critical_path.sh',exit_code=0,
+receipt=dict(command='sh tests/av1_critical_path.sh',exit_code=0,
     recorded_at=datetime.datetime.now(datetime.timezone.utc).isoformat(),
     dependency_source_overrides={key:os.environ[key] for key in ('IMAGE_CODEC_ROOT','AV1_AOM_SOURCE','AV1_DAV1D_SOURCE') if key in os.environ},
     implementation_status='incomplete: shown KEY intra frames decode bit-exact against pinned libaom on the local corpus and the pinned libaom test-vector KEY units; inter frames and the tools below reject',

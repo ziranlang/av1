@@ -14,7 +14,7 @@ for form in source saved; do
     CFLAGS="${CFLAGS:-} -fstack-usage" "$ziran" build --target=c --exe --entry av1_engine_parity:main "$@" -o "$out/$form" "$input"
     "$out/$form/av1_engine_parity"
     "$ziran" bundle --entry av1_engine_parity:main "$@" -o "$out/$form.zx" "$input"
-    test "$("$bin/zi2zx-vm" run "$out/$form.zx")" = 0
+    test "$("$bin/zi2zx" run --vm "$out/$form.zx")" = 0
     "$ziran" build --target=go --pkg main --entry av1_engine_parity:main "$@" -o "$out/$form-go" "$input"
     printf 'package main\nfunc main() { if Av1EngineParity_Main() != 0 { panic("AV1 zero-residual still parity") } }\n' > "$out/$form-go/main.go"
     (cd "$out/$form-go" && GO111MODULE=off go build -o run . && ./run)
@@ -51,11 +51,11 @@ import json,pathlib,sys
 out=pathlib.Path(sys.argv[1])
 receipt=dict(command='build-queue -- sh tests/av1_engine_parity.sh',exit_code=0,
     scope='8x8 monochrome DC zero-residual reduced still only; full engine pending',
-    depths=[8,10,12], forms=['source','saved IR'], targets=['C','Go','direct zi2zx-vm'],
+    depths=[8,10,12], forms=['source','saved IR'], targets=['C','Go','zi2zx run --vm'],
     sanitizers=['ASan','UBSan'],repeated_decodes=32,invalid_prefixes=14,
     allocation_failure='one allocation fails, no pixels/worker/scratch retained',
     fixtures=[json.loads((out/f'fixture-{d}'/'fixture.json').read_text()) for d in (8,10,12)],
     working_memory=json.loads((out/'working-memory.json').read_text()))
 (out/'receipt.json').write_text(json.dumps(receipt,indent=2)+'\n')
 PY
-printf '%s\n' 'AV1 initial zero-residual still: owned YUV parity, limits/cancellation/reuse, source/saved C/Go/directVM + ASan/UBSan passed; full engine pending'
+printf '%s\n' 'AV1 initial zero-residual still: owned YUV parity, limits/cancellation/reuse, source/saved C/Go/VM + ASan/UBSan passed; full engine pending'

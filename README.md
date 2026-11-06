@@ -13,7 +13,7 @@ slower than libaom and dav1d; `tests/av1_benchmark.sh` measures it. See
 [docs/AV1.md](docs/AV1.md) for the module layout, contracts and tests.
 
 ```sh
-build-queue -- sh tests/av1_critical_path.sh
+sh tests/av1_critical_path.sh
 ```
 
 libaom and dav1d are pinned test oracles only; no product module calls a native

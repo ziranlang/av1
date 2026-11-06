@@ -13,3 +13,5 @@
 - Faster CDEF direction search and filtering.
 - Faster self-guided restoration.
 - CDEF filtering on SIMD vectors.
+- Tests run bundles on the portable VM with `zi2zx run --vm`.
+- The critical path runs each stage and conformance shard in its own build-queue ticket.

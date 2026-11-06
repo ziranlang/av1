@@ -759,8 +759,9 @@ Run from this package:
 build-queue -- sh tests/av1_obu_range.sh
 ```
 
-`build-queue -- sh tests/av1_critical_path.sh` runs 26 combined owned stages,
-including the transform, prediction, filter and grain kernels, encoded-grain
+`sh tests/av1_critical_path.sh` runs 26 combined owned stages, each stage and
+each conformance shard in its own build-queue ticket so other projects build
+between them. They include the transform, prediction, filter and grain kernels, encoded-grain
 frames, the 46 libaom intra frames, OBU framing and the conformance corpus.
 `tests/av1_obu_framing.sh` checks 96 framing variants (split headers, tile
 groups, redundant/padding/reserved OBUs, layer dropping and malformed orders);
@@ -769,8 +770,11 @@ fetches libaom's 240 IVF test vectors into ignored `build/corpus`, verified
 against the pinned `test-data.sha1`. Every native frame must match the
 upstream MD5. Each KEY unit, plus one small inter unit per vector, must then
 be bit-exact or reject as pinned in `tests/av1_conformance_expected.json`.
-`AV1_CONFORMANCE_DISCOVER=1` only reports outcomes for review. Its receipt
-records the tested source hashes, six canonical compiler binary hashes and
+`AV1_CONFORMANCE_DISCOVER=1` only reports outcomes for review.
+`AV1_CONFORMANCE_SHARDS=prepare` only builds the shards; `N` or `FIRST-LAST`
+then runs those shards, and the stage receipt appears once all have passed.
+The critical path receipt
+records the tested source hashes, five canonical compiler binary hashes and
 individual stage receipts under ignored build artifacts. It rejects source/test
 or compiler-binary changes during its run. A previous
 receipt remains a historical snapshot when later implementation is in progress.
@@ -783,10 +787,10 @@ its config headers under ignored `build/native/aom` when it is missing.
 `AV1_AOM_ENCODER_LIBRARY` may point to the same verified pinned oracle
 elsewhere. Product modules never link it. The tests use the canonical
 toolchain selected by `tests/common.sh`, including `ZIRAN_ROOT`, take its
-binaries from `ZIRAN_BIN_DIR` (default `build/bin`) and invoke `zi2zx-vm run`
-directly to avoid native dispatch by the normal launcher. The critical path
-copies the six binaries once into ignored `build/toolchain` and runs every stage
-on that copy, so a rebuild of the shared toolchain cannot change them mid-run.
+binaries from `ZIRAN_BIN_DIR` (default `build/bin`) and run bundles with
+`zi2zx run --vm`, so they execute on the portable VM rather than as native
+code. The critical path copies the five binaries once into ignored
+`build/toolchain` and runs every stage on that copy, so a rebuild of the shared toolchain cannot change them mid-run.
 
 The deterministic seed `0x415631` covers 192 libaom symbol/CDF cases (10,538
 accepted symbols), counters 0/15/16/31/32, update enable/disable, flat and endpoint
