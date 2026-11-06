@@ -12,17 +12,18 @@ from av1_lossless_oracle import PIN, digest, run
 HOST=r'''
 #include <stdint.h>
 #include <stdio.h>
-static uint16_t random_register;
+typedef struct { uint16_t random_register; } aom_grain_rng_t;
+static aom_grain_rng_t rng;
 '''
 MAIN=r'''
 int main(void) {
   int mode,index,count;
   while(scanf("%d%d%d",&mode,&index,&count)==3) {
     if(mode==0) {
-      random_register=index;
+      rng.random_register=index;
       for(int i=0;i<count;i++) {
-        int bits=1+(i+index)%16,value=get_random_number(bits);
-        printf("%d %u ",value,random_register);
+        int bits=1+(i+index)%16,value=get_random_number(&rng,bits);
+        printf("%d %u ",value,rng.random_register);
       }
     } else {
       int points[14][2]={{0}},lut[256]={0};

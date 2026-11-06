@@ -66,7 +66,7 @@ int main(int argc,char **argv) {
   for(int i=eob;i<cw*ch;i++)if(coeff[scan[i]])return 7;
   if(eob&&!coeff[scan[eob-1]])return 8;
   aom_dsp_rtcd();av1_rtcd();aom_writer writer={0};writer.allow_update_cdf=!disable;
-  aom_start_encode(&writer,output);av1_write_coeffs_txb(cm,x,&writer,0,0,p,0,tx);
+  aom_start_encode(&writer,output,sizeof output);av1_write_coeffs_txb(cm,x,&writer,0,0,p,0,tx);
   if(aom_stop_encode(&writer)<0)return 9;
   printf("%u",writer.pos);for(unsigned i=0;i<writer.pos;i++)printf(" %u",output[i]);puts("");
   pool(fc);free(fc);free(x);free(cm);return 0;

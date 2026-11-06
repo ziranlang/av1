@@ -25,7 +25,7 @@ sys.path.insert(0,str(Path(__file__).resolve().parent))
 from av1_conformance_fetch import pins, vectors
 from av1_frame_oracle import UNHEX, zi_hex
 
-PIN='d772e334cc724105040382a977ebb10dfd393293'
+PIN='b141d9c45db236335351c8a4b2a14b3ade27c937'
 SHARD_BYTES=400000
 INTER_LIMIT=8192
 HOST=r'''

@@ -12,7 +12,7 @@ from pathlib import Path
 import shlex
 import subprocess
 
-PIN = 'd772e334cc724105040382a977ebb10dfd393293'
+PIN = 'b141d9c45db236335351c8a4b2a14b3ade27c937'
 HOST = r'''
 #include <stdio.h>
 #include <stdint.h>

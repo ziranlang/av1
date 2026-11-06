@@ -70,7 +70,7 @@ def main():
     parser.add_argument('--out',type=Path,required=True)
     parser.add_argument('--aom',type=Path,required=True)
     args=parser.parse_args()
-    pin='d772e334cc724105040382a977ebb10dfd393293'
+    pin='b141d9c45db236335351c8a4b2a14b3ade27c937'
     if run(['git','-C',str(args.aom),'rev-parse','HEAD'],text=True,capture_output=True).stdout.strip()!=pin:
         raise SystemExit('libaom pin mismatch')
     run(['git','-C',str(args.aom),'diff','--quiet','HEAD','--'])

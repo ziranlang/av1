@@ -16,7 +16,7 @@ ref = "360553150917f352e49e1beb78917370792ccaef"
 # Test oracle only; no product module links it.
 [dependencies.libaom]
 git = "https://aomedia.googlesource.com/aom"
-ref = "d772e334cc724105040382a977ebb10dfd393293"
+ref = "b141d9c45db236335351c8a4b2a14b3ade27c937"
 source = true
 
 # Test oracle only; no product module links it.

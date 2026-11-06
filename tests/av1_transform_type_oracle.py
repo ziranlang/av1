@@ -41,7 +41,7 @@ int main(int argc,char **argv) {
   if(filter>=0){mi.filter_intra_mode_info.use_filter_intra=1;mi.filter_intra_mode_info.filter_intra_mode=filter;}
   int set=get_ext_tx_set(tx,inter,reduced),square=txsize_sqr_map[tx],type_set=av1_get_ext_tx_set_type(tx,inter,reduced);
   int n=av1_num_ext_tx_set[type_set];printf("%d %d %d\n",set,square,n);
-  unsigned char bytes[4096];aom_writer w={0};w.allow_update_cdf=!disable;aom_start_encode(&w,bytes);
+  unsigned char bytes[4096];aom_writer w={0};w.allow_update_cdf=!disable;aom_start_encode(&w,bytes,sizeof bytes);
   int expected[64];for(int i=0;i<64;i++) {
     int value=(i*7+mode)%16;
     while(!av1_ext_tx_used[type_set][value])value=(value+1)%16;

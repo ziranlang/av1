@@ -18,8 +18,7 @@ HOST=r'''
 #include <string.h>
 #include "aom_dsp/aom_dsp_common.h"
 #include "aom_dsp/grain_params.h"
-static uint16_t random_register;
-static int grain_min,grain_max;
+typedef struct { uint16_t random_register; } aom_grain_rng_t;
 static const int gauss_bits=11;
 '''
 MAIN=r'''
@@ -44,9 +43,9 @@ int main(void) {
     }
     positions[pos][2]=1;pred[pos]=positions[pos];
     int ygrain[82*73]={0},cb[82*73]={0},cr[82*73]={0};
-    grain_min=-(128<<(depth-8));grain_max=(128<<(depth-8))-1;random_register=p.random_seed;
-    generate_luma_grain_block(&p,pred,ygrain,73,82,82,3,3,3,0);
-    if(!mono&&!generate_chroma_grain_blocks(&p,pred,ygrain,cb,cr,82,ch,cw,cw,3,3,3,0,sy,sx))return 1;
+    aom_grain_rng_t rng={p.random_seed};
+    generate_luma_grain_block(&p,&rng,pred,ygrain,73,82,82,3,3,3,0);
+    if(!mono&&!generate_chroma_grain_blocks(&p,&rng,pred,ygrain,cb,cr,82,ch,cw,cw,3,3,3,0,sy,sx))return 1;
     printf("%d %d %d %d %d %d ",index,depth,mono,sx,sy,mono?0:cw);
     printf("%d ",mono?0:ch);
     for(int plane=0;plane<3;plane++)for(int y=0;y<73;y++)for(int x=0;x<82;x++) {

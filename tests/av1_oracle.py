@@ -15,7 +15,7 @@ import random
 import shlex
 import subprocess
 
-PIN = "d772e334cc724105040382a977ebb10dfd393293"
+PIN = "b141d9c45db236335351c8a4b2a14b3ade27c937"
 SPEC = "5e04f3f75e73a5898d7616c47c52f032144b8f80"
 HOST = r'''
 #include <stdio.h>

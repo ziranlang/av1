@@ -765,8 +765,11 @@ its config headers under ignored `build/native/aom` when it is missing.
 `AV1_AOM_SOURCE`, `AV1_AOM_LIBRARY`, `AV1_AOM_CONFIG` and
 `AV1_AOM_ENCODER_LIBRARY` may point to the same verified pinned oracle
 elsewhere. Product modules never link it. The tests use the canonical
-toolchain selected by `tests/common.sh`, including `ZIRAN_ROOT`, and invokes
-`build/bin/zi2zx-vm run` directly to avoid native dispatch by the normal launcher.
+toolchain selected by `tests/common.sh`, including `ZIRAN_ROOT`, take its
+binaries from `ZIRAN_BIN_DIR` (default `build/bin`) and invoke `zi2zx-vm run`
+directly to avoid native dispatch by the normal launcher. The critical path
+copies the six binaries once into ignored `build/toolchain` and runs every stage
+on that copy, so a rebuild of the shared toolchain cannot change them mid-run.
 
 The deterministic seed `0x415631` covers 192 libaom symbol/CDF cases (10,538
 accepted symbols), counters 0/15/16/31/32, update enable/disable, flat and endpoint
@@ -793,8 +796,8 @@ tests at revision `5e04f3f75e73a5898d7616c47c52f032144b8f80`:
 `04.conventions.md`, `06.bitstream.syntax.md`, `07.bitstream.semantics.md` and
 `08.decoding.process.md`, `09.parsing.process.md` in [AOMediaCodec/av1-spec](https://github.com/AOMediaCodec/av1-spec/tree/5e04f3f75e73a5898d7616c47c52f032144b8f80).
 
-The differential oracle is [libaom](https://aomedia.googlesource.com/aom/+/d772e334cc724105040382a977ebb10dfd393293/),
-revision `d772e334cc724105040382a977ebb10dfd393293`, using its unmodified
+The differential oracle is [libaom](https://aomedia.googlesource.com/aom/+/b141d9c45db236335351c8a4b2a14b3ade27c937/),
+revision `b141d9c45db236335351c8a4b2a14b3ade27c937`, using its unmodified
 `od_ec_decode_cdf_q15`, `od_ec_dec_tell` and `update_cdf`. It is a pinned
 correctness reference, not a current performance comparison. The upstream
 source retains its BSD 2-Clause and AOM Patent licenses in its source package;

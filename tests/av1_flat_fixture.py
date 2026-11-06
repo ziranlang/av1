@@ -10,7 +10,7 @@ from pathlib import Path
 import shlex
 import subprocess
 
-PIN='d772e334cc724105040382a977ebb10dfd393293'
+PIN='b141d9c45db236335351c8a4b2a14b3ade27c937'
 REFERENCE={
     8:bytes([18,0,10,5,24,8,191,33,80,50,3,16,0,48]),
     10:bytes([18,0,10,5,24,8,191,35,80,50,3,16,0,48]),
