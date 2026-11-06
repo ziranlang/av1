@@ -99,27 +99,32 @@ PostFloorLog2 :: (value: u32) -> s32 {
 PostCdefPlane :: (frame: *IntraFrame, source: []u16, destination: []u16, plane: s32,
     row: s32, column: s32, primary: s32, secondary: s32, damping: s32, direction: s32,
     cancellation: *Cancellation) -> DecodeError {
+    error := CancellationError(cancellation)
+    if error.code != DecodeOK { return error }
+    // Zero strengths leave the block as copied into destination.
+    if primary == 0 && secondary == 0 { return Error(DecodeOK) }
     sx := IntraSubX(frame, plane); sy := IntraSubY(frame, plane)
     x0 := (column * 4) >> sx; y0 := (row * 4) >> sy
     w := 8 >> sx; h := 8 >> sy
+    columns: [12]bool
+    for j: 0..w + 3 {
+        x := x0 + cast(s32)j - 2
+        columns[j] = x >= 0 && ((x << sx) >> 2) < frame.mi_cols
+    }
     input: [144]u16
     for i: 0..h + 3 {
         y := y0 + cast(s32)i - 2
-        for j: 0..w + 3 {
-            x := x0 + cast(s32)j - 2
-            value := cast(u16)CdefMissingSample
-            if y >= 0 && x >= 0 && ((y << sy) >> 2) < frame.mi_rows && ((x << sx) >> 2) < frame.mi_cols {
-                value = source[PostIndex(frame, plane, x, y)]
+        if y >= 0 && ((y << sy) >> 2) < frame.mi_rows {
+            line := PostIndex(frame, plane, x0 - 2, y)
+            for j: 0..w + 3 {
+                input[i * 12 + j] = ifx columns[j] then source[line + j] else cast(u16)CdefMissingSample
             }
-            input[i * 12 + j] = value
+        } else {
+            for j: 0..w + 3 { input[i * 12 + j] = cast(u16)CdefMissingSample }
         }
     }
-    block := FilterCdefBlock(input[:], 12, w, h, primary, secondary, damping, direction, frame.bit_depth, cancellation)
-    if block.error.code != DecodeOK { return block.error }
-    for i: 0..h - 1 {
-        line := PostIndex(frame, plane, x0, y0 + cast(s32)i)
-        for j: 0..w - 1 { destination[line + j] = block.samples[i * 8 + j] }
-    }
+    CdefFilterInto(input[:], 12, w, h, primary, secondary, damping, direction, frame.bit_depth,
+        destination[PostIndex(frame, plane, x0, y0):], frame.plane_stride[plane])
     return Error(DecodeOK)
 }
 

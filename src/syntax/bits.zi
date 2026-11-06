@@ -29,14 +29,20 @@ ReadBits :: (reader: *BitReader, count: s32) -> u32 {
     required := cast(s64)((reader.bit + count + 7) / 8)
     if count == 0 { return 0 }
     if required > reader.end - reader.byte { reader.error = Error(TruncatedInput, reader.end); return 0 }
-    value: u32
+    // Whole remaining bits of each byte at once, at most five bytes.
+    value: u64
     remaining := count
+    at := reader.byte; bit := reader.bit
     while remaining > 0 {
-        value = (value << 1) | ((cast(u32)reader.input.data[reader.byte] >> cast(u32)(7 - reader.bit)) & 1)
-        reader.bit += 1; remaining -= 1
-        if reader.bit == 8 { reader.byte += 1; reader.bit = 0 }
+        available := 8 - bit
+        take := ifx remaining < available then remaining else available
+        chunk := cast(u64)reader.input.data[at] >> cast(u64)(available - take)
+        value = (value << cast(u64)take) | (chunk & ((cast(u64)1 << cast(u64)take) - 1))
+        remaining -= take; bit += take
+        if bit == 8 { at += 1; bit = 0 }
     }
-    return value
+    reader.byte = at; reader.bit = bit
+    return cast(u32)value
 }
 
 ReadSignedBits :: (reader: *BitReader, count: s32) -> s32 {

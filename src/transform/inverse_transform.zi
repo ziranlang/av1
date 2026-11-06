@@ -249,6 +249,15 @@ InverseTransform2D :: (dequant: []s32, residual: []s32, width: s32, height: s32,
             for j: 0..cast(s64)width - 1 { residual[i * width + j] = 0 }
             continue
         }
+        // Every 1D kernel maps zero input to zero output, so zero rows skip it.
+        nonzero := false
+        for j: 0..cast(s64)(ifx width < 32 then width else 32) - 1 {
+            if dequant[i * width + j] != 0 { nonzero = true; break }
+        }
+        if !nonzero {
+            for j: 0..cast(s64)width - 1 { residual[i * width + j] = 0 }
+            continue
+        }
         for j: 0..cast(s64)width - 1 {
             value := ifx j < 32 then cast(s64)dequant[i * width + j] else 0
             if rect { value = Round2Signed(value * 2896, 12) }
@@ -264,7 +273,12 @@ InverseTransform2D :: (dequant: []s32, residual: []s32, width: s32, height: s32,
     error = CancellationError(cancellation)
     if error.code != DecodeOK { ClearResidual(residual); return error }
     for j: 0..cast(s64)width - 1 {
-        for i: 0..cast(s64)height - 1 { t[i] = cast(s64)residual[i * width + j] }
+        nonzero := false
+        for i: 0..cast(s64)height - 1 {
+            t[i] = cast(s64)residual[i * width + j]
+            if t[i] != 0 { nonzero = true }
+        }
+        if !nonzero { continue }
         Inverse1D(t[:height], column_kind, log2h, column_range, table[:])
         for i: 0..cast(s64)height - 1 { residual[i * width + j] = cast(s32)Round2Signed(t[i], 4) }
     }

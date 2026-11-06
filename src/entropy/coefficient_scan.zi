@@ -37,33 +37,37 @@ BuildCoefficientScan :: (width: s32, height: s32, mode: s32,
     cw := ifx width < 32 then width else 32; ch := ifx height < 32 then height else 32
     count := cw * ch
     result: CoefficientScan
-    if mode == ScanRows || mode == ScanColumns {
-        for i: 0..count - 1 {
-            if i % cw == 0 {
-                error = CancellationError(cancellation)
-                if error.code != DecodeOK { return ScanFailure(error) }
-            }
-            position := ifx mode == ScanRows then i else (i % ch) * cw + i / ch
-            result.positions[i] = cast(u16)position; result.inverse[position] = cast(u16)i
-        }
-    } else {
-        at: s32
-        for diagonal: 0..cw + ch - 2 {
-            error = CancellationError(cancellation)
-            if error.code != DecodeOK { return ScanFailure(error) }
-            low := ifx diagonal >= cw then diagonal - cw + 1 else 0
-            high := ifx diagonal < ch then diagonal else ch - 1
-            reverse := cw > ch || (cw == ch && (diagonal & 1) == 0)
-            for i: 0..high - low {
-                row := ifx reverse then high - i else low + i
-                column := diagonal - row; position := row * cw + column
-                result.positions[at] = cast(u16)position; result.inverse[position] = cast(u16)at
-                at += 1
-            }
-        }
-    }
+    CoefficientScanPrefix(result.positions[:], cw, ch, mode, count)
+    for i: 0..count - 1 { result.inverse[cast(s32)result.positions[i]] = cast(u16)i }
     error = CancellationError(cancellation)
     if error.code != DecodeOK { return ScanFailure(error) }
     result.count = count; result.coded_width = cw; result.coded_height = ch
     return result
+}
+
+// The first count scan positions of a validated coded cw x ch rectangle, so a
+// block stops at its end of block.
+CoefficientScanPrefix :: (positions: []u16, cw: s32, ch: s32, mode: s32, count: s32) {
+    if mode == ScanRows {
+        for i: 0..count - 1 { positions[i] = cast(u16)i }
+        return
+    }
+    if mode == ScanColumns {
+        for i: 0..count - 1 { positions[i] = cast(u16)((i % ch) * cw + i / ch) }
+        return
+    }
+    at: s32
+    diagonal: s32
+    while at < count {
+        low := ifx diagonal >= cw then diagonal - cw + 1 else 0
+        high := ifx diagonal < ch then diagonal else ch - 1
+        reverse := cw > ch || (cw == ch && (diagonal & 1) == 0)
+        i: s32
+        while i <= high - low && at < count {
+            row := ifx reverse then high - i else low + i
+            positions[at] = cast(u16)(row * cw + diagonal - row)
+            at += 1; i += 1
+        }
+        diagonal += 1
+    }
 }

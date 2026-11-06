@@ -10,7 +10,10 @@ files=[root/'src'/name for name in ('entropy/coefficient_neighbors.zi','entropy/
 files += [root/'tests'/name for name in ('av1_coefficient_neighbors.zi','av1_coefficient_neighbors.sh',
     'av1_coefficient_neighbors_oracle.py','av1_coefficient_neighbors_abi.zi','av1_coefficient_neighbors_abi.py',
     'av1_coefficient_context_oracle.py','av1_coefficient_scan_oracle.py','av1_quantization_oracle.py','common.sh')]
-files += [toolchain/'build/bin'/name for name in ('ziran','zi2zir','zi2c','zi2go','zi2zx','zi2zx-vm')]
+import os
+# The critical path runs on one binary snapshot; hash the binaries in use.
+bin_dir=pathlib.Path(os.environ.get('ZIRAN_BIN_DIR') or toolchain/'build/bin')
+files += [bin_dir/name for name in ('ziran','zi2zir','zi2c','zi2go','zi2zx','zi2zx-vm')]
 inputs={}
 for path in files:
     h=hashlib.sha256()

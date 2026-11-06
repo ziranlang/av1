@@ -19,6 +19,20 @@ CoefficientBlockFailure :: (error: DecodeError) -> CoefficientBlock {
     result: CoefficientBlock; result.error = error; return result
 }
 
+// DecodeNonzeroCoefficients' result; the coefficients go to the caller's buffer.
+CoefficientSummary :: struct {
+    eob: s32;
+    level: s32;
+    dc_category: s32;
+    coded_width: s32;
+    coded_height: s32;
+    error: DecodeError;
+}
+
+CoefficientSummaryFailure :: (error: DecodeError) -> CoefficientSummary {
+    result: CoefficientSummary; result.error = error; return result
+}
+
 // Read before transform-type syntax. On nonzero luma the caller reads that
 // syntax, resolves the legal plane transform, then calls ReadNonzeroCoefficients.
 ReadCoefficientSkip :: (decoder: *RangeDecoder, cdfs: *CoefficientCDFs,
@@ -44,68 +58,99 @@ ReadCoefficientSkip :: (decoder: *RangeDecoder, cdfs: *CoefficientCDFs,
 ReadNonzeroCoefficients :: (decoder: *RangeDecoder, cdfs: *CoefficientCDFs,
     width: s32, height: s32, tx_class: s32, plane: s32, dc_context: s32,
     cancellation: *Cancellation = null) -> CoefficientBlock {
+    result: CoefficientBlock
+    summary := DecodeNonzeroCoefficients(decoder, cdfs, width, height, tx_class, plane, dc_context,
+        result.quant[:], cancellation)
+    if summary.error.code != DecodeOK { return CoefficientBlockFailure(summary.error) }
+    result.eob = summary.eob; result.level = summary.level; result.dc_category = summary.dc_category
+    result.coded_width = summary.coded_width; result.coded_height = summary.coded_height
+    return result
+}
+
+// ReadNonzeroCoefficients into quant, the caller's compact row-major buffer of
+// at least the coded count. On failure quant holds partial values.
+DecodeNonzeroCoefficients :: (decoder: *RangeDecoder, cdfs: *CoefficientCDFs,
+    width: s32, height: s32, tx_class: s32, plane: s32, dc_context: s32, quant: []s32,
+    cancellation: *Cancellation = null) -> CoefficientSummary {
     error := CancellationError(cancellation)
-    if error.code != DecodeOK { return CoefficientBlockFailure(error) }
+    if error.code != DecodeOK { return CoefficientSummaryFailure(error) }
     if decoder == null || cdfs == null || plane < 0 || plane > 1 || dc_context < 0 || dc_context > 2 ||
         tx_class < 0 || tx_class > 2 {
-        return CoefficientBlockFailure(Error(InvalidInput))
+        return CoefficientSummaryFailure(Error(InvalidInput))
     }
     shape := GetCoefficientShape(width, height)
-    if shape.error.code != DecodeOK { return CoefficientBlockFailure(shape.error) }
+    if shape.error.code != DecodeOK { return CoefficientSummaryFailure(shape.error) }
+    if (tx_class != CoefficientClass2D && (width > 16 || height > 16)) || quant.count < cast(s64)shape.count {
+        return CoefficientSummaryFailure(Error(InvalidInput))
+    }
     mode: s32 = ScanDefault
     if tx_class == CoefficientClassHorizontal { mode = ScanColumns }
     if tx_class == CoefficientClassVertical { mode = ScanRows }
-    scan := BuildCoefficientScan(width, height, mode, cancellation)
-    if scan.error.code != DecodeOK { return CoefficientBlockFailure(scan.error) }
     symbol := ReadCoefficientSymbol(decoder, cdfs, CoefficientCDFEOB, shape.area,
         plane, ifx tx_class == CoefficientClass2D then 0 else 1, cancellation)
-    if symbol.error.code != DecodeOK { return CoefficientBlockFailure(symbol.error) }
+    if symbol.error.code != DecodeOK { return CoefficientSummaryFailure(symbol.error) }
     point := symbol.value + 1
     eob := ifx point < 2 then point else cast(s32)(cast(u32)1 << cast(u32)(point - 2)) + 1
     if point >= 3 {
         symbol = ReadCoefficientSymbol(decoder, cdfs, CoefficientCDFExtra,
             shape.size_context, plane, point - 3, cancellation)
-        if symbol.error.code != DecodeOK { return CoefficientBlockFailure(symbol.error) }
+        if symbol.error.code != DecodeOK { return CoefficientSummaryFailure(symbol.error) }
         eob += cast(s32)(cast(u32)symbol.value << cast(u32)(point - 3))
         bit := point - 4
         while bit >= 0 {
             eob += cast(s32)(ReadBool(decoder) << cast(u32)bit); bit -= 1
         }
     }
-    if decoder.error.code != DecodeOK { return CoefficientBlockFailure(decoder.error) }
-    if eob < 1 || eob > shape.count { return CoefficientBlockFailure(Error(MalformedInput, decoder.bits.byte)) }
-    result: CoefficientBlock; levels: [1024]u8
+    if decoder.error.code != DecodeOK { return CoefficientSummaryFailure(decoder.error) }
+    if eob < 1 || eob > shape.count { return CoefficientSummaryFailure(Error(MalformedInput, decoder.bits.byte)) }
+    if cdfs.error.code != DecodeOK { return CoefficientSummaryFailure(cdfs.error) }
+    cw := ifx width < 32 then width else 32; ch := ifx height < 32 then height else 32
+    log_width: s32 = 2
+    while (cast(s32)1 << log_width) < cw { log_width += 1 }
+    positions: [1024]u16
+    CoefficientScanPrefix(positions[:], cw, ch, mode, eob)
+    // CDF rows of this block's size and plane, as SelectCoefficientCDF lays them out.
+    row_plane := shape.size_context * 2 + plane
+    base_cdfs := 213 + row_plane * 42 * 5
+    eob_cdfs := 3153 + row_plane * 4 * 4
+    br_cdfs := 2313 + ((ifx shape.size_context > 3 then 3 else shape.size_context) * 2 + plane) * 21 * 5
+    stride := CoefficientLevelStride(cw)
+    for i: 0..shape.count - 1 { quant[i] = 0 }
+    result: CoefficientSummary; levels: [1296]u8
     index := eob - 1
     while index >= 0 {
-        position := cast(s32)scan.positions[index]
-        contexts := GetCoefficientContexts(levels[:shape.count], width, height,
-            position, index, tx_class, index == eob - 1, cancellation)
-        if contexts.error.code != DecodeOK { return CoefficientBlockFailure(contexts.error) }
-        family := ifx index == eob - 1 then CoefficientCDFBaseEOB else CoefficientCDFBase
-        symbol = ReadCoefficientSymbol(decoder, cdfs, cast(s32)family,
-            shape.size_context, plane, contexts.base, cancellation)
-        if symbol.error.code != DecodeOK { return CoefficientBlockFailure(symbol.error) }
-        level := symbol.value + (ifx index == eob - 1 then 1 else 0)
+        position := cast(s32)positions[index]
+        row := position >> log_width; column := position & (cw - 1)
+        contexts := CoefficientContextsAt(levels[:], stride, row, column,
+            width, height, index, tx_class, index == eob - 1)
+        level: s32
+        if index == eob - 1 {
+            at := eob_cdfs + contexts.base * 4
+            level = DecodeSymbol(decoder, cdfs.values[at:at + 4]) + 1
+        } else {
+            at := base_cdfs + contexts.base * 5
+            level = DecodeSymbol(decoder, cdfs.values[at:at + 5])
+        }
+        if decoder.error.code != DecodeOK { return CoefficientSummaryFailure(decoder.error) }
         if level > 2 {
+            at := br_cdfs + contexts.br * 5
             for extension: 0..3 {
-                symbol = ReadCoefficientSymbol(decoder, cdfs, CoefficientCDFBR,
-                    shape.size_context, plane, contexts.br, cancellation)
-                if symbol.error.code != DecodeOK { return CoefficientBlockFailure(symbol.error) }
-                level += symbol.value
-                if symbol.value < 3 { break }
+                value := DecodeSymbol(decoder, cdfs.values[at:at + 5])
+                if decoder.error.code != DecodeOK { return CoefficientSummaryFailure(decoder.error) }
+                level += value
+                if value < 3 { break }
             }
         }
-        levels[position] = cast(u8)level; index -= 1
+        levels[row * stride + column] = cast(u8)level; index -= 1
     }
     for i: 0..eob - 1 {
-        error = CancellationError(cancellation)
-        if error.code != DecodeOK { return CoefficientBlockFailure(error) }
-        position := cast(s32)scan.positions[i]; level := cast(s32)levels[position]
+        position := cast(s32)positions[i]
+        level := cast(s32)levels[(position >> log_width) * stride + (position & (cw - 1))]
         sign: s32
         if level != 0 {
             if i == 0 {
                 symbol = ReadCoefficientSymbol(decoder, cdfs, CoefficientCDFDC, 0, plane, dc_context, cancellation)
-                if symbol.error.code != DecodeOK { return CoefficientBlockFailure(symbol.error) }
+                if symbol.error.code != DecodeOK { return CoefficientSummaryFailure(symbol.error) }
                 sign = symbol.value
             } else { sign = cast(s32)ReadBool(decoder) }
         }
@@ -114,19 +159,19 @@ ReadNonzeroCoefficients :: (decoder: *RangeDecoder, cdfs: *CoefficientCDFs,
             length: s32
             while ReadBool(decoder) == 0 && decoder.error.code == DecodeOK {
                 length += 1
-                if length >= 20 { return CoefficientBlockFailure(Error(MalformedInput, decoder.bits.byte)) }
+                if length >= 20 { return CoefficientSummaryFailure(Error(MalformedInput, decoder.bits.byte)) }
             }
             extra := (cast(u32)1 << cast(u32)length) | ReadLiteral(decoder, length)
             level = cast(s32)(extra + 14)
         }
-        if decoder.error.code != DecodeOK { return CoefficientBlockFailure(decoder.error) }
+        if decoder.error.code != DecodeOK { return CoefficientSummaryFailure(decoder.error) }
         if position == 0 && level != 0 { result.dc_category = ifx sign == 1 then 1 else 2 }
         level &= 1048575; result.level += level
-        result.quant[position] = ifx sign == 1 then -level else level
+        quant[position] = ifx sign == 1 then -level else level
     }
     error = CancellationError(cancellation)
-    if error.code != DecodeOK { return CoefficientBlockFailure(error) }
+    if error.code != DecodeOK { return CoefficientSummaryFailure(error) }
     if result.level > 63 { result.level = 63 }
-    result.eob = eob; result.coded_width = scan.coded_width; result.coded_height = scan.coded_height
+    result.eob = eob; result.coded_width = cw; result.coded_height = ch
     return result
 }

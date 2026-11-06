@@ -18,7 +18,7 @@ def main():
         'Av1YUVResult','PartitionCDF',
         'IntraModeCDF','FilterIntraCDF','PaletteCDF','PaletteUVCDF','PaletteBlock','PaletteCache','PaletteIndexContext','ChromaModeCDF','ChromaModeResult','Residual4x4',
         'FilmGrainParams','FilmGrainResult','GrainRandom','GrainNumber','GrainScaling','GrainNoise','GrainPlanes',
-        'IntraFrame','IntraTile','IntraBlock','IntraTileCDFs','IntraEdges','CoefficientBlock','DequantBlock',
+        'IntraFrame','IntraTile','IntraBlock','IntraTileCDFs','IntraEdges','CoefficientSummary',
         'TransformCoefficientContexts','TransformTypeResult','QuantizerIndex','CoefficientSymbol','TileGroupCursor','TileSpanResult']
     host=a.out/'native_layout.c'
     # Every generated product header; the test entry's own header declares main.
@@ -52,9 +52,10 @@ def main():
         'Av1YUVResult':2,'PartitionCDF':3,'IntraModeCDF':3,'FilterIntraCDF':3,'ChromaModeCDF':3,'ChromaModeResult':2,
         'PaletteCDF':3,'PaletteUVCDF':3,'PaletteBlock':1,'PaletteCache':3,'PaletteIndexContext':3,'Residual4x4':2,
         'FilmGrainParams':10,'FilmGrainResult':4,'GrainRandom':4,'GrainNumber':6,'GrainScaling':8,'GrainNoise':4,'GrainPlanes':3,
-        'IntraFrame':2,'IntraTile':2,'IntraBlock':2,'IntraTileCDFs':4,'IntraEdges':2,'CoefficientBlock':3,'DequantBlock':3,
+        'IntraFrame':2,'IntraTile':2,'IntraBlock':2,'IntraTileCDFs':4,'IntraEdges':2,'CoefficientSummary':3,
         'TransformCoefficientContexts':2,'TransformTypeResult':3,'QuantizerIndex':3,'CoefficientSymbol':2,'TileGroupCursor':2,'TileSpanResult':2}
-    # Tile state already embeds its result/CDF arrays; these separate copies
+    # Tile state already embeds its result/CDF arrays and the coefficient and
+    # dequantization buffers; these separate copies
     # intentionally count factories, return values and caller temporaries too.
     record_bound=sum(sizes[name]*count for name,count in copies.items())
     fixed_leaf_recursion_and_scalar_allowance=32768

@@ -9,7 +9,10 @@ root,toolchain,out=map(pathlib.Path,sys.argv[1:])
 files=[root/'src'/name for name in ('transform/transform_type.zi','transform/transform_type_data.zi','entropy/coefficient_geometry.zi','entropy/range.zi',)]
 files += [root/'tests'/name for name in ('av1_transform_type.zi','av1_transform_type.sh',
     'av1_transform_type_oracle.py','av1_coefficient_context_oracle.py','av1_coefficient_scan_oracle.py','av1_quantization_oracle.py','common.sh')]
-files += [toolchain/'build/bin'/name for name in ('ziran','zi2zir','zi2c','zi2go','zi2zx','zi2zx-vm')]
+import os
+# The critical path runs on one binary snapshot; hash the binaries in use.
+bin_dir=pathlib.Path(os.environ.get('ZIRAN_BIN_DIR') or toolchain/'build/bin')
+files += [bin_dir/name for name in ('ziran','zi2zir','zi2c','zi2go','zi2zx','zi2zx-vm')]
 inputs={}
 for path in files:
     h=hashlib.sha256()

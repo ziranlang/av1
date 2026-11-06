@@ -72,7 +72,7 @@ import each other with package-local file imports; `decoder` is the only export.
   bounded virtual zero padding. Reads past the permitted padding return
   `TruncatedInput` at the interval end. `FinishRange` verifies `exit_symbol`'s
   one bit and zero tail and rejects reuse after success. Callers must finish a
-  tile; decoding a symbol alone does not validate its termination.
+  tile; decoding a symbol alone does not validate its termination. `DecodeSymbol` is the same decode without the CDF scan, for CDFs the decoder owns.
 
 Input slices borrow caller storage synchronously; keep it alive and unchanged.
 There are no allocations, threads, globals or retained callbacks in V01.
@@ -419,7 +419,7 @@ unavailable neighbors, and returns a block with stride 8. Center samples must
 be real samples. Bounds, source depth, strengths, direction and damping are
 validated before filtering; errors and cancellation return no committed samples.
 The primary strength accepts the intermediate high-bit-depth values produced
-by normative luma variance adjustment.
+by normative luma variance adjustment. `CdefFilterInto` is the filter alone for a validated block, written at any output stride; the frame CDEF pass uses it.
 
 `build-queue -- sh tests/av1_cdef.sh` passed 768 direction and 1,806 filter
 vectors against the pinned libaom scalar functions and an independent reference
@@ -570,7 +570,7 @@ responsibility. Products use widened arithmetic, the normative 24-bit magnitude
 mask, transform-size division and source-depth clipping. The owned 4,096-cell
 result uses the full transform width; cells outside the coded upper-left
 rectangle and inactive cells remain zero. Errors and cancellation return no
-coefficients. Borrowed inputs remain unchanged.
+coefficients. Borrowed inputs remain unchanged. `DequantizeInto` writes the same values into a caller buffer.
 
 `build-queue -- sh tests/av1_quantization.sh` passed 98,304 lookup/delta cases and
 114 dequantization vectors across 8/10/12-bit depth and all nineteen sizes.
@@ -596,7 +596,7 @@ Matrix-data kernel tests are not encoded-frame conformance tests.
 32 coefficient mapping. `ScanRows` and `ScanColumns` cover the nine sizes whose
 longest side is at most 16. The result owns forward and inverse 1,024-entry
 `u16` maps, the compact coded dimensions and the active count. Inactive entries
-remain zero; invalid dimensions/modes and cancellation commit no maps.
+remain zero; invalid dimensions/modes and cancellation commit no maps. `CoefficientScanPrefix` fills only the first positions, up to a block's end.
 
 The tile caller selects the scan mode from `PlaneTxType`, including selecting
 the default scan for transforms with a 64-pixel side before one-dimensional type
@@ -628,7 +628,7 @@ provides a matching scan index/position and validates frame transform legality.
 Default contexts cover all nineteen sizes; one-dimensional contexts cover the
 nine sizes with longest side at most 16. No CDF, input or decoder state mutates.
 Invalid dimensions, positions, classes, slice counts and cancellation return
-zero context fields with an error.
+zero context fields with an error. `CoefficientContextsAt` selects over levels padded with four zero columns and rows (`CoefficientLevelStride`).
 
 `build-queue -- sh tests/av1_coefficient_context.sh` passed 111 native level
 planes and 108,096 context-field comparisons at 27,024 positions. Zero,
@@ -669,7 +669,7 @@ coefficient integration is described below and used by the frame decoder.
 `ReadNonzeroCoefficients`. Keeping them separate lets the caller read luma
 transform-type syntax between skip and nonzero coefficients, as required by
 the specification. The caller resolves the legal transform class and neighbor
-contexts. No transform-type syntax is omitted inside this component.
+contexts. No transform-type syntax is omitted inside this component. `DecodeNonzeroCoefficients` writes the coefficients into a caller buffer instead of returning them.
 
 The reader covers nineteen transform sizes, the permitted 2D/horizontal/vertical
 coefficient classes, all EOB areas, reverse base/BR levels, forward signs and
@@ -800,15 +800,28 @@ the three sample hashes agree. The receipt
 `build/scratch/av1-benchmark/receipt.json` records the medians, iteration
 counts and allocation calls per decode for one machine.
 
-On 2026-11-06, on a Ryzen 9 9950X, the authored decoder took 21 to 428 ms per
-frame. That is 3 to 12 times libaom and 6 to 24 times dav1d. It makes 9 to 11
-allocation calls per decode at every frame size, so no allocation happens per
-block. A gprof profile showed self-guided restoration, CDEF and coefficient
-context derivation on top. Column box sums and shift rounding in
-`filter/sgr.zi`, per-block CDEF taps in `filter/cdef.zi` and a swap-network
-bit reversal in `transform/inverse_transform.zi` cut 16 to 29 percent from
-the first baseline, with identical output. No SIMD path, thread, other
-machine, cold start or energy figure has been measured.
+On 2026-11-06, on a Ryzen 9 9950X, the authored decoder first took 28 to 576
+ms per frame. It makes 9 to 11 allocation calls per decode at every frame
+size, so no allocation happens per block. gprof profiles then guided scalar
+changes, each with identical output:
+
+- `filter/sgr.zi`: column box sums, shift rounding and a reciprocal table.
+- `filter/cdef.zi`: taps resolved per block, zero-strength taps and the
+  redundant clamp skipped, output written straight into the frame.
+- `transform/inverse_transform.zi`: a swap-network bit reversal; zero rows
+  and columns skip the 1D kernels.
+- `syntax/bits.zi` and `entropy/range.zi`: byte-wise bit reads, a dedicated
+  boolean decode, and decoder-owned CDFs read without the per-symbol scan.
+- `entropy/coefficient_*.zi`: the scan built only up to the end of block,
+  and context neighbors read from zero-padded levels.
+- `transform/quantization.zi` and `decode/residual.zi`: coefficients and
+  dequantized values go to tile buffers, not 4 to 16 KB returned structs.
+
+After them it takes 16 to 360 ms per frame: 3 to 9 times libaom and 6 to 18
+times dav1d. Entropy decoding is now the largest cost. The generated C still
+bounds-checks every index and calls small helpers in other modules out of
+line. No SIMD path, thread, other machine, cold start or energy figure has
+been measured.
 
 ## Specification and provenance
 

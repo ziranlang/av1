@@ -5,22 +5,23 @@ CoefficientClassHorizontal :: 1
 CoefficientClassVertical :: 2
 CoefficientContexts :: struct { base: s32; br: s32; error: DecodeError; }
 
-// Caller-owned levels are unsigned coefficient magnitudes in compact row-major
-// storage. Clamping is local to the referenced neighbors, with zero outside the
-// coded rectangle. This is context selection, without entropy/CDF mutation.
-CoeffNeighbor :: (levels: []u8, width: s32, height: s32, row: s32, column: s32,
-    dr: s32, dc: s32, limit: s32) -> s32 {
-    r := row + dr; c := column + dc
-    if r >= height || c >= width { return 0 }
-    value := cast(s32)levels[r * width + c]
+// Coefficient levels padded with four zero columns on the right and four zero
+// rows below the coded rectangle, so every neighbor read stays in range.
+CoefficientLevelStride :: (coded_width: s32) -> s32 { return coded_width + 4 }
+
+CoefficientLevel :: (levels: []u8, at: s32, limit: s32) -> s32 {
+    value := cast(s32)levels[at]
     return ifx value < limit then value else limit
 }
 
 // AV1 coefficient-base/base-eob/BR CDF selection. Class values are the AV1
 // 2D/horizontal/vertical classes, not the row/column scan-mode constants.
 // base indexes the selected base-eob CDF(0..3) when is_eob, otherwise base CDF.
-// A frame/tile caller must validate transform-set legality and provide matching
-// scan_index/position; every normative scan begins at position0.
+// Caller-owned levels are unsigned coefficient magnitudes in compact row-major
+// storage, zero outside the coded rectangle. This is context selection,
+// without entropy/CDF mutation. A frame/tile caller must validate
+// transform-set legality and provide matching scan_index/position; every
+// normative scan begins at position0.
 GetCoefficientContexts :: (levels: []u8, width: s32, height: s32, position: s32,
     scan_index: s32, tx_class: s32, is_eob: bool,
     cancellation: *Cancellation = null) -> CoefficientContexts {
@@ -41,22 +42,43 @@ GetCoefficientContexts :: (levels: []u8, width: s32, height: s32, position: s32,
         scan_index >= count || ((position == 0) != (scan_index == 0)) {
         result.error = Error(InvalidInput); return result
     }
-    row := position / cw; column := position % cw
+    stride := CoefficientLevelStride(cw)
+    padded: [1296]u8
+    for r: 0..ch - 1 { for c: 0..cw - 1 { padded[r * stride + c] = levels[r * cw + c] } }
+    contexts := CoefficientContextsAt(padded[:], stride, position / cw, position % cw,
+        width, height, scan_index, tx_class, is_eob)
+    result.error = CancellationError(cancellation)
+    if result.error.code != DecodeOK { return result }
+    result.base = contexts.base; result.br = contexts.br
+    return result
+}
+
+// The selection itself, over padded levels at a validated coded position.
+CoefficientContextsAt :: (levels: []u8, stride: s32, row: s32, column: s32,
+    width: s32, height: s32, scan_index: s32, tx_class: s32, is_eob: bool) -> CoefficientContexts {
+    result: CoefficientContexts
+    at := row * stride + column
     base: s32
     if is_eob {
+        cw := ifx width < 32 then width else 32; ch := ifx height < 32 then height else 32
+        count := cw * ch
         base = ifx scan_index == 0 then 0 else ifx scan_index <= count / 8 then 1 else ifx scan_index <= count / 4 then 2 else 3
     } else {
-        dr: [5]s32 = .[0,1,1,0,2]; dc: [5]s32 = .[1,0,1,2,0]
-        for i: 2..4 {
-            if tx_class == CoefficientClassHorizontal { dr[i] = 0; dc[i] = cast(s32)i }
-            if tx_class == CoefficientClassVertical { dr[i] = cast(s32)i; dc[i] = 0 }
+        magnitude := CoefficientLevel(levels, at + 1, 3) + CoefficientLevel(levels, at + stride, 3)
+        if tx_class == CoefficientClass2D {
+            magnitude += CoefficientLevel(levels, at + stride + 1, 3) + CoefficientLevel(levels, at + 2, 3) +
+                CoefficientLevel(levels, at + 2 * stride, 3)
+        } else if tx_class == CoefficientClassHorizontal {
+            magnitude += CoefficientLevel(levels, at + 2, 3) + CoefficientLevel(levels, at + 3, 3) +
+                CoefficientLevel(levels, at + 4, 3)
+        } else {
+            magnitude += CoefficientLevel(levels, at + 2 * stride, 3) + CoefficientLevel(levels, at + 3 * stride, 3) +
+                CoefficientLevel(levels, at + 4 * stride, 3)
         }
-        magnitude: s32
-        for i: 0..4 { magnitude += CoeffNeighbor(levels, cw, ch, row, column, dr[i], dc[i], 3) }
         base = (magnitude + 1) >> 1
         if base > 4 { base = 4 }
         if tx_class == CoefficientClass2D {
-            if position == 0 { base = 0 }
+            if row == 0 && column == 0 { base = 0 }
             else if width < height && row < 2 { base += 11 }
             else if width > height && column < 2 { base += 16 }
             else if row + column < 2 { base += 1 }
@@ -67,19 +89,16 @@ GetCoefficientContexts :: (levels: []u8, width: s32, height: s32, position: s32,
             base += ifx index == 0 then 26 else ifx index == 1 then 31 else 36
         }
     }
-    dr: [3]s32 = .[0,1,1]; dc: [3]s32 = .[1,0,1]
-    if tx_class == CoefficientClassHorizontal { dr[2] = 0; dc[2] = 2 }
-    if tx_class == CoefficientClassVertical { dr[2] = 2; dc[2] = 0 }
-    magnitude: s32
-    for i: 0..2 { magnitude += CoeffNeighbor(levels, cw, ch, row, column, dr[i], dc[i], 15) }
+    magnitude := CoefficientLevel(levels, at + 1, 15) + CoefficientLevel(levels, at + stride, 15)
+    if tx_class == CoefficientClass2D { magnitude += CoefficientLevel(levels, at + stride + 1, 15) }
+    else if tx_class == CoefficientClassHorizontal { magnitude += CoefficientLevel(levels, at + 2, 15) }
+    else { magnitude += CoefficientLevel(levels, at + 2 * stride, 15) }
     br := (magnitude + 1) >> 1
     if br > 6 { br = 6 }
-    if position != 0 {
+    if row != 0 || column != 0 {
         near := ifx tx_class == CoefficientClass2D then row < 2 && column < 2 else ifx tx_class == CoefficientClassHorizontal then column == 0 else row == 0
         br += ifx near then 7 else 14
     }
-    result.error = CancellationError(cancellation)
-    if result.error.code != DecodeOK { return result }
     result.base = base; result.br = br
     return result
 }

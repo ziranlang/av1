@@ -8,7 +8,10 @@ import hashlib,json,pathlib,sys
 root,toolchain,out=map(pathlib.Path,sys.argv[1:])
 files=[root/'src'/name for name in ('transform/quantization.zi','transform/quant_tables.zi',)]
 files += [root/'tests'/name for name in ('av1_quantization.zi','av1_quantization.sh','av1_quantization_oracle.py','av1_quantization_abi.zi','av1_quantization_abi.py','common.sh')]
-files += [toolchain/'build/bin'/name for name in ('ziran','zi2zir','zi2c','zi2go','zi2zx','zi2zx-vm')]
+import os
+# The critical path runs on one binary snapshot; hash the binaries in use.
+bin_dir=pathlib.Path(os.environ.get('ZIRAN_BIN_DIR') or toolchain/'build/bin')
+files += [bin_dir/name for name in ('ziran','zi2zir','zi2c','zi2go','zi2zx','zi2zx-vm')]
 inputs={}
 for path in files:
     h=hashlib.sha256()

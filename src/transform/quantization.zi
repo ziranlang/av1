@@ -61,31 +61,44 @@ DequantFailure :: (error: DecodeError) -> DequantBlock {
 DequantizeBlock :: (quant: []s32, width: s32, height: s32, qindex: s32,
     delta_dc: s32, delta_ac: s32, depth: s32, weights: []u8,
     cancellation: *Cancellation = null) -> DequantBlock {
-    error := CancellationError(cancellation)
+    result: DequantBlock
+    error := DequantizeInto(quant, width, height, qindex, delta_dc, delta_ac, depth, weights,
+        result.samples[:], cancellation)
     if error.code != DecodeOK { return DequantFailure(error) }
+    result.width = width; result.height = height
+    return result
+}
+
+// DequantizeBlock into samples, the caller's row-major buffer of at least
+// width x height values.
+DequantizeInto :: (quant: []s32, width: s32, height: s32, qindex: s32,
+    delta_dc: s32, delta_ac: s32, depth: s32, weights: []u8, samples: []s32,
+    cancellation: *Cancellation = null) -> DecodeError {
+    error := CancellationError(cancellation)
+    if error.code != DecodeOK { return error }
     if (width != 4 && width != 8 && width != 16 && width != 32 && width != 64) ||
         (height != 4 && height != 8 && height != 16 && height != 32 && height != 64) {
-        return DequantFailure(Error(InvalidInput))
+        return Error(InvalidInput)
     }
-    if width > height * 4 || height > width * 4 { return DequantFailure(Error(InvalidInput)) }
+    if width > height * 4 || height > width * 4 || samples.count < cast(s64)width * height { return Error(InvalidInput) }
     cw := ifx width < 32 then width else 32; ch := ifx height < 32 then height else 32
     count := cw * ch
     if quant.count != cast(s64)count || (weights.count != 0 && weights.count != cast(s64)count) {
-        return DequantFailure(Error(InvalidInput))
+        return Error(InvalidInput)
     }
     steps := GetQuantizationSteps(qindex, delta_dc, delta_ac, depth, cancellation)
-    if steps.error.code != DecodeOK { return DequantFailure(steps.error) }
+    if steps.error.code != DecodeOK { return steps.error }
     for i: 0..count - 1 {
         if quant[i] < -1048575 || quant[i] > 1048575 || (weights.count != 0 && weights[i] == 0) {
-            return DequantFailure(Error(InvalidInput))
+            return Error(InvalidInput)
         }
     }
     denominator := ifx width * height > 1024 then 4 else ifx width * height > 256 then 2 else 1
     limit := cast(s64)1 << cast(u32)(depth + 7)
-    result: DequantBlock
+    if cw < width || ch < height { for i: 0..width * height - 1 { samples[i] = 0 } }
     for row: 0..ch - 1 {
         error = CancellationError(cancellation)
-        if error.code != DecodeOK { return DequantFailure(error) }
+        if error.code != DecodeOK { return error }
         for column: 0..cw - 1 {
             at := row * cw + column
             q := cast(s64)(ifx at == 0 then steps.dc else steps.ac)
@@ -96,11 +109,8 @@ DequantizeBlock :: (quant: []s32, width: s32, height: s32, qindex: s32,
             if negative { value = -value }
             if value < -limit { value = -limit }
             if value >= limit { value = limit - 1 }
-            result.samples[row * width + column] = cast(s32)value
+            samples[row * width + column] = cast(s32)value
         }
     }
-    error = CancellationError(cancellation)
-    if error.code != DecodeOK { return DequantFailure(error) }
-    result.width = width; result.height = height
-    return result
+    return CancellationError(cancellation)
 }

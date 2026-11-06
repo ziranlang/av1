@@ -8,7 +8,10 @@ import hashlib,json,pathlib,sys
 root,toolchain,out=map(pathlib.Path,sys.argv[1:])
 files=[root/'src/entropy/coefficient_scan.zi']+[root/'tests'/name for name in (
     'av1_coefficient_scan.zi','av1_coefficient_scan.sh','av1_coefficient_scan_oracle.py','av1_quantization_oracle.py','common.sh')]
-files += [toolchain/'build/bin'/name for name in ('ziran','zi2zir','zi2c','zi2go','zi2zx','zi2zx-vm')]
+import os
+# The critical path runs on one binary snapshot; hash the binaries in use.
+bin_dir=pathlib.Path(os.environ.get('ZIRAN_BIN_DIR') or toolchain/'build/bin')
+files += [bin_dir/name for name in ('ziran','zi2zir','zi2c','zi2go','zi2zx','zi2zx-vm')]
 inputs={}
 for path in files:
     h=hashlib.sha256()

@@ -67,15 +67,15 @@ IntraCoefficients :: (tile: *IntraTile, block: *IntraBlock, plane: s32, start_x:
             if resolved.error.code != DecodeOK { return resolved.error }
             tx_type = resolved.value
         }
-        coefficients := ReadNonzeroCoefficients(*tile.decoder, *tile.cdfs.coefficients, tx_w, tx_h,
-            TransformClass(tx_type), plane_type, contexts.dc, tile.cancellation)
+        coefficients := DecodeNonzeroCoefficients(*tile.decoder, *tile.cdfs.coefficients, tx_w, tx_h,
+            TransformClass(tx_type), plane_type, contexts.dc, tile.quant[:], tile.cancellation)
         if coefficients.error.code != DecodeOK { return coefficients.error }
         level = coefficients.level; dc = coefficients.dc_category
         stride := frame.plane_stride[plane]
         plane_end := frame.plane_offset[plane] + cast(s64)stride * frame.plane_rows[plane]
         at := frame.plane_offset[plane] + cast(s64)start_y * stride + start_x
         if block.lossless {
-            residual := InverseLossless4x4(coefficients.quant[:16], frame.bit_depth, tile.cancellation)
+            residual := InverseLossless4x4(tile.quant[:16], frame.bit_depth, tile.cancellation)
             if residual.error.code != DecodeOK { return residual.error }
             error := AddResidual(tile.samples[at:plane_end], stride, residual.samples[:], 4, 4, 0,
                 frame.bit_depth, tile.cancellation)
@@ -89,11 +89,11 @@ IntraCoefficients :: (tile: *IntraTile, block: *IntraBlock, plane: s32, start_x:
             if plane == 2 { delta_dc = header.delta_q[3]; delta_ac = header.delta_q[4] }
             coded := IntraMin(32, tx_w) * IntraMin(32, tx_h)
             no_weights: [1]u8
-            dequant := DequantizeBlock(coefficients.quant[:coded], tx_w, tx_h, q.value, delta_dc, delta_ac,
-                frame.bit_depth, no_weights[:0], tile.cancellation)
-            if dequant.error.code != DecodeOK { return dequant.error }
             count := tx_w * tx_h
-            error := InverseTransform2D(dequant.samples[:count], tile.residual[:count], tx_w, tx_h, tx_type,
+            error := DequantizeInto(tile.quant[:coded], tx_w, tx_h, q.value, delta_dc, delta_ac,
+                frame.bit_depth, no_weights[:0], tile.dequant[:count], tile.cancellation)
+            if error.code != DecodeOK { return error }
+            error = InverseTransform2D(tile.dequant[:count], tile.residual[:count], tx_w, tx_h, tx_type,
                 frame.bit_depth, tile.cancellation)
             if error.code != DecodeOK { return error }
             error = AddResidual(tile.samples[at:plane_end], stride, tile.residual[:count], tx_w, tx_h, tx_type,
