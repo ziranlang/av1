@@ -1,0 +1,61 @@
+#import, file "./range.zi";
+#import, file "./modes.zi";
+#import, file "./chroma_cdfs.zi";
+using Codec :: #import "image_codec/api"
+
+ChromaModeResult :: struct { mode: s32; angle_delta: s32; alpha_u: s32; alpha_v: s32; error: DecodeError; }
+
+// Lossless intra UV mode syntax: CfL is allowed exactly when the chroma coding
+// footprint is4x4. Directional delta eligibility is based on the luma block.
+// The angle probabilities are shared with luma. This does not parse palettes.
+ReadLosslessChromaMode :: (decoder: *RangeDecoder, cdfs: *ChromaModeCDF,
+    modes: *IntraModeCDF, luma_mode: s32, width: s32, height: s32,
+    allow_angle_delta: bool, cancellation: *Cancellation = null) -> ChromaModeResult {
+    if width < 4 || width > 64 || height < 4 || height > 64 {
+        result: ChromaModeResult; result.error = Error(InvalidInput); return result
+    }
+    return ReadChromaMode(decoder, cdfs, modes, luma_mode, width == 4 && height == 4,
+        allow_angle_delta, cancellation)
+}
+
+// General intra uv_mode syntax. The frame caller derives cflAllowed: lossless
+// blocks need a4x4 chroma residual, other blocks max luma side <=32.
+ReadChromaMode :: (decoder: *RangeDecoder, cdfs: *ChromaModeCDF,
+    modes: *IntraModeCDF, luma_mode: s32, cfl_allowed: bool,
+    allow_angle_delta: bool, cancellation: *Cancellation = null) -> ChromaModeResult {
+    result: ChromaModeResult
+    result.error = CancellationError(cancellation)
+    if result.error.code != DecodeOK { return result }
+    if decoder == null || cdfs == null || modes == null || luma_mode < 0 || luma_mode > 12 {
+        result.error = Error(InvalidInput); return result
+    }
+    if cfl_allowed {
+        at := luma_mode * 15
+        result.mode = ReadSymbol(decoder, cdfs.with_cfl[at:at + 15])
+    } else {
+        at := luma_mode * 14
+        result.mode = ReadSymbol(decoder, cdfs.without_cfl[at:at + 14])
+    }
+    if decoder.error.code != DecodeOK { result.error = decoder.error; return result }
+    if result.mode == 13 {
+        joint := ReadSymbol(decoder, cdfs.signs[:])
+        sign_u := (joint + 1) / 3; sign_v := (joint + 1) % 3
+        if sign_u != 0 {
+            at := ((sign_u - 1) * 3 + sign_v) * 17
+            result.alpha_u = ReadSymbol(decoder, cdfs.alphas[at:at + 17]) + 1
+            if sign_u == 1 { result.alpha_u = -result.alpha_u }
+        }
+        if sign_v != 0 {
+            at := ((sign_v - 1) * 3 + sign_u) * 17
+            result.alpha_v = ReadSymbol(decoder, cdfs.alphas[at:at + 17]) + 1
+            if sign_v == 1 { result.alpha_v = -result.alpha_v }
+        }
+    }
+    if result.mode >= 1 && result.mode <= 8 && allow_angle_delta {
+        at := (result.mode - 1) * 8
+        result.angle_delta = ReadSymbol(decoder, modes.angle[at:at + 8]) - 3
+    }
+    result.error = decoder.error
+    if result.error.code == DecodeOK { result.error = CancellationError(cancellation) }
+    return result
+}

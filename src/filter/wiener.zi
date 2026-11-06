@@ -1,0 +1,81 @@
+using Codec :: #import "image_codec/api"
+
+// AV1 7.17.4/5 scalar Wiener reference. No allocation or native codec calls.
+// The caller resolves frame/tile/stripe boundaries into the three-pixel halo;
+// outside-stripe samples must come from the pre-CDEF source, per 7.17.6.
+WienerBlock :: struct { samples: [64]u16; width: s32; height: s32; error: DecodeError; }
+
+#scope_file
+WienerRound :: (value: s64, shift: s32) -> s64 {
+    divisor := cast(s64)(cast(u64)1 << cast(u64)shift)
+    biased := value + divisor / 2
+    return ifx biased < 0 then -((-biased + divisor - 1) / divisor) else biased / divisor
+}
+WienerValidCoefficients :: (coefficients: []s32) -> bool {
+    if coefficients.count != 3 { return false }
+    return coefficients[0] >= -5 && coefficients[0] <= 10 &&
+        coefficients[1] >= -23 && coefficients[1] <= 8 &&
+        coefficients[2] >= -17 && coefficients[2] <= 46
+}
+WienerFilter :: (coefficients: []s32) -> [7]s32 {
+    result: [7]s32
+    result[3] = 128
+    for i: 0..2 {
+        result[i] = coefficients[i]; result[6 - i] = coefficients[i]
+        result[3] -= 2 * coefficients[i]
+    }
+    return result
+}
+
+#scope_export
+// Input begins at the top-left halo, stride is in u16 samples. Output stride
+// is 8, with inactive cells zero. Chroma callers must pass outer tap zero.
+FilterWienerBlock :: (input: []u16, stride: s32, width: s32, height: s32,
+    horizontal: []s32, vertical: []s32, bit_depth: s32,
+    cancellation: *Cancellation = null) -> WienerBlock {
+    result: WienerBlock
+    result.error = CancellationError(cancellation)
+    if result.error.code != DecodeOK { return result }
+    if (bit_depth != 8 && bit_depth != 10 && bit_depth != 12) || width < 1 || width > 8 || height < 1 || height > 8 ||
+        stride < width + 6 || stride > 64 || input.count < cast(s64)(height + 5) * stride + width + 6 || input.count > 4096 ||
+        !WienerValidCoefficients(horizontal) || !WienerValidCoefficients(vertical) {
+        result.error = Error(InvalidInput); return result
+    }
+    maximum := cast(s64)((cast(u64)1 << cast(u64)bit_depth) - 1)
+    for y: 0..height + 5 { for x: 0..width + 5 {
+        if cast(s64)input[y * stride + x] > maximum { result.error = Error(InvalidInput); return result }
+    } }
+    hfilter := WienerFilter(horizontal); vfilter := WienerFilter(vertical)
+    round0: s32 = ifx bit_depth == 12 then 5 else 3
+    round1: s32 = 14 - round0
+    offset := cast(s64)(cast(u64)1 << cast(u64)(bit_depth + 7 - round0 - 1))
+    limit := cast(s64)((cast(u64)1 << cast(u64)(bit_depth + 1 + 7 - round0)) - 1)
+    intermediate: [112]s64; samples: [64]u16
+    for y: 0..height + 5 {
+        result.error = CancellationError(cancellation)
+        if result.error.code != DecodeOK { return result }
+        for x: 0..width - 1 {
+            sum: s64
+            for tap: 0..6 { sum += cast(s64)hfilter[tap] * cast(s64)input[y * stride + x + tap] }
+            value := WienerRound(sum, round0)
+            if value < -offset { value = -offset }
+            if value > limit - offset { value = limit - offset }
+            intermediate[y * 8 + x] = value
+        }
+    }
+    for y: 0..height - 1 {
+        result.error = CancellationError(cancellation)
+        if result.error.code != DecodeOK { return result }
+        for x: 0..width - 1 {
+            sum: s64
+            for tap: 0..6 { sum += cast(s64)vfilter[tap] * intermediate[(y + tap) * 8 + x] }
+            value := WienerRound(sum, round1)
+            if value < 0 { value = 0 }; if value > maximum { value = maximum }
+            samples[y * 8 + x] = cast(u16)value
+        }
+    }
+    result.error = CancellationError(cancellation)
+    if result.error.code != DecodeOK { return result }
+    result.samples = samples; result.width = width; result.height = height
+    return result
+}

@@ -1,0 +1,106 @@
+using Codec :: #import "image_codec/api"
+#import, file "./quant_tables.zi";
+
+QuantizerIndex :: struct { value: s32; error: DecodeError; }
+QuantizationSteps :: struct { dc: s32; ac: s32; error: DecodeError; }
+DequantBlock :: struct { samples: [4096]s32; width: s32; height: s32; error: DecodeError; }
+
+// AV1 7.12.2: segment alternate Q is relative to the selected base/current Q.
+// The caller supplies already parsed delta-Q state; no frame state is retained.
+ResolveQuantizerIndex :: (base: s32, current: s32, delta_present: bool,
+    ignore_delta: bool, alternate: bool, alternate_value: s32,
+    cancellation: *Cancellation = null) -> QuantizerIndex {
+    result: QuantizerIndex
+    result.error = CancellationError(cancellation)
+    if result.error.code != DecodeOK { return result }
+    if base < 0 || base > 255 || current < 0 || current > 255 ||
+        alternate_value < -255 || alternate_value > 255 {
+        result.error = Error(InvalidInput); return result
+    }
+    value := ifx delta_present && !ignore_delta then current else base
+    if alternate { value += alternate_value }
+    if value < 0 { value = 0 }
+    if value > 255 { value = 255 }
+    result.value = value
+    return result
+}
+
+// Delta fields are signed seven-bit syntax values. The selected quantizer
+// table is obtained once for both lookups, never once per coefficient.
+GetQuantizationSteps :: (qindex: s32, delta_dc: s32, delta_ac: s32, depth: s32,
+    cancellation: *Cancellation = null) -> QuantizationSteps {
+    result: QuantizationSteps
+    result.error = CancellationError(cancellation)
+    if result.error.code != DecodeOK { return result }
+    if qindex < 0 || qindex > 255 || delta_dc < -64 || delta_dc > 63 ||
+        delta_ac < -64 || delta_ac > 63 || (depth != 8 && depth != 10 && depth != 12) {
+        result.error = Error(InvalidInput); return result
+    }
+    dc := qindex + delta_dc; ac := qindex + delta_ac
+    if dc < 0 { dc = 0 }; if dc > 255 { dc = 255 }
+    if ac < 0 { ac = 0 }; if ac > 255 { ac = 255 }
+    table: [512]s16
+    if depth == 8 { table = Av1Quantizers8() }
+    else if depth == 10 { table = Av1Quantizers10() }
+    else { table = Av1Quantizers12() }
+    result.dc = cast(s32)table[dc]; result.ac = cast(s32)table[256 + ac]
+    return result
+}
+
+DequantFailure :: (error: DecodeError) -> DequantBlock {
+    result: DequantBlock; result.error = error; return result
+}
+
+// AV1 7.12.3, all nineteen transform sizes. Quant is the compact, row-major
+// min(width,32) x min(height,32) signed 20-bit coefficient array after syntax
+// masking. Output uses the full transform width; cells outside the upper-left
+// coded rectangle and beyond width*height remain zero.
+// Empty weights selects q2=q. Otherwise weights is the caller-selected normative
+// inverse matrix for that compact rectangle. Selection/level/type gating belongs
+// to the frame/tile caller; this scalar function does not invent matrix state.
+DequantizeBlock :: (quant: []s32, width: s32, height: s32, qindex: s32,
+    delta_dc: s32, delta_ac: s32, depth: s32, weights: []u8,
+    cancellation: *Cancellation = null) -> DequantBlock {
+    error := CancellationError(cancellation)
+    if error.code != DecodeOK { return DequantFailure(error) }
+    if (width != 4 && width != 8 && width != 16 && width != 32 && width != 64) ||
+        (height != 4 && height != 8 && height != 16 && height != 32 && height != 64) {
+        return DequantFailure(Error(InvalidInput))
+    }
+    if width > height * 4 || height > width * 4 { return DequantFailure(Error(InvalidInput)) }
+    cw := ifx width < 32 then width else 32; ch := ifx height < 32 then height else 32
+    count := cw * ch
+    if quant.count != cast(s64)count || (weights.count != 0 && weights.count != cast(s64)count) {
+        return DequantFailure(Error(InvalidInput))
+    }
+    steps := GetQuantizationSteps(qindex, delta_dc, delta_ac, depth, cancellation)
+    if steps.error.code != DecodeOK { return DequantFailure(steps.error) }
+    for i: 0..count - 1 {
+        if quant[i] < -1048575 || quant[i] > 1048575 || (weights.count != 0 && weights[i] == 0) {
+            return DequantFailure(Error(InvalidInput))
+        }
+    }
+    denominator := ifx width * height > 1024 then 4 else ifx width * height > 256 then 2 else 1
+    limit := cast(s64)1 << cast(u32)(depth + 7)
+    result: DequantBlock
+    for row: 0..ch - 1 {
+        error = CancellationError(cancellation)
+        if error.code != DecodeOK { return DequantFailure(error) }
+        for column: 0..cw - 1 {
+            at := row * cw + column
+            q := cast(s64)(ifx at == 0 then steps.dc else steps.ac)
+            if weights.count != 0 { q = (q * cast(s64)weights[at] + 16) >> 5 }
+            level := cast(s64)quant[at]; negative := level < 0
+            if negative { level = -level }
+            value := ((level * q) & 16777215) / cast(s64)denominator
+            if negative { value = -value }
+            if value < -limit { value = -limit }
+            if value >= limit { value = limit - 1 }
+            result.samples[row * width + column] = cast(s32)value
+        }
+    }
+    error = CancellationError(cancellation)
+    if error.code != DecodeOK { return DequantFailure(error) }
+    result.width = width; result.height = height
+    return result
+}

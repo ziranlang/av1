@@ -1,0 +1,47 @@
+#import, file "../src/syntax/tilegroup.zi";
+#import, file "../src/syntax/state.zi";
+using Codec :: #import "image_codec/api"
+
+#program_export
+main :: () -> s32 {
+    // One-tile groups have no group header and no explicit tile length.
+    data: [16]u8 = .[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]
+    layout: TileLayout
+    layout.columns = 1; layout.rows = 1
+    group := NewTileGroup(BorrowBytes(data[:]), 3, 16, layout)
+    tile := NextTileSpan(*group)
+    if tile.error.code != DecodeOK || !tile.has_tile || tile.tile.begin != 3 || tile.tile.end != 16 || tile.tile.index != 0 { return 1 }
+    if NextTileSpan(*group).has_tile { return 2 }
+    empty := NewTileGroup(BorrowBytes(data[:]), 16, 16, layout)
+    if NextTileSpan(*empty).error.code != TruncatedInput { return 3 }
+    // Two tiles, byte aligned header, LE size_minus_1 then final remainder.
+    layout.columns = 2; layout.column_log2 = 1; layout.size_bytes = 4
+    group = NewTileGroup(BorrowBytes(data[:]), 0, 16, layout)
+    tile = NextTileSpan(*group)
+    if tile.error.code != DecodeOK || tile.tile.index != 0 || tile.tile.begin != 5 || tile.tile.end != 6 { return 4 }
+    tile = NextTileSpan(*group)
+    if tile.error.code != DecodeOK || tile.tile.index != 1 || tile.tile.begin != 6 || tile.tile.end != 16 { return 5 }
+    data[4] = 255
+    group = NewTileGroup(BorrowBytes(data[:]), 0, 16, layout)
+    huge := NextTileSpan(*group)
+    if huge.error.code != TruncatedInput || huge.error.offset != 16 { return 6 }
+    data[4] = 0; data[0] = 1
+    group = NewTileGroup(BorrowBytes(data[:]), 0, 16, layout)
+    if group.error.code != MalformedInput { return 7 }
+    // Fragment containing only tile1: present=1, start=1, end=1, zeros.
+    data[0] = 0xe0
+    group = NewTileGroup(BorrowBytes(data[:]), 0, 16, layout)
+    tile = NextTileSpan(*group)
+    if tile.error.code != DecodeOK || tile.tile.index != 1 || tile.tile.column != 1 || tile.tile.begin != 1 || tile.tile.end != 16 { return 8 }
+    data[0] = 0xc0
+    group = NewTileGroup(BorrowBytes(data[:]), 0, 16, layout)
+    if group.error.code != MalformedInput { return 9 }
+    data[0] = 0
+    token: Cancellation
+    group = NewTileGroup(BorrowBytes(data[:]), 0, 16, layout, *token)
+    first := NextTileSpan(*group)
+    Cancel(*token)
+    cancelled := NextTileSpan(*group)
+    if cancelled.error.code != DecodeCancelled || cancelled.has_tile { return 10 }
+    return 0
+}

@@ -1,0 +1,41 @@
+#import, file "../src/syntax/headers.zi";
+#import, file "../src/syntax/frame.zi";
+using Codec :: #import "image_codec/api"
+
+#program_export
+main :: () -> s32 {
+    // Actual libaom-produced alpha sequence from pinned fixtures/rgba8.alpha.obu.
+    data: [5]u8 = .[0x18,0x08,0xbd,0x61,0x50]
+    result := ParseSequenceHeader(BorrowBytes(data[:]), 0, 5, DefaultLimits())
+    if result.error.code != DecodeOK { return 1 }
+    if result.header.profile != 0 || result.header.bit_depth != 8 || !result.header.monochrome ||
+        !result.header.still_picture || !result.header.reduced_still_picture_header { return 2 }
+    for end: 0..4 {
+        truncated := ParseSequenceHeader(BorrowBytes(data[:]), 0, end, DefaultLimits())
+        if truncated.error.code != TruncatedInput || truncated.error.offset != end { return 3 }
+    }
+    data[4] |= 1
+    malformed := ParseSequenceHeader(BorrowBytes(data[:]), 0, 5, DefaultLimits())
+    if malformed.error.code != MalformedInput { return 4 }
+    data[4] &= 254; data[0] = 0xf8
+    unsupported := ParseSequenceHeader(BorrowBytes(data[:]), 0, 5, DefaultLimits())
+    if unsupported.error.code != UnsupportedCapability || unsupported.error.offset != 0 { return 5 }
+    limits := DefaultLimits(); limits.max_metadata_bytes = 4
+    bounded := ParseSequenceHeader(BorrowBytes(data[:]), 0, 5, limits)
+    if bounded.error.code != LimitExceeded { return 6 }
+    packet: [25]u8 = .[0x10,0x00,0x46,0x79,0x00,0xc5,0xce,0x15,0xd1,0x81,0x15,0x4b,0x10,0xa2,0xc1,0xbd,0x3a,0x63,0xe2,0xd5,0x7e,0xb3,0x44,0xe0,0x9f]
+    frame := ParseStillFrameHeader(BorrowBytes(packet[:]), 0, 25, result.header, DefaultLimits())
+    if frame.error.code != DecodeOK || frame.next != 2 || !frame.header.coded_lossless ||
+        frame.header.width != 8 || frame.header.height != 6 || frame.header.tiles.columns != 1 || frame.header.tiles.rows != 1 { return 7 }
+    for end: 0..1 {
+        short := ParseStillFrameHeader(BorrowBytes(packet[:]), 0, end, result.header, DefaultLimits())
+        if short.error.code != TruncatedInput || short.error.offset != end { return 8 }
+    }
+    packet[2] = 0x80
+    separate := ParseStillFrameHeader(BorrowBytes(packet[:]), 0, 3, result.header, DefaultLimits(), false)
+    if separate.error.code != DecodeOK || separate.next != 3 { return 9 }
+    packet[2] = 0x81
+    bad_tail := ParseStillFrameHeader(BorrowBytes(packet[:]), 0, 3, result.header, DefaultLimits(), false)
+    if bad_tail.error.code != MalformedInput || bad_tail.error.offset != 2 { return 10 }
+    return 0
+}

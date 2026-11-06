@@ -1,0 +1,127 @@
+using Codec :: #import "image_codec/api"
+
+// AV1 7.17.2/3 self-guided restoration scalar semantic reference. No allocation,
+// native codec calls or frame scheduling. Caller supplies the resolved 3-pixel
+// restoration halo, including pre-CDEF samples outside the restoration stripe.
+SgrBlock :: struct { samples: [64]u16; width: s32; height: s32; error: DecodeError; }
+
+// Sgr_Params row set: [r0, e0, r1, e1]; index 0/2 are the pass radii.
+SgrParameters :: (set: s32, pass: s32) -> s32 {
+    parameters: [64]s32 = .[2,12,1,4,2,15,1,6,2,18,1,8,2,21,1,9,
+        2,24,1,10,2,29,1,11,2,36,1,12,2,45,1,13,
+        2,56,1,14,2,68,1,15,0,0,1,5,0,0,1,8,
+        0,0,1,11,0,0,1,14,2,30,0,0,2,75,0,0]
+    return parameters[set * 4 + pass]
+}
+
+#scope_file
+SgrPass :: struct { samples: [64]s64; error: DecodeError; }
+SgrRound :: (value: s64, shift: s32) -> s64 {
+    divisor := cast(s64)(cast(u64)1 << cast(u64)shift)
+    biased := value + divisor / 2
+    return ifx biased < 0 then -((-biased + divisor - 1) / divisor) else biased / divisor
+}
+SgrBox :: (input: []u16, stride: s32, width: s32, height: s32,
+    set: s32, pass: s32, bit_depth: s32, cancellation: *Cancellation) -> SgrPass {
+    result: SgrPass
+    radius := SgrParameters(set, pass * 2)
+    if radius == 0 { return result }
+    epsilon := cast(s64)SgrParameters(set, pass * 2 + 1)
+    n := cast(s64)((2 * radius + 1) * (2 * radius + 1))
+    n2e := n * n * epsilon
+    scale: s64 = (1048576 + n2e / 2) / n2e
+    reciprocal: s64 = (4096 + n / 2) / n
+    a_values: [100]s64; b_values: [100]s64
+    for iy: 0..height + 1 {
+        result.error = CancellationError(cancellation)
+        if result.error.code != DecodeOK { return result }
+        y := cast(s32)iy - 1
+        for ix: 0..width + 1 {
+            x := cast(s32)ix - 1
+            a: s64; b: s64
+            for dy: 0..2 * radius { for dx: 0..2 * radius {
+                value := cast(s64)input[(y + 3 + dy - radius) * stride + x + 3 + dx - radius]
+                a += value * value; b += value
+            } }
+            a = SgrRound(a, 2 * (bit_depth - 8))
+            d := SgrRound(b, bit_depth - 8)
+            p := a * n - d * d; if p < 0 { p = 0 }
+            z := SgrRound(p * scale, 20)
+            a2: s64 = 1
+            if z >= 255 { a2 = 256 }
+            else if z > 0 { a2 = (z * 256 + z / 2) / (z + 1) }
+            a_values[iy * 10 + ix] = a2
+            b_values[iy * 10 + ix] = SgrRound((256 - a2) * b * reciprocal, 12)
+        }
+    }
+    for y: 0..height - 1 {
+        result.error = CancellationError(cancellation)
+        if result.error.code != DecodeOK { return result }
+        shift: s32 = 5
+        if pass == 0 && (y & 1) != 0 { shift = 4 }
+        for x: 0..width - 1 {
+            a: s64; b: s64
+            for dy: 0..2 { for dx: 0..2 {
+                weight: s64
+                if pass == 0 {
+                    if ((y + dy - 1) & 1) != 0 { weight = ifx dx == 1 then 6 else 5 }
+                } else { weight = ifx dx == 1 || dy == 1 then 4 else 3 }
+                a += weight * a_values[(y + dy) * 10 + x + dx]
+                b += weight * b_values[(y + dy) * 10 + x + dx]
+            } }
+            source := cast(s64)input[(y + 3) * stride + x + 3]
+            result.samples[y * 8 + x] = SgrRound(a * source + b, 8 + shift - 4)
+        }
+    }
+    return result
+}
+
+#scope_export
+// Projection coefficients are the two LrSgrXqd values, not native decoded xq.
+// Output stride is 8; inactive cells and all output on error are zero.
+FilterSgrBlock :: (input: []u16, stride: s32, width: s32, height: s32,
+    set: s32, projection0: s32, projection1: s32, bit_depth: s32,
+    cancellation: *Cancellation = null) -> SgrBlock {
+    result: SgrBlock
+    result.error = CancellationError(cancellation)
+    if result.error.code != DecodeOK { return result }
+    if (bit_depth != 8 && bit_depth != 10 && bit_depth != 12) || width < 1 || width > 8 || height < 1 || height > 8 ||
+        stride < width + 6 || stride > 64 || input.count < cast(s64)(height + 5) * stride + width + 6 || input.count > 4096 ||
+        set < 0 || set > 15 || projection0 < -96 || projection0 > 31 || projection1 < -32 || projection1 > 95 {
+        result.error = Error(InvalidInput); return result
+    }
+    // Missing-radius coefficients are implicit in lr_params: xqd0=0, and
+    // xqd1=Clip3(-32,95,128-xqd0)=95 for the allowed xqd0 range.
+    if (SgrParameters(set, 0) == 0 && projection0 != 0) ||
+        (SgrParameters(set, 2) == 0 && projection1 != 95) {
+        result.error = Error(InvalidInput); return result
+    }
+    maximum := cast(s64)((cast(u64)1 << cast(u64)bit_depth) - 1)
+    for y: 0..height + 5 { for x: 0..width + 5 {
+        if cast(s64)input[y * stride + x] > maximum { result.error = Error(InvalidInput); return result }
+    } }
+    pass0 := SgrBox(input, stride, width, height, set, 0, bit_depth, cancellation)
+    if pass0.error.code != DecodeOK { result.error = pass0.error; return result }
+    pass1 := SgrBox(input, stride, width, height, set, 1, bit_depth, cancellation)
+    if pass1.error.code != DecodeOK { result.error = pass1.error; return result }
+    radius0 := SgrParameters(set, 0); radius1 := SgrParameters(set, 2)
+    w0 := cast(s64)projection0; w1 := cast(s64)projection1; w2 := 128 - w0 - w1
+    samples: [64]u16
+    for y: 0..height - 1 {
+        result.error = CancellationError(cancellation)
+        if result.error.code != DecodeOK { return result }
+        for x: 0..width - 1 {
+            u := cast(s64)input[(y + 3) * stride + x + 3] * 16
+            v := w1 * u
+            v += w0 * (ifx radius0 != 0 then pass0.samples[y * 8 + x] else u)
+            v += w2 * (ifx radius1 != 0 then pass1.samples[y * 8 + x] else u)
+            value := SgrRound(v, 11)
+            if value < 0 { value = 0 }; if value > maximum { value = maximum }
+            samples[y * 8 + x] = cast(u16)value
+        }
+    }
+    result.error = CancellationError(cancellation)
+    if result.error.code != DecodeOK { return result }
+    result.samples = samples; result.width = width; result.height = height
+    return result
+}

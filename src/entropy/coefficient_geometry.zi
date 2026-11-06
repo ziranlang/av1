@@ -1,0 +1,24 @@
+using Codec :: #import "image_codec/api"
+
+CoefficientShape :: struct { size_context: s32; area: s32; count: s32; error: DecodeError; }
+
+// Validate before multiplication or shifts. Raw size selects entropy contexts;
+// a64-pixel side codes only its upper-left32 coefficients.
+GetCoefficientShape :: (width: s32, height: s32) -> CoefficientShape {
+    result: CoefficientShape
+    if (width != 4 && width != 8 && width != 16 && width != 32 && width != 64) ||
+        (height != 4 && height != 8 && height != 16 && height != 32 && height != 64) {
+        result.error = Error(InvalidInput); return result
+    }
+    if width > height * 4 || height > width * 4 {
+        result.error = Error(InvalidInput); return result
+    }
+    lw: s32 = 2; lh: s32 = 2; w: s32 = 4; h: s32 = 4
+    while w < width { lw += 1; w *= 2 }
+    while h < height { lh += 1; h *= 2 }
+    result.size_context = (lw + lh - 3) / 2
+    cw := ifx width < 32 then width else 32; ch := ifx height < 32 then height else 32
+    result.count = cw * ch
+    result.area = (ifx lw < 5 then lw else 5) + (ifx lh < 5 then lh else 5) - 4
+    return result
+}

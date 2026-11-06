@@ -1,0 +1,66 @@
+#import, file "../src/decoder.zi";
+
+#program_export
+main :: () -> s32 {
+    // Actual FFmpeg/libaom reduced-still output, independently decoded and
+    // symbol-traced by the package-pinned libaom oracle. No test-only syntax.
+    data: [14]u8 = .[18,0,10,5,24,8,191,33,80,50,3,16,0,48]
+    options := DefaultOptions()
+    budget := NewWorkerBudget(options.limits); options.workers = *budget
+    for repeat: 0..31 {
+        result := DecodeAv1YUV(BorrowBytes(data[:]), *options)
+        if !result.is_ok || result.error.code != DecodeOK || result.y.width != 8 || result.y.height != 8 ||
+            result.y.storage.count != 64 || result.y.storage.capacity != 64 || result.u.storage.count != 0 || result.v.storage.count != 0 { return 1 }
+        for i: 0..63 { if result.y.storage[i] != 128 { return 2 } }
+        if budget.active_workers != 0 || budget.working_bytes != 0 || budget.peak_workers != 1 ||
+            // 8x8 monochrome heap: 64x64 u16 plane, 2x2 mode records,
+            // 3 planes of padded line contexts, palette lines and one CDEF cell.
+            budget.peak_working_bytes != Av1StillWorkingBytes + 8192 + 64 + 408 + 128 + 1 { return 3 }
+    }
+    for high: 0..1 {
+        data[7] = 35
+        if high == 1 { data[4] = 88; data[8] = 168 }
+        depth: s32 = ifx high == 0 then 10 else 12
+        result := DecodeAv1YUV(BorrowBytes(data[:]), *options)
+        if !result.is_ok || result.sequence.bit_depth != depth || result.y.sample_bytes != 2 ||
+            result.y.storage.count != 128 || result.y.storage.capacity != 128 || result.y.stride != 16 { return 11 }
+        value := cast(u32)1 << cast(u32)(depth - 1)
+        for i: 0..63 {
+            if result.y.storage[i * 2] != cast(u8)(value & 255) || result.y.storage[i * 2 + 1] != cast(u8)(value >> 8) { return 12 }
+        }
+        if budget.active_workers != 0 || budget.working_bytes != 0 { return 13 }
+    }
+    data[4] = 24; data[7] = 33; data[8] = 80
+    // Every prefix rejects; no plane may escape failure, no lease may remain.
+    for end: 0..13 {
+        short := DecodeAv1YUV(BorrowBytes(data[:end]), *options)
+        if short.is_ok || short.error.code == DecodeOK || short.y.storage.count != 0 ||
+            budget.active_workers != 0 || budget.working_bytes != 0 { return 4 }
+    }
+    options.limits.max_output_bytes = 63
+    too_small := DecodeAv1YUV(BorrowBytes(data[:]), *options)
+    if too_small.error.code != LimitExceeded || too_small.y.storage.count != 0 || budget.working_bytes != 0 { return 5 }
+    options = DefaultOptions(); options.limits.max_working_bytes = Av1StillWorkingBytes - 1
+    small_budget := NewWorkerBudget(options.limits); options.workers = *small_budget
+    bounded := DecodeAv1YUV(BorrowBytes(data[:]), *options)
+    if bounded.error.code != LimitExceeded || small_budget.active_workers != 0 || small_budget.working_bytes != 0 { return 6 }
+    options = DefaultOptions(); options.workers = *budget
+    budget.active_workers = 1
+    saturated := DecodeAv1YUV(BorrowBytes(data[:]), *options)
+    if saturated.error.code != WorkerBudgetExceeded || budget.active_workers != 1 || budget.working_bytes != 0 { return 7 }
+    budget.active_workers = 0
+    token: Cancellation
+    options.cancellation = *token; Cancel(*token)
+    cancelled := DecodeAv1YUV(BorrowBytes(data[:]), *options)
+    if cancelled.error.code != DecodeCancelled || cancelled.y.storage.count != 0 || budget.active_workers != 0 { return 8 }
+    options = DefaultOptions()
+    owned := DecodeAv1YUV(BorrowBytes(data[:]), *options)
+    data[13] = 0
+    if !owned.is_ok || owned.y.storage[0] != 128 { return 9 }
+    bad_tail := DecodeAv1YUV(BorrowBytes(data[:]), *options)
+    if bad_tail.is_ok || bad_tail.error.code == DecodeOK || bad_tail.y.storage.count != 0 { return 10 }
+    options.color_mode = FastColor
+    fast := DecodeAv1YUV(BorrowBytes(data[:]), *options)
+    if fast.is_ok || fast.error.code != UnsupportedCapability { return 14 }
+    return 0
+}

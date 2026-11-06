@@ -1,0 +1,73 @@
+#import, file "./range.zi";
+#import, file "../syntax/partition.zi";
+#import, file "./modes.zi";
+#import, file "./chroma_cdfs.zi";
+#import, file "./palette_cdfs.zi";
+#import, file "./palette_uv_cdfs.zi";
+#import, file "../predict/filter_intra.zi";
+#import, file "./coefficient_cdfs.zi";
+#import, file "../transform/transform_type.zi";
+using Codec :: #import "image_codec/api"
+
+// Default probabilities from libaom d772e334cc724105040382a977ebb10dfd393293
+// av1/common/entropymode.c. Copyright (c) 2016, 2017 Alliance for Open Media.
+// BSD 2-Clause + AOM Patent License, retained alongside these modules.
+// Values are ascending AV1 Q15 cumulative probabilities plus one adaptation
+// counter per CDF. Every tile of an intra frame starts from these values.
+IntraTileCDFs :: struct {
+    partitions: PartitionCDF;
+    skip: [9]u16;
+    segment: [27]u16;
+    delta_q: [5]u16;
+    // Four multi-filter CDFs, then the single shared CDF at offset 20.
+    delta_lf: [25]u16;
+    modes: IntraModeCDF;
+    chroma: ChromaModeCDF;
+    palette: PaletteCDF;
+    uv_palette: PaletteUVCDF;
+    filter: FilterIntraCDF;
+    // Four depth categories by three contexts, stride four.
+    tx_depth: [48]u16;
+    coefficients: CoefficientCDFs;
+    tx_types: TransformTypeCDFs;
+    wiener: [3]u16;
+    sgrproj: [3]u16;
+    restoration: [4]u16;
+    error: DecodeError;
+}
+
+NewIntraTileCDFs :: (base_q_index: s32, cancellation: *Cancellation = null) -> IntraTileCDFs {
+    result: IntraTileCDFs
+    result.error = CancellationError(cancellation)
+    if result.error.code != DecodeOK { return result }
+    if base_q_index < 0 || base_q_index > 255 { result.error = Error(InvalidInput); return result }
+    result.partitions = NewPartitionCDF()
+    skip: [9]u16 = .[31671,32768,0, 16515,32768,0, 4576,32768,0]
+    result.skip = skip
+    segment: [27]u16 = .[
+        5622,7893,16093,18233,27809,28373,32533,32768,0,
+        14274,18230,22557,24935,29980,30851,32344,32768,0,
+        27527,28487,28723,28890,32397,32647,32679,32768,0]
+    result.segment = segment
+    delta: [5]u16 = .[28160,32120,32677,32768,0]
+    result.delta_q = delta
+    for i: 0..4 { for j: 0..4 { result.delta_lf[i * 5 + j] = delta[j] } }
+    depth: [48]u16 = .[
+        19968,32768,0,0, 19968,32768,0,0, 24320,32768,0,0,
+        12272,30172,32768,0, 12272,30172,32768,0, 18677,30848,32768,0,
+        12986,15180,32768,0, 12986,15180,32768,0, 24302,25602,32768,0,
+        5782,11475,32768,0, 5782,11475,32768,0, 16803,22759,32768,0]
+    result.tx_depth = depth
+    result.modes = NewIntraModeCDF(); result.chroma = NewChromaModeCDF()
+    result.palette = NewPaletteCDF(); result.uv_palette = NewPaletteUVCDF()
+    result.filter = NewFilterIntraCDF()
+    result.coefficients = NewCoefficientCDFs(base_q_index, cancellation)
+    if result.coefficients.error.code != DecodeOK { result.error = result.coefficients.error; return result }
+    result.tx_types = NewTransformTypeCDFs(cancellation)
+    if result.tx_types.error.code != DecodeOK { result.error = result.tx_types.error; return result }
+    wiener: [3]u16 = .[11570,32768,0]; result.wiener = wiener
+    sgrproj: [3]u16 = .[16855,32768,0]; result.sgrproj = sgrproj
+    restoration: [4]u16 = .[9413,22581,32768,0]; result.restoration = restoration
+    result.error = CancellationError(cancellation)
+    return result
+}

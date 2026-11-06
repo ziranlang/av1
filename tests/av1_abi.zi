@@ -1,0 +1,12 @@
+#import, file "../src/entropy/range.zi";
+using Codec :: #import "image_codec/api"
+
+// The native host forges only invalid counts with a null data pointer. Source
+// code cannot mutate borrowed counts. Rejection must precede narrowing/access.
+#program_export
+ProbeCDF :: (cdf: []u16) -> s32 {
+    data: [1]u8 = .[0xc0]
+    decoder := NewRange(BorrowBytes(data[:]), 0, 1)
+    discarded := ReadSymbol(*decoder, cdf)
+    return decoder.error.code
+}

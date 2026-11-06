@@ -1,0 +1,21 @@
+#import, file "../src/entropy/coefficient_cdfs.zi";
+
+CDFDataBoundaries :: () -> s32 {
+    invalid := NewCoefficientCDFs(-1)
+    if invalid.error.code != InvalidInput { return 1 }
+    for i: 0..3834 { if invalid.values[i] != 0 { return 2 } }
+    invalid = NewCoefficientCDFs(256)
+    if invalid.error.code != InvalidInput { return 3 }
+    for i: 0..3834 { if invalid.values[i] != 0 { return 4 } }
+    token: Cancellation; Cancel(*token)
+    cancelled := NewCoefficientCDFs(0, *token)
+    if cancelled.error.code != DecodeCancelled { return 5 }
+    for i: 0..3834 { if cancelled.values[i] != 0 { return 6 } }
+    state := NewCoefficientCDFs(0)
+    original := state.values[0]
+    state.values[0] = ifx original == 0 then 1 else 0
+    state.values[2] = 1
+    independent := NewCoefficientCDFs(0)
+    if independent.error.code != DecodeOK || independent.values[0] != original || independent.values[2] != 0 { return 7 }
+    return 0
+}

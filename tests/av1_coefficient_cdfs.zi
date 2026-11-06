@@ -1,0 +1,51 @@
+#import, file "../src/entropy/coefficient_cdfs.zi";
+#import, file "../src/entropy/coefficient_cdf_symbols.zi";
+#import, file "../src/entropy/range.zi";
+
+CDFBoundaries :: () -> s32 {
+    for q: 0..1 {
+        invalid := NewCoefficientCDFs(ifx q == 0 then -1 else 256)
+        if invalid.error.code != InvalidInput { return 1 }
+        for i: 0..3834 { if invalid.values[i] != 0 { return 2 } }
+    }
+    token: Cancellation; Cancel(*token)
+    cancelled := NewCoefficientCDFs(0, *token)
+    if cancelled.error.code != DecodeCancelled { return 3 }
+    for i: 0..3834 { if cancelled.values[i] != 0 { return 4 } }
+    if SelectCoefficientCDF(*cancelled, 0, 0, 0, 0).error.code != DecodeCancelled { return 5 }
+    empty: *CoefficientCDFs
+    if SelectCoefficientCDF(empty, 0, 0, 0, 0).error.code != InvalidInput { return 6 }
+    state := NewCoefficientCDFs(0)
+    if state.error.code != DecodeOK { return 7 }
+    if SelectCoefficientCDF(*state, -1, 0, 0, 0).error.code != InvalidInput { return 8 }
+    if SelectCoefficientCDF(*state, 7, 0, 0, 0).error.code != InvalidInput { return 9 }
+    if SelectCoefficientCDF(*state, 0, -1, 0, 0).error.code != InvalidInput { return 10 }
+    if SelectCoefficientCDF(*state, 0, 0, -1, 0).error.code != InvalidInput { return 11 }
+    if SelectCoefficientCDF(*state, 0, 0, 2, 0).error.code != InvalidInput { return 12 }
+    if SelectCoefficientCDF(*state, 0, 0, 0, -1).error.code != InvalidInput { return 13 }
+    limits: [7]s32 = .[13,3,42,21,4,9,2]
+    for family: 0..6 {
+        bad := SelectCoefficientCDF(*state, cast(s32)family, 0, 0, limits[family])
+        if bad.error.code != InvalidInput || bad.count != 0 { return 14 }
+        size := ifx family == 1 then 1 else ifx family == 6 then 7 else 5
+        if SelectCoefficientCDF(*state, cast(s32)family, cast(s32)size, 0, 0).error.code != InvalidInput { return 15 }
+    }
+    a := SelectCoefficientCDF(*state, CoefficientCDFBR, 3, 0, 0)
+    b := SelectCoefficientCDF(*state, CoefficientCDFBR, 4, 0, 0)
+    if a.error.code != DecodeOK || b.error.code != DecodeOK || a.offset != b.offset || a.count != 5 || b.count != 5 { return 16 }
+    a = SelectCoefficientCDF(*state, CoefficientCDFSkip, 0, 0, 7)
+    b = SelectCoefficientCDF(*state, CoefficientCDFSkip, 0, 1, 7)
+    if a.error.code != DecodeOK || b.error.code != DecodeOK || a.offset != b.offset || a.count != 3 || b.count != 3 { return 17 }
+    missing: *RangeDecoder
+    symbol := ReadCoefficientSymbol(missing, *state, 0, 0, 0, 0)
+    if symbol.error.code != InvalidInput || symbol.value != 0 { return 18 }
+    decoder: RangeDecoder; decoder.error = Error(MalformedInput, 7)
+    symbol = ReadCoefficientSymbol(*decoder, *state, 0, 0, 0, 0)
+    if symbol.error.code != MalformedInput || symbol.error.offset != 7 || symbol.value != 0 { return 19 }
+    symbol = ReadCoefficientSymbol(*decoder, *state, 0, 0, 0, 0, *token)
+    if symbol.error.code != DecodeCancelled || symbol.value != 0 { return 20 }
+    state.error = Error(MalformedInput, 123)
+    failed := SelectCoefficientCDF(*state, 0, 0, 0, 0)
+    if failed.error.code != MalformedInput || failed.error.offset != 123 || failed.count != 0 { return 21 }
+    return 0
+}

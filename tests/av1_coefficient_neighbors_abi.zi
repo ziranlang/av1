@@ -1,0 +1,22 @@
+#import, file "../src/entropy/coefficient_neighbors.zi";
+using Codec :: #import "image_codec/api"
+
+ProbeNeighborDescriptors :: (input: []u8, kind: s32) -> s32 {
+    empty: [1]u8
+    result: TransformCoefficientContexts
+    if kind == 0 {
+        result = GetTransformCoefficientContexts(input, empty[:0], input, empty[:0], 4, 4, 8, 8, 0)
+    } else if kind == 1 {
+        result = GetTransformCoefficientContexts(empty[:0], input, empty[:0], input, 4, 4, 8, 8, 0)
+    } else if kind == 2 {
+        result = GetTransformCoefficientContexts(empty[:0], empty[:0], input, empty[:0], 4, 4, 8, 8, 0)
+    } else if kind == 3 {
+        result = GetTransformCoefficientContexts(empty[:0], empty[:0], empty[:0], input, 4, 4, 8, 8, 0)
+    } else if kind == 4 {
+        result = GetTransformCoefficientContexts(input, input, input, input, 4, 4, 8, 8, 0)
+        if result.error.code != DecodeOK || result.skip != 1 || result.dc != 0 { return 1 }
+        return 0
+    } else { return 1 }
+    if result.error.code != InvalidInput || result.skip != 0 || result.dc != 0 { return 2 }
+    return 0
+}

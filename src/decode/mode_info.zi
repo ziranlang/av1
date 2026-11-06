@@ -1,0 +1,320 @@
+#import, file "../entropy/range.zi";
+#import, file "../syntax/partition.zi";
+#import, file "../syntax/profile.zi";
+#import, file "../syntax/state.zi";
+#import, file "../syntax/tilegroup.zi";
+#import, file "../entropy/intra_frame_cdfs.zi";
+#import, file "../entropy/chroma_modes.zi";
+#import, file "../predict/palette.zi";
+#import, file "../predict/filter_intra.zi";
+#import, file "../predict/intra_predict.zi";
+#import, file "../predict/cfl.zi";
+#import, file "../entropy/coefficient_block.zi";
+#import, file "../entropy/coefficient_neighbors.zi";
+#import, file "../transform/transform_type.zi";
+#import, file "../transform/quantization.zi";
+#import, file "../transform/inverse_transform.zi";
+#import, file "../transform/lossless.zi";
+#import, file "../filter/sgr.zi";
+#import, file "./intra_frame.zi";
+using Codec :: #import "image_codec/api"
+using IntraVectors :: #import "std/vec"
+
+// Mode info syntax for intra blocks, specification section 5.11.5-5.11.46.
+IntraNegDeinterleave :: (diff: s32, reference: s32, maximum: s32) -> s32 {
+    if reference == 0 { return diff }
+    if reference >= maximum - 1 { return maximum - diff - 1 }
+    if 2 * reference < maximum {
+        if diff <= 2 * reference {
+            if (diff & 1) != 0 { return reference + ((diff + 1) >> 1) }
+            return reference - (diff >> 1)
+        }
+        return diff
+    }
+    if diff <= 2 * (maximum - reference - 1) {
+        if (diff & 1) != 0 { return reference + ((diff + 1) >> 1) }
+        return reference - (diff >> 1)
+    }
+    return maximum - (diff + 1)
+}
+
+ReadIntraSegmentId :: (tile: *IntraTile, block: *IntraBlock) -> DecodeError {
+    frame := tile.frame
+    block.segment_id = 0
+    if tile.header.segmentation_enabled {
+        above_left: s32 = -1; above: s32 = -1; left: s32 = -1
+        if block.avail_u && block.avail_l { above_left = cast(s32)frame.mi[IntraMiAt(frame, block.row - 1, block.column - 1) + IntraMiSegment] }
+        if block.avail_u { above = cast(s32)frame.mi[IntraMiAt(frame, block.row - 1, block.column) + IntraMiSegment] }
+        if block.avail_l { left = cast(s32)frame.mi[IntraMiAt(frame, block.row, block.column - 1) + IntraMiSegment] }
+        prediction: s32
+        if above == -1 { prediction = ifx left == -1 then 0 else left }
+        else if left == -1 { prediction = above }
+        else { prediction = ifx above_left == above then above else left }
+        if block.skip != 0 { block.segment_id = prediction }
+        else {
+            context: s32
+            if above_left < 0 { context = 0 }
+            else if above_left == above && above_left == left { context = 2 }
+            else if above_left == above || above_left == left || above == left { context = 1 }
+            symbol := ReadSymbol(*tile.decoder, tile.cdfs.segment[context * 9:context * 9 + 9])
+            if tile.decoder.error.code != DecodeOK { return tile.decoder.error }
+            block.segment_id = IntraNegDeinterleave(symbol, prediction, tile.header.last_active_segment_id + 1)
+        }
+        if block.segment_id < 0 || block.segment_id > tile.header.last_active_segment_id {
+            return Error(MalformedInput, tile.decoder.bits.byte)
+        }
+    }
+    block.lossless = tile.header.lossless[block.segment_id]
+    return Error(DecodeOK)
+}
+
+ReadIntraDeltaValue :: (tile: *IntraTile, cdf_at: s32, is_q: bool) -> s32 {
+    absolute: s32
+    if is_q { absolute = ReadSymbol(*tile.decoder, tile.cdfs.delta_q[:]) }
+    else { absolute = ReadSymbol(*tile.decoder, tile.cdfs.delta_lf[cdf_at:cdf_at + 5]) }
+    if absolute == 3 {
+        bits := cast(s32)ReadLiteral(*tile.decoder, 3) + 1
+        absolute = cast(s32)ReadLiteral(*tile.decoder, bits) + IntraShift(1, bits) + 1
+    }
+    if absolute != 0 && ReadLiteral(*tile.decoder, 1) != 0 { absolute = -absolute }
+    return absolute
+}
+
+ReadIntraDeltas :: (tile: *IntraTile, block: *IntraBlock) -> DecodeError {
+    side := tile.frame.superblock4 * 4
+    if (block.width == side && block.height == side && block.skip != 0) || !tile.read_deltas { return Error(DecodeOK) }
+    reduced := ReadIntraDeltaValue(tile, 0, true)
+    if tile.decoder.error.code != DecodeOK { return tile.decoder.error }
+    if reduced != 0 {
+        tile.current_q = IntraMax(1, IntraMin(255, tile.current_q + reduced * IntraShift(1, tile.header.delta_q_res)))
+    }
+    if tile.header.delta_lf_present {
+        count: s32 = 1
+        if tile.header.delta_lf_multi { count = ifx tile.frame.planes > 1 then 4 else 2 }
+        for i: 0..count - 1 {
+            at := ifx tile.header.delta_lf_multi then cast(s32)i * 5 else 20
+            value := ReadIntraDeltaValue(tile, at, false)
+            if tile.decoder.error.code != DecodeOK { return tile.decoder.error }
+            if value != 0 {
+                tile.delta_lf[i] = IntraMax(-63, IntraMin(63, tile.delta_lf[i] + value * IntraShift(1, tile.header.delta_lf_res)))
+            }
+        }
+    }
+    return tile.decoder.error
+}
+
+ReadIntraCdef :: (tile: *IntraTile, block: *IntraBlock) -> DecodeError {
+    frame := tile.frame
+    if block.skip != 0 || tile.header.coded_lossless || !tile.sequence.enable_cdef || tile.header.allow_intrabc {
+        return Error(DecodeOK)
+    }
+    row := block.row >> 4; column := block.column >> 4
+    at := cast(s64)row * frame.cdef_columns + column
+    if frame.cdef[at] == 0 {
+        value := ReadLiteral(*tile.decoder, tile.header.cdef_bits)
+        if tile.decoder.error.code != DecodeOK { return tile.decoder.error }
+        for dy: 0..(block.bh4 - 1) / 16 {
+            for dx: 0..(block.bw4 - 1) / 16 {
+                r := row + cast(s32)dy; c := column + cast(s32)dx
+                if r < frame.cdef_rows && c < frame.cdef_columns { frame.cdef[cast(s64)r * frame.cdef_columns + c] = cast(u8)(value + 1) }
+            }
+        }
+    }
+    return Error(DecodeOK)
+}
+
+IntraModeContext :: (mode: s32) -> s32 {
+    contexts: [13]s32 = .[0,1,2,3,4,4,4,4,3,0,1,2,0]
+    return ifx mode >= 0 && mode <= 12 then contexts[mode] else 0
+}
+
+IntraPaletteCache :: (tile: *IntraTile, block: *IntraBlock, plane: s32) -> PaletteCache {
+    frame := tile.frame
+    above: [8]u16; left: [8]u16; above_count: s32; left_count: s32
+    field := ifx plane == 0 then IntraMiPaletteY else IntraMiPaletteUV
+    if block.avail_u && (block.row & 15) != 0 {
+        above_count = IntraMin(8, cast(s32)frame.mi[IntraMiAt(frame, block.row - 1, block.column) + field])
+        base := (cast(s64)plane * frame.mi_cols + block.column) * 8
+        for i: 0..above_count - 1 { above[i] = frame.palette_lines[base + i] }
+    }
+    if block.avail_l {
+        left_count = IntraMin(8, cast(s32)frame.mi[IntraMiAt(frame, block.row, block.column - 1) + field])
+        base := 16 * cast(s64)frame.mi_cols + (cast(s64)plane * frame.mi_rows + block.row) * 8
+        for i: 0..left_count - 1 { left[i] = frame.palette_lines[base + i] }
+    }
+    return BuildPaletteCache(above[:above_count], left[:left_count])
+}
+
+ReadIntraPaletteInfo :: (tile: *IntraTile, block: *IntraBlock) -> DecodeError {
+    frame := tile.frame
+    size_context := IntraSizeLog2(block.width) + IntraSizeLog2(block.height) - 2
+    if block.y_mode == 0 {
+        neighbors: s32
+        if block.avail_u && frame.mi[IntraMiAt(frame, block.row - 1, block.column) + IntraMiPaletteY] > 0 { neighbors += 1 }
+        if block.avail_l && frame.mi[IntraMiAt(frame, block.row, block.column - 1) + IntraMiPaletteY] > 0 { neighbors += 1 }
+        at := (size_context * 3 + neighbors) * 3
+        enabled := ReadSymbol(*tile.decoder, tile.cdfs.palette.enabled[at:at + 3])
+        if tile.decoder.error.code != DecodeOK { return tile.decoder.error }
+        if enabled != 0 {
+            cache := IntraPaletteCache(tile, block, 0)
+            if cache.error.code != DecodeOK { return cache.error }
+            error := ReadPaletteColors(*tile.decoder, tile.cdfs.palette.size[:], size_context,
+                cache.colors[:cache.count], frame.bit_depth, false, *tile.palette, tile.cancellation)
+            if error.code != DecodeOK { return error }
+        }
+    }
+    if block.has_chroma && block.uv_mode == 0 {
+        at := ifx tile.palette.count > 0 then 3 else 0
+        enabled := ReadSymbol(*tile.decoder, tile.cdfs.chroma.palette[at:at + 3])
+        if tile.decoder.error.code != DecodeOK { return tile.decoder.error }
+        if enabled != 0 {
+            cache := IntraPaletteCache(tile, block, 1)
+            if cache.error.code != DecodeOK { return cache.error }
+            error := ReadPaletteColors(*tile.decoder, tile.cdfs.uv_palette.size[:], size_context,
+                cache.colors[:cache.count], frame.bit_depth, true, *tile.uv_palette, tile.cancellation)
+            if error.code != DecodeOK { return error }
+        }
+    }
+    return Error(DecodeOK)
+}
+
+ReadIntraModeInfo :: (tile: *IntraTile, block: *IntraBlock) -> DecodeError {
+    frame := tile.frame; header := tile.header
+    error: DecodeError
+    block.skip = 0
+    if header.segment_id_pre_skip {
+        error = ReadIntraSegmentId(tile, block)
+        if error.code != DecodeOK { return error }
+    }
+    if header.segment_id_pre_skip && IntraFeature(tile, block.segment_id, 6) { block.skip = 1 }
+    else {
+        context: s32
+        if block.avail_u { context += cast(s32)frame.mi[IntraMiAt(frame, block.row - 1, block.column) + IntraMiSkip] }
+        if block.avail_l { context += cast(s32)frame.mi[IntraMiAt(frame, block.row, block.column - 1) + IntraMiSkip] }
+        block.skip = ReadSymbol(*tile.decoder, tile.cdfs.skip[context * 3:context * 3 + 3])
+        if tile.decoder.error.code != DecodeOK { return tile.decoder.error }
+    }
+    if !header.segment_id_pre_skip {
+        error = ReadIntraSegmentId(tile, block)
+        if error.code != DecodeOK { return error }
+    }
+    error = ReadIntraCdef(tile, block)
+    if error.code != DecodeOK { return error }
+    error = ReadIntraDeltas(tile, block)
+    if error.code != DecodeOK { return error }
+    tile.read_deltas = false
+    above: s32; left: s32
+    if block.avail_u { above = IntraModeContext(cast(s32)frame.mi[IntraMiAt(frame, block.row - 1, block.column) + IntraMiYMode]) }
+    if block.avail_l { left = IntraModeContext(cast(s32)frame.mi[IntraMiAt(frame, block.row, block.column - 1) + IntraMiYMode]) }
+    at := (above * 5 + left) * 14
+    block.y_mode = ReadSymbol(*tile.decoder, tile.cdfs.modes.keyframe[at:at + 14])
+    if tile.decoder.error.code != DecodeOK { return tile.decoder.error }
+    // MiSize >= BLOCK_8X8 in enum order includes 4x16 and 16x4.
+    extended := block.width * block.height >= 64
+    block.y_angle = 0
+    if block.y_mode >= 1 && block.y_mode <= 8 && extended {
+        angle_at := (block.y_mode - 1) * 8
+        block.y_angle = ReadSymbol(*tile.decoder, tile.cdfs.modes.angle[angle_at:angle_at + 8]) - 3
+        if tile.decoder.error.code != DecodeOK { return tile.decoder.error }
+    }
+    block.uv_mode = 0; block.uv_angle = 0; block.alpha_u = 0; block.alpha_v = 0
+    if block.has_chroma {
+        cfl_allowed: bool
+        if block.lossless {
+            cfl_allowed = IntraMax(4, block.width >> frame.subsampling_x) == 4 &&
+                IntraMax(4, block.height >> frame.subsampling_y) == 4
+        } else { cfl_allowed = IntraMax(block.width, block.height) <= 32 }
+        uv := ReadChromaMode(*tile.decoder, *tile.cdfs.chroma, *tile.cdfs.modes, block.y_mode,
+            cfl_allowed, extended, tile.cancellation)
+        if uv.error.code != DecodeOK { return uv.error }
+        block.uv_mode = uv.mode; block.uv_angle = uv.angle_delta
+        block.alpha_u = uv.alpha_u; block.alpha_v = uv.alpha_v
+    }
+    tile.palette.count = 0; tile.uv_palette.count = 0
+    if extended && block.width <= 64 && block.height <= 64 && header.allow_screen_content_tools {
+        error = ReadIntraPaletteInfo(tile, block)
+        if error.code != DecodeOK { return error }
+    }
+    block.filter_mode = -1
+    if tile.sequence.enable_filter_intra && block.y_mode == 0 && tile.palette.count == 0 &&
+        IntraMax(block.width, block.height) <= 32 {
+        index := FilterIntraBlockIndex(block.width, block.height)
+        if index < 0 { return Error(MalformedInput, tile.decoder.bits.byte) }
+        enabled := ReadSymbol(*tile.decoder, tile.cdfs.filter.enabled[index * 3:index * 3 + 3])
+        if enabled != 0 { block.filter_mode = ReadSymbol(*tile.decoder, tile.cdfs.filter.mode[:]) }
+        if tile.decoder.error.code != DecodeOK { return tile.decoder.error }
+    }
+    return Error(DecodeOK)
+}
+
+ReadIntraPaletteTokens :: (tile: *IntraTile, block: *IntraBlock) -> DecodeError {
+    frame := tile.frame
+    onscreen_w := IntraMin(block.width, (frame.mi_cols - block.column) * 4)
+    onscreen_h := IntraMin(block.height, (frame.mi_rows - block.row) * 4)
+    if tile.palette.count > 0 {
+        error := ReadPaletteMap(*tile.decoder, tile.cdfs.palette.color[:], block.width, block.height,
+            onscreen_w, onscreen_h, *tile.palette, tile.cancellation)
+        if error.code != DecodeOK { return error }
+    }
+    if tile.uv_palette.count > 0 {
+        sx := frame.subsampling_x; sy := frame.subsampling_y
+        w := block.width >> sx; h := block.height >> sy
+        ow := onscreen_w >> sx; oh := onscreen_h >> sy
+        if w < 4 { w += 2; ow += 2 }
+        if h < 4 { h += 2; oh += 2 }
+        error := ReadPaletteMap(*tile.decoder, tile.cdfs.uv_palette.color[:], w, h, ow, oh,
+            *tile.uv_palette, tile.cancellation)
+        if error.code != DecodeOK { return error }
+    }
+    return Error(DecodeOK)
+}
+
+ReadIntraTxSize :: (tile: *IntraTile, block: *IntraBlock) -> DecodeError {
+    if block.lossless { block.tx_width = 4; block.tx_height = 4; return Error(DecodeOK) }
+    frame := tile.frame
+    w := IntraMin(64, block.width); h := IntraMin(64, block.height)
+    if !(block.width == 4 && block.height == 4) && tile.header.tx_mode == 2 {
+        above_w: s32; left_h: s32
+        if block.avail_u { above_w = IntraPackedWidth(frame.mi[IntraMiAt(frame, block.row - 1, block.column) + IntraMiTx]) }
+        if block.avail_l { left_h = IntraPackedHeight(frame.mi[IntraMiAt(frame, block.row, block.column - 1) + IntraMiTx]) }
+        context := (ifx above_w >= w then 1 else 0) + (ifx left_h >= h then 1 else 0)
+        category := IntraMin(IntraMaxTxDepth(block.width, block.height), 4) - 1
+        count: s32 = ifx category == 0 then 3 else 4
+        at := (category * 3 + context) * 4
+        depth := ReadSymbol(*tile.decoder, tile.cdfs.tx_depth[at:at + count])
+        if tile.decoder.error.code != DecodeOK { return tile.decoder.error }
+        for i: 1..depth {
+            next_w := IntraSplitWidth(w, h); next_h := IntraSplitHeight(w, h)
+            w = next_w; h = next_h
+        }
+    }
+    block.tx_width = w; block.tx_height = h
+    return Error(DecodeOK)
+}
+
+IntraSmoothMode :: (mode: u8) -> bool { return mode >= 9 && mode <= 11 }
+
+// get_filter_type: smooth above/left neighbors select the stronger edge filter.
+// Chroma neighbors are shifted onto the 4x4 records that carry chroma modes.
+IntraFilterType :: (tile: *IntraTile, block: *IntraBlock, plane: s32) -> s32 {
+    frame := tile.frame
+    field := ifx plane == 0 then IntraMiYMode else IntraMiUVMode
+    smooth := false
+    if (plane == 0 && block.avail_u) || (plane > 0 && block.avail_u_chroma) {
+        row := block.row - 1; column := block.column
+        if plane > 0 {
+            if frame.subsampling_x != 0 && (block.column & 1) == 0 { column += 1 }
+            if frame.subsampling_y != 0 && (block.row & 1) != 0 { row -= 1 }
+        }
+        if IntraSmoothMode(frame.mi[IntraMiAt(frame, row, column) + field]) { smooth = true }
+    }
+    if (plane == 0 && block.avail_l) || (plane > 0 && block.avail_l_chroma) {
+        row := block.row; column := block.column - 1
+        if plane > 0 {
+            if frame.subsampling_x != 0 && (block.column & 1) != 0 { column -= 1 }
+            if frame.subsampling_y != 0 && (block.row & 1) == 0 { row += 1 }
+        }
+        if IntraSmoothMode(frame.mi[IntraMiAt(frame, row, column) + field]) { smooth = true }
+    }
+    return ifx smooth then 1 else 0
+}

@@ -1,0 +1,26 @@
+#import, file "../src/filter/deblock.zi";
+
+DeblockBoundaries :: () -> s32 {
+    source: [17]u16
+    for i: 0..16 { source[i] = 128 }
+    if FilterDeblockEdge(source[:15], 4, 32, 16, 1, 8).error.code != InvalidInput { return 1 }
+    if FilterDeblockEdge(source[:], 4, 32, 16, 1, 8).error.code != InvalidInput { return 2 }
+    if FilterDeblockEdge(source[:16], 16, 32, 16, 1, 8).error.code != InvalidInput { return 3 }
+    if FilterDeblockEdge(source[:16], 4, -1, 16, 1, 8).error.code != InvalidInput { return 4 }
+    if FilterDeblockEdge(source[:16], 4, 256, 16, 1, 8).error.code != InvalidInput { return 5 }
+    if FilterDeblockEdge(source[:16], 4, 32, -1, 1, 8).error.code != InvalidInput { return 6 }
+    if FilterDeblockEdge(source[:16], 4, 32, 256, 1, 8).error.code != InvalidInput { return 7 }
+    if FilterDeblockEdge(source[:16], 4, 32, 16, -1, 8).error.code != InvalidInput { return 8 }
+    if FilterDeblockEdge(source[:16], 4, 32, 16, 256, 8).error.code != InvalidInput { return 9 }
+    if FilterDeblockEdge(source[:16], 4, 32, 16, 1, 9).error.code != InvalidInput { return 10 }
+    source[15] = 256
+    bad := FilterDeblockEdge(source[:16], 14, 32, 16, 1, 8)
+    if bad.error.code != InvalidInput || bad.filter_enabled || bad.high_variance || bad.flat || bad.wide { return 11 }
+    for i: 0..15 { if bad.samples[i] != 0 { return 12 } }
+    source[15] = 128
+    token: Cancellation; Cancel(*token)
+    cancelled := FilterDeblockEdge(source[:16], 14, 32, 16, 1, 8, *token)
+    if cancelled.error.code != DecodeCancelled || cancelled.filter_enabled || cancelled.high_variance || cancelled.flat || cancelled.wide { return 13 }
+    for i: 0..15 { if cancelled.samples[i] != 0 { return 14 } }
+    return 0
+}

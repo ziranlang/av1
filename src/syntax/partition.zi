@@ -1,0 +1,85 @@
+#import, file "../entropy/range.zi";
+using Codec :: #import "image_codec/api"
+
+// Copyright (c) 2016, 2017 Alliance for Open Media. All rights reserved.
+// BSD 2-Clause + AOM Patent License, retained in LICENSE.libaom/PATENTS.libaom.
+// Default square partition probabilities from pinned libaom entropymode.c,
+// revision d772e334cc724105040382a977ebb10dfd393293. Ascending AV1 Q15.
+PartitionCDF :: struct { cells: [220]u16; }
+NewPartitionCDF :: () -> PartitionCDF {
+    state: PartitionCDF
+    // Four contexts per width8/16/32/64/128. Rows have stride11; width8 uses
+    // five cells and width128 nine, each including its own adaptation count.
+    cells: [220]u16 = .[
+        19132,25510,30392,32768,0,0,0,0,0,0,0,
+        13928,19855,28540,32768,0,0,0,0,0,0,0,
+        12522,23679,28629,32768,0,0,0,0,0,0,0,
+        9896,18783,25853,32768,0,0,0,0,0,0,0,
+        15597,20929,24571,26706,27664,28821,29601,30571,31902,32768,0,
+        7925,11043,16785,22470,23971,25043,26651,28701,29834,32768,0,
+        5414,13269,15111,20488,22360,24500,25537,26336,32117,32768,0,
+        2662,6362,8614,20860,23053,24778,26436,27829,31171,32768,0,
+        18462,20920,23124,27647,28227,29049,29519,30178,31544,32768,0,
+        7689,9060,12056,24992,25660,26182,26951,28041,29052,32768,0,
+        6015,9009,10062,24544,25409,26545,27071,27526,32047,32768,0,
+        1394,2208,2796,28614,29061,29466,29840,30185,31899,32768,0,
+        20137,21547,23078,29566,29837,30261,30524,30892,31724,32768,0,
+        6732,7490,9497,27944,28250,28515,28969,29630,30104,32768,0,
+        5945,7663,8348,28683,29117,29749,30064,30298,32238,32768,0,
+        870,1212,1487,31198,31394,31574,31743,31881,32332,32768,0,
+        27899,28219,28529,32484,32539,32619,32639,32768,0,0,0,
+        6607,6990,8268,32060,32219,32338,32371,32768,0,0,0,
+        5429,6676,7122,32027,32227,32531,32582,32768,0,0,0,
+        711,966,1172,32448,32538,32617,32664,32768,0,0,0]
+    state.cells = cells
+    return state
+}
+
+// Complete square within a tile; boundary forcing belongs to the traversal.
+// Missing neighbors have width/height zero. Otherwise pass their coded size.
+ReadSquarePartition :: (decoder: *RangeDecoder, cdfs: *PartitionCDF,
+    side: s32, above_width: s32, left_height: s32) -> s32 {
+    if decoder == null { return 0 }
+    if cdfs == null || (side != 8 && side != 16 && side != 32 && side != 64 && side != 128) ||
+        above_width < 0 || left_height < 0 { decoder.error = Error(InvalidInput, decoder.bits.byte); return 0 }
+    size_context: s32
+    n := side
+    while n > 8 { size_context += 4; n /= 2 }
+    context := size_context
+    if above_width > 0 && above_width < side { context += 1 }
+    if left_height > 0 && left_height < side { context += 2 }
+    at := context * 11
+    count: s32 = ifx side == 8 then 5 else ifx side == 128 then 9 else 11
+    return ReadSymbol(decoder, cdfs.cells[at:at + count])
+}
+
+// AV1 split_or_horz/split_or_vert uses a transient binary CDF derived from
+// the full partition distribution. It must not adapt the source partition CDF.
+ReadBoundaryPartition :: (decoder: *RangeDecoder, cdfs: *PartitionCDF,
+    side: s32, above_width: s32, left_height: s32, has_rows: bool) -> s32 {
+    if decoder == null { return 0 }
+    if cdfs == null || (side != 16 && side != 32 && side != 64 && side != 128) || above_width < 0 || left_height < 0 {
+        decoder.error = Error(InvalidInput, decoder.bits.byte); return 0
+    }
+    context: s32 = 4; n := side
+    while n > 16 { context += 4; n /= 2 }
+    if above_width > 0 && above_width < side { context += 1 }
+    if left_height > 0 && left_height < side { context += 2 }
+    at := context * 11
+    horizontal: [6]s32 = .[2,3,4,6,7,9]
+    vertical: [6]s32 = .[1,3,4,5,6,8]
+    // Width128 has no four-way partitions, so its sixth term is absent.
+    probability: s32; terms: s32 = ifx side == 128 then 4 else 5
+    for i: 0..terms {
+        symbol := ifx has_rows then vertical[i] else horizontal[i]
+        high := cast(s32)cdfs.cells[at + symbol]; low := cast(s32)cdfs.cells[at + symbol - 1]
+        if high < low { decoder.error = Error(InvalidInput, decoder.bits.byte); return 0 }
+        probability += high - low
+    }
+    if probability > 32768 { decoder.error = Error(InvalidInput, decoder.bits.byte); return 0 }
+    cdf: [3]u16
+    cdf[0] = cast(u16)(32768 - probability); cdf[1] = 32768
+    symbol := ReadSymbol(decoder, cdf[:])
+    if symbol == 1 { return 3 }
+    return ifx has_rows then 2 else 1
+}

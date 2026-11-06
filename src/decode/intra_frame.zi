@@ -1,0 +1,281 @@
+#import, file "../entropy/range.zi";
+#import, file "../syntax/partition.zi";
+#import, file "../syntax/profile.zi";
+#import, file "../syntax/state.zi";
+#import, file "../syntax/tilegroup.zi";
+#import, file "../entropy/intra_frame_cdfs.zi";
+#import, file "../entropy/chroma_modes.zi";
+#import, file "../predict/palette.zi";
+#import, file "../predict/filter_intra.zi";
+#import, file "../predict/intra_predict.zi";
+#import, file "../predict/cfl.zi";
+#import, file "../entropy/coefficient_block.zi";
+#import, file "../entropy/coefficient_neighbors.zi";
+#import, file "../transform/transform_type.zi";
+#import, file "../transform/quantization.zi";
+#import, file "../transform/inverse_transform.zi";
+#import, file "../transform/lossless.zi";
+#import, file "../filter/sgr.zi";
+using Codec :: #import "image_codec/api"
+using IntraVectors :: #import "std/vec"
+
+// AV1 intra-frame tile decoding, specification sections 5.11 and 7.11-7.13.
+// Per-4x4 mode records and line contexts are heap owned by IntraFrame; the
+// sample planes are a caller-local Vec(u16) of sample_count elements lent as
+// one view. Both are sized from the frame header and charged to the caller's
+// working budget before allocation.
+//
+// Block and transform sizes are packed as (log2(width/4) << 3) | log2(height/4).
+// Per-4x4 records hold IntraMiFields bytes at the offsets below; chroma loop
+// filter transform sizes use the plane's own 4x4 grid inside the luma grid.
+IntraMiFields :: 16
+IntraMiSize :: 0
+IntraMiYMode :: 1
+IntraMiUVMode :: 2
+IntraMiSkip :: 3
+IntraMiTx :: 4
+IntraMiSegment :: 5
+IntraMiPaletteY :: 6
+IntraMiPaletteUV :: 7
+IntraMiLoopTx :: 8
+IntraMiDeltaLF :: 11
+// Restoration unit records: type, Wiener pass0 taps, pass1 taps, SGR set and
+// the two projection weights. Types are RESTORE_NONE/WIENER/SGRPROJ (0/1/2).
+IntraRestorationFields :: 10
+// Block-decoded flags span -1..32 per axis for each plane.
+IntraDecodedSide :: 35
+IntraDecodedPlane :: 1225
+
+IntraFrame :: struct {
+    mi: Vec(u8);
+    contexts: Vec(u8);
+    palette_lines: Vec(u16);
+    cdef: Vec(u8);
+    restoration: Vec(s16);
+    plane_offset: [3]s64;
+    plane_stride: [3]s32;
+    plane_rows: [3]s32;
+    planes: s32;
+    width: s32;
+    height: s32;
+    mi_rows: s32;
+    mi_cols: s32;
+    subsampling_x: s32;
+    subsampling_y: s32;
+    bit_depth: s32;
+    superblock4: s32;
+    context_columns: s32;
+    context_rows: s32;
+    cdef_columns: s32;
+    cdef_rows: s32;
+    restoration_type: [3]s32;
+    restoration_size: [3]s32;
+    restoration_columns: [3]s32;
+    restoration_rows: [3]s32;
+    restoration_offset: [3]s64;
+    sample_count: s64;
+    tiles_decoded: s32;
+    restoration_count: s64;
+    // Post filters that are not the identity; each needs one extra frame.
+    cdef_enabled: bool;
+    restoration_enabled: bool;
+    working_bytes: s64;
+}
+
+IntraTile :: struct {
+    frame: *IntraFrame;
+    samples: []u16;
+    sequence: *SequenceHeader;
+    header: *StillFrameHeader;
+    decoder: RangeDecoder;
+    cdfs: IntraTileCDFs;
+    row_start: s32;
+    row_end: s32;
+    column_start: s32;
+    column_end: s32;
+    current_q: s32;
+    delta_lf: [4]s32;
+    read_deltas: bool;
+    ref_wiener: [18]s32;
+    ref_sgr: [6]s32;
+    decoded: [3675]u8;
+    palette: PaletteBlock;
+    uv_palette: PaletteBlock;
+    edges: IntraEdges;
+    residual: [4096]s32;
+    cfl_luma: [4096]u16;
+    cancellation: *Cancellation;
+}
+
+IntraBlock :: struct {
+    row: s32;
+    column: s32;
+    width: s32;
+    height: s32;
+    bw4: s32;
+    bh4: s32;
+    has_chroma: bool;
+    avail_u: bool;
+    avail_l: bool;
+    avail_u_chroma: bool;
+    avail_l_chroma: bool;
+    skip: s32;
+    segment_id: s32;
+    lossless: bool;
+    y_mode: s32;
+    y_angle: s32;
+    uv_mode: s32;
+    uv_angle: s32;
+    alpha_u: s32;
+    alpha_v: s32;
+    filter_mode: s32;
+    tx_width: s32;
+    tx_height: s32;
+    max_luma_w: s32;
+    max_luma_h: s32;
+}
+
+IntraSizeLog2 :: (value: s32) -> s32 {
+    log: s32 = -1; n: s32 = 4
+    for i: 0..5 {
+        if n == value { log = cast(s32)i }
+        n *= 2
+    }
+    return log
+}
+IntraPackSize :: (width: s32, height: s32) -> u8 {
+    return cast(u8)(IntraSizeLog2(width) * 8 + IntraSizeLog2(height))
+}
+IntraPackedWidth :: (packed: u8) -> s32 { return cast(s32)(cast(u32)4 << cast(u32)(packed >> 3)) }
+IntraPackedHeight :: (packed: u8) -> s32 { return cast(s32)(cast(u32)4 << cast(u32)(packed & 7)) }
+IntraMin :: (a: s32, b: s32) -> s32 { return ifx a < b then a else b }
+IntraMax :: (a: s32, b: s32) -> s32 { return ifx a > b then a else b }
+IntraShift :: (value: s32, bits: s32) -> s32 { return cast(s32)(cast(u32)value << cast(u32)bits) }
+IntraMiAt :: (frame: *IntraFrame, row: s32, column: s32) -> s64 {
+    return (cast(s64)row * frame.mi_cols + column) * IntraMiFields
+}
+IntraInside :: (tile: *IntraTile, row: s32, column: s32) -> bool {
+    return row >= tile.row_start && row < tile.row_end && column >= tile.column_start && column < tile.column_end
+}
+IntraFeature :: (tile: *IntraTile, segment: s32, feature: s32) -> bool {
+    return tile.header.segmentation_enabled && tile.header.features[segment * 8 + feature].enabled
+}
+IntraSubX :: (frame: *IntraFrame, plane: s32) -> s32 { return ifx plane > 0 then frame.subsampling_x else 0 }
+IntraSubY :: (frame: *IntraFrame, plane: s32) -> s32 { return ifx plane > 0 then frame.subsampling_y else 0 }
+// Context line layout per plane: above levels, above DC signs, left levels,
+// left DC signs. Columns and rows include 32 entries of edge padding.
+IntraContextBase :: (frame: *IntraFrame, plane: s32) -> s64 {
+    return cast(s64)plane * (2 * cast(s64)frame.context_columns + 2 * cast(s64)frame.context_rows)
+}
+
+// Transforms are split to a square first, then along the longer side.
+IntraSplitWidth :: (width: s32, height: s32) -> s32 { return ifx width >= height && width > 4 then width / 2 else width }
+IntraSplitHeight :: (width: s32, height: s32) -> s32 { return ifx height >= width && height > 4 then height / 2 else height }
+IntraMaxTxDepth :: (width: s32, height: s32) -> s32 {
+    w := IntraMin(width, 64); h := IntraMin(height, 64); depth: s32
+    while w > 4 || h > 4 {
+        next_w := IntraSplitWidth(w, h); next_h := IntraSplitHeight(w, h)
+        w = next_w; h = next_h; depth += 1
+    }
+    return depth
+}
+
+// Supported tool subset for this scalar intra engine; other streams reject
+// with UnsupportedCapability.
+IntraFrameSupported :: (sequence: *SequenceHeader, header: *StillFrameHeader) -> DecodeError {
+    if sequence == null || header == null { return Error(InvalidInput) }
+    if header.frame_type != 0 || header.allow_intrabc || header.width != header.upscaled_width {
+        return Error(UnsupportedCapability)
+    }
+    if header.using_qmatrix {
+        for i: 0..2 { if header.qm[i] < 15 { return Error(UnsupportedCapability) } }
+    }
+    return Error(DecodeOK)
+}
+
+// Geometry and exact heap element counts. Nothing is allocated here; the
+// caller reserves working_bytes (heap elements only; fixed tile state lives in
+// the caller's fixed reservation) before AllocateIntraFrame.
+PrepareIntraFrame :: (frame: *IntraFrame, sequence: *SequenceHeader, header: *StillFrameHeader) -> DecodeError {
+    if frame == null || sequence == null || header == null { return Error(InvalidInput) }
+    if header.width < 1 || header.width > 65536 || header.height < 1 || header.height > 65536 ||
+        (sequence.bit_depth != 8 && sequence.bit_depth != 10 && sequence.bit_depth != 12) ||
+        sequence.subsampling_x < 0 || sequence.subsampling_x > 1 || sequence.subsampling_y < 0 ||
+        sequence.subsampling_y > sequence.subsampling_x { return Error(InvalidInput) }
+    frame.width = header.width; frame.height = header.height
+    frame.mi_cols = 2 * ((header.width + 7) >> 3); frame.mi_rows = 2 * ((header.height + 7) >> 3)
+    frame.planes = ifx sequence.monochrome then 1 else 3
+    frame.subsampling_x = ifx sequence.monochrome then 1 else sequence.subsampling_x
+    frame.subsampling_y = ifx sequence.monochrome then 1 else sequence.subsampling_y
+    frame.bit_depth = sequence.bit_depth
+    frame.superblock4 = ifx sequence.use_128x128_superblock then 32 else 16
+    luma_stride := ((frame.mi_cols * 4 + 63) / 64) * 64
+    luma_rows := ((frame.mi_rows * 4 + 63) / 64) * 64
+    total: s64
+    for plane: 0..2 {
+        frame.plane_offset[plane] = total
+        if plane < frame.planes {
+            frame.plane_stride[plane] = luma_stride >> IntraSubX(frame, cast(s32)plane)
+            frame.plane_rows[plane] = luma_rows >> IntraSubY(frame, cast(s32)plane)
+            total += cast(s64)frame.plane_stride[plane] * frame.plane_rows[plane]
+        }
+    }
+    frame.sample_count = total
+    frame.context_columns = frame.mi_cols + 32; frame.context_rows = frame.mi_rows + 32
+    frame.cdef_columns = (frame.mi_cols + 15) / 16; frame.cdef_rows = (frame.mi_rows + 15) / 16
+    frame.restoration_count = 0
+    for plane: 0..2 {
+        frame.restoration_type[plane] = 0; frame.restoration_size[plane] = 0
+        frame.restoration_columns[plane] = 0; frame.restoration_rows[plane] = 0
+        frame.restoration_offset[plane] = frame.restoration_count
+        if plane < frame.planes && header.restoration_types[plane] != 0 {
+            raw := header.restoration_types[plane]
+            frame.restoration_type[plane] = ifx raw == 1 then 3 else ifx raw == 2 then 1 else 2
+            size := header.restoration_sizes[plane]
+            if size != 32 && size != 64 && size != 128 && size != 256 { return Error(InvalidInput) }
+            frame.restoration_size[plane] = size
+            sx := IntraSubX(frame, cast(s32)plane); sy := IntraSubY(frame, cast(s32)plane)
+            plane_w := (header.upscaled_width + sx) >> sx
+            plane_h := (header.height + sy) >> sy
+            frame.restoration_columns[plane] = IntraMax((plane_w + size / 2) / size, 1)
+            frame.restoration_rows[plane] = IntraMax((plane_h + size / 2) / size, 1)
+            frame.restoration_count += cast(s64)frame.restoration_columns[plane] * frame.restoration_rows[plane] * IntraRestorationFields
+        }
+    }
+    frame.cdef_enabled = false
+    if sequence.enable_cdef && !header.coded_lossless && !header.allow_intrabc {
+        if header.cdef_bits < 0 || header.cdef_bits > 3 { return Error(InvalidInput) }
+        count := cast(s32)(cast(u32)1 << cast(u32)header.cdef_bits)
+        for i: 0..count - 1 {
+            if header.cdef_y_primary[i] != 0 || header.cdef_y_secondary[i] != 0 ||
+                header.cdef_uv_primary[i] != 0 || header.cdef_uv_secondary[i] != 0 { frame.cdef_enabled = true }
+        }
+    }
+    frame.restoration_enabled = frame.restoration_count > 0
+    buffers: s64 = 1
+    if frame.cdef_enabled { buffers += 1 }
+    if frame.restoration_enabled { buffers += 1 }
+    mi_count := cast(s64)frame.mi_rows * frame.mi_cols
+    bytes := buffers * frame.sample_count * 2 + mi_count * IntraMiFields
+    bytes += 3 * (2 * cast(s64)frame.context_columns + 2 * cast(s64)frame.context_rows)
+    bytes += 2 * 8 * 2 * (cast(s64)frame.mi_cols + frame.mi_rows)
+    bytes += cast(s64)frame.cdef_columns * frame.cdef_rows + frame.restoration_count * 2
+    frame.working_bytes = bytes
+    return Error(DecodeOK)
+}
+
+AllocateIntraFrame :: (frame: *IntraFrame) -> DecodeError {
+    if frame == null || frame.sample_count <= 0 { return Error(InvalidInput) }
+    mi_count := cast(s64)frame.mi_rows * frame.mi_cols * IntraMiFields
+    contexts := 3 * (2 * cast(s64)frame.context_columns + 2 * cast(s64)frame.context_rows)
+    lines := 2 * 8 * (cast(s64)frame.mi_cols + frame.mi_rows)
+    cdef := cast(s64)frame.cdef_columns * frame.cdef_rows
+    if !VecResizeBounded(frame.mi, mi_count, mi_count) ||
+        !VecResizeBounded(frame.contexts, contexts, contexts) ||
+        !VecResizeBounded(frame.palette_lines, lines, lines) ||
+        !VecResizeBounded(frame.cdef, cdef, cdef) ||
+        !VecResizeBounded(frame.restoration, frame.restoration_count, frame.restoration_count) {
+        return Error(AllocationFailed)
+    }
+    return Error(DecodeOK)
+}

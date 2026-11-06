@@ -1,0 +1,80 @@
+using Codec :: #import "image_codec/api"
+
+LEB128Result :: struct { value: u32; bytes: s32; next: s64; error: DecodeError; }
+
+// AV1 leb128(), not an unrestricted u64 LEB128. Non-minimal encodings are legal.
+ReadLEB128 :: (input: BorrowedBytes, at: s64, end: s64) -> LEB128Result {
+    result: LEB128Result
+    result.next = at
+    if at < 0 || end < at || end > input.data.count { result.error = Error(InvalidInput, at); return result }
+    value: u64
+    i: s32
+    while i < 8 {
+        if result.next == end { result.error = Error(TruncatedInput, end); return result }
+        byte := input.data[result.next]
+        value |= cast(u64)(byte & 127) << cast(u64)(i * 7)
+        if value > 4294967295 { result.error = Error(MalformedInput, result.next); return result }
+        result.next += 1; result.bytes += 1
+        if (byte & 128) == 0 { result.value = cast(u32)value; return result }
+        i += 1
+    }
+    result.error = Error(MalformedInput, result.next - 1)
+    return result
+}
+
+Av1SequenceHeader :: 1;
+Av1TemporalDelimiter :: 2;
+Av1FrameHeader :: 3;
+Av1TileGroup :: 4;
+Av1Metadata :: 5;
+Av1Frame :: 6;
+Av1RedundantFrameHeader :: 7;
+Av1TileList :: 8;
+Av1Padding :: 15;
+
+ObuView :: struct {
+    kind: s32;
+    temporal_id: s32;
+    spatial_id: s32;
+    has_extension: bool;
+    has_size: bool;
+    start: s64;
+    payload: s64;
+    end: s64;
+}
+ObuResult :: struct { obu: ObuView; error: DecodeError; }
+
+// end bounds the enclosing input. With external_size=true it instead bounds
+// exactly one OBU whose length was supplied by the enclosing framing layer.
+// Reserved types remain skippable; this function does not interpret payloads.
+ReadOBU :: (input: BorrowedBytes, at: s64, end: s64, external_size: bool = false) -> ObuResult {
+    result: ObuResult
+    if at < 0 || end < at || end > input.data.count { result.error = Error(InvalidInput, at); return result }
+    if at == end { result.error = Error(TruncatedInput, end); return result }
+    header := input.data[at]
+    if (header & 129) != 0 { result.error = Error(MalformedInput, at); return result }
+    obu: ObuView
+    obu.kind = cast(s32)((header >> 3) & 15)
+    obu.start = at; obu.payload = at + 1
+    obu.has_extension = (header & 4) != 0; obu.has_size = (header & 2) != 0
+    if obu.has_extension {
+        if obu.payload == end { result.error = Error(TruncatedInput, end); return result }
+        extension := input.data[obu.payload]
+        if (extension & 7) != 0 { result.error = Error(MalformedInput, obu.payload); return result }
+        obu.temporal_id = cast(s32)(extension >> 5); obu.spatial_id = cast(s32)((extension >> 3) & 3)
+        obu.payload += 1
+    }
+    if obu.has_size {
+        length := ReadLEB128(input, obu.payload, end)
+        if length.error.code != DecodeOK { result.error = length.error; return result }
+        obu.payload = length.next
+        if cast(s64)length.value > end - obu.payload { result.error = Error(TruncatedInput, end); return result }
+        obu.end = obu.payload + cast(s64)length.value
+        if external_size && obu.end != end { result.error = Error(MalformedInput, obu.end); return result }
+    } else {
+        if !external_size { result.error = Error(MalformedInput, at); return result }
+        obu.end = end
+    }
+    result.obu = obu
+    return result
+}

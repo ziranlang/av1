@@ -1,0 +1,30 @@
+using Codec :: #import "image_codec/api"
+#import, file "./coefficient_cdf_data.zi";
+
+CoefficientCDFSkip :: 0
+CoefficientCDFDC :: 1
+CoefficientCDFBase :: 2
+CoefficientCDFBR :: 3
+CoefficientCDFBaseEOB :: 4
+CoefficientCDFExtra :: 5
+CoefficientCDFEOB :: 6
+
+CoefficientCDFs :: struct { values: [3835]u16; error: DecodeError; }
+
+// Fresh tile-owned ascending Q15 probabilities and independent adaptation
+// counters. The category uses the frame base Q, not a block's delta-Q index.
+NewCoefficientCDFs :: (base_q_index: s32, cancellation: *Cancellation = null) -> CoefficientCDFs {
+    result: CoefficientCDFs
+    result.error = CancellationError(cancellation)
+    if result.error.code != DecodeOK { return result }
+    if base_q_index < 0 || base_q_index > 255 { result.error = Error(InvalidInput); return result }
+    if base_q_index <= 20 { result.values = CoefficientCDFData0() }
+    else if base_q_index <= 60 { result.values = CoefficientCDFData1() }
+    else if base_q_index <= 120 { result.values = CoefficientCDFData2() }
+    else { result.values = CoefficientCDFData3() }
+    result.error = CancellationError(cancellation)
+    if result.error.code != DecodeOK {
+        failed: CoefficientCDFs; failed.error = result.error; return failed
+    }
+    return result
+}

@@ -1,0 +1,446 @@
+using Codec :: #import "image_codec/api"
+
+// AV1 7.11.2 intra prediction for every transform size 4x4..64x64, scalar
+// reference. Smooth weights, directional derivatives and recursive filter taps
+// are from libaom d772e334cc724105040382a977ebb10dfd393293
+// (aom_dsp/intrapred_common.h, av1/common/reconintra.{c,h}). Copyright (c)
+// 2016, 2017 Alliance for Open Media. BSD 2-Clause + AOM Patent License
+// retained in src/LICENSE.libaom and src/PATENTS.libaom.
+//
+// Mode numbers follow AV1 intra_frame_y_mode: DC 0, V 1, H 2, D45 3, D135 4,
+// D113 5, D157 6, D203 7, D67 8, SMOOTH 9, SMOOTH_V 10, SMOOTH_H 11, PAETH 12.
+
+IntraEdgeOffset :: 2
+
+// AboveRow/LeftCol with logical indices -2..133 stored at IntraEdgeOffset.
+// Indices -1..width+height-1 hold the normative edge; filtering and upsampling
+// happen on a private copy inside PredictIntra.
+IntraEdges :: struct {
+    above: [136]s32;
+    left: [136]s32;
+    width: s32;
+    height: s32;
+    available_width: s32;
+    available_height: s32;
+    have_above: bool;
+    have_left: bool;
+    bit_depth: s32;
+}
+
+IntraLog2 :: (size: s32) -> s32 {
+    if size == 4 { return 2 }
+    if size == 8 { return 3 }
+    if size == 16 { return 4 }
+    if size == 32 { return 5 }
+    if size == 64 { return 6 }
+    return -1
+}
+
+// One of the 19 AV1 transform sizes.
+IntraSizeValid :: (width: s32, height: s32) -> bool {
+    log2_width := IntraLog2(width); log2_height := IntraLog2(height)
+    if log2_width < 0 || log2_height < 0 { return false }
+    return log2_width - log2_height <= 2 && log2_height - log2_width <= 2
+}
+
+IntraDepthValid :: (bit_depth: s32) -> bool {
+    return bit_depth == 8 || bit_depth == 10 || bit_depth == 12
+}
+
+// Floor division by 2^bits for either sign, without signed-shift semantics.
+IntraFloorShift :: (value: s32, bits: s32) -> s32 {
+    if value >= 0 { return value >> bits }
+    return -((-value + cast(s32)(cast(u32)1 << cast(u32)bits) - 1) >> bits)
+}
+
+IntraDerivative :: (angle: s32) -> s32 {
+    table: [90]s16 = .[0,0,0,1023,0,0,547,0,0,372,0,0,0,0,273,0,0,215,0,0,178,0,0,151,0,0,132,0,0,116,
+        0,0,102,0,0,0,90,0,0,80,0,0,71,0,0,64,0,0,57,0,0,51,0,0,45,0,0,0,40,0,0,35,0,0,31,0,0,27,0,0,
+        23,0,0,19,0,0,15,0,0,0,0,11,0,0,7,0,0,3,0,0]
+    if angle < 0 || angle > 89 { return 0 }
+    return cast(s32)table[angle]
+}
+
+// Smooth weights for sizes 4, 8, 16, 32 and 64; size n starts at n - 4.
+IntraSmoothWeights :: () -> [124]u8 {
+    weights: [124]u8 = .[255,149,85,64,
+        255,197,146,105,73,50,37,32,
+        255,225,196,170,145,123,102,84,68,54,43,33,26,20,17,16,
+        255,240,225,210,196,182,169,157,145,133,122,111,101,92,83,74,
+        66,59,52,45,39,34,29,25,21,17,14,12,10,9,8,8,
+        255,248,240,233,225,218,210,203,196,189,182,176,169,163,156,
+        150,144,138,133,127,121,116,111,106,101,96,91,86,82,77,73,69,
+        65,61,57,54,50,47,44,41,38,35,32,29,27,25,22,20,18,16,15,
+        13,12,10,9,8,7,6,6,5,5,4,4,4]
+    return weights
+}
+
+// Intra_Filter_Taps[mode][output (i1 << 2) + j1][neighbor 0..6].
+IntraFilterTaps :: () -> [280]s8 {
+    taps: [280]s8 = .[
+        -6,10,0,0,0,12,0, -5,2,10,0,0,9,0, -3,1,1,10,0,7,0, -3,1,1,2,10,5,0,
+        -4,6,0,0,0,2,12, -3,2,6,0,0,2,9, -3,2,2,6,0,2,7, -3,1,2,2,6,3,5,
+        -10,16,0,0,0,10,0, -6,0,16,0,0,6,0, -4,0,0,16,0,4,0, -2,0,0,0,16,2,0,
+        -10,16,0,0,0,0,10, -6,0,16,0,0,0,6, -4,0,0,16,0,0,4, -2,0,0,0,16,0,2,
+        -8,8,0,0,0,16,0, -8,0,8,0,0,16,0, -8,0,0,8,0,16,0, -8,0,0,0,8,16,0,
+        -4,4,0,0,0,0,16, -4,0,4,0,0,0,16, -4,0,0,4,0,0,16, -4,0,0,0,4,0,16,
+        -2,8,0,0,0,10,0, -1,3,8,0,0,6,0, -1,2,3,8,0,4,0, 0,1,2,3,8,2,0,
+        -1,4,0,0,0,3,10, -1,3,4,0,0,4,6, -1,2,3,4,0,4,4, -1,2,2,3,4,3,3,
+        -12,14,0,0,0,14,0, -10,0,14,0,0,12,0, -9,0,0,14,0,11,0, -8,0,0,0,14,10,0,
+        -10,12,0,0,0,0,14, -9,1,12,0,0,0,12, -8,0,0,12,0,1,11, -7,0,0,1,12,1,9]
+    return taps
+}
+
+// Builds AboveRow/LeftCol (AV1 7.11.2.1) from a reconstructed plane. x/y are
+// the transform block origin; max_x/max_y are the last decoded plane sample,
+// ((MiCols * MI_SIZE) >> subsampling_x) - 1 and likewise for rows. Every read
+// is bounds-checked; edges is only written on success.
+BuildIntraEdges :: (edges: *IntraEdges, plane: []u16, stride: s32, x: s32, y: s32,
+    width: s32, height: s32, max_x: s32, max_y: s32, have_above: bool, have_left: bool,
+    have_above_right: bool, have_below_left: bool, bit_depth: s32) -> DecodeError {
+    if edges == null || !IntraSizeValid(width, height) || !IntraDepthValid(bit_depth) ||
+        stride < 1 || max_x < 0 || max_y < 0 || max_x >= stride || x < 0 || x > max_x || y < 0 || y > max_y ||
+        (have_above && y == 0) || (have_left && x == 0) ||
+        cast(s64)max_y * stride + max_x >= plane.count {
+        return Error(InvalidInput)
+    }
+    maximum := cast(s32)((cast(u32)1 << cast(u32)bit_depth) - 1)
+    midpoint := cast(s32)(cast(u32)1 << cast(u32)(bit_depth - 1))
+    above: [136]s32; left: [136]s32
+    total := width + height
+    row := cast(s64)y * stride
+    if have_above {
+        span := ifx have_above_right then 2 * width else width
+        limit := x + span - 1; if limit > max_x { limit = max_x }
+        for i: 0..cast(s64)total - 1 {
+            at := x + cast(s32)i; if at > limit { at = limit }
+            above[IntraEdgeOffset + i] = cast(s32)plane[row - stride + at]
+        }
+    } else {
+        value := ifx have_left then cast(s32)plane[row + x - 1] else midpoint - 1
+        for i: 0..cast(s64)total - 1 { above[IntraEdgeOffset + i] = value }
+    }
+    if have_left {
+        span := ifx have_below_left then 2 * height else height
+        limit := y + span - 1; if limit > max_y { limit = max_y }
+        for i: 0..cast(s64)total - 1 {
+            at := y + cast(s32)i; if at > limit { at = limit }
+            left[IntraEdgeOffset + i] = cast(s32)plane[cast(s64)at * stride + x - 1]
+        }
+    } else {
+        value := ifx have_above then cast(s32)plane[row - stride + x] else midpoint + 1
+        for i: 0..cast(s64)total - 1 { left[IntraEdgeOffset + i] = value }
+    }
+    corner := midpoint
+    if have_above && have_left { corner = cast(s32)plane[row - stride + x - 1] }
+    else if have_above { corner = cast(s32)plane[row - stride + x] }
+    else if have_left { corner = cast(s32)plane[row + x - 1] }
+    above[IntraEdgeOffset - 1] = corner; left[IntraEdgeOffset - 1] = corner
+    for i: -1..cast(s64)total - 1 {
+        if above[IntraEdgeOffset + i] > maximum || left[IntraEdgeOffset + i] > maximum { return Error(InvalidInput) }
+    }
+    edges.above = above; edges.left = left
+    edges.width = width; edges.height = height
+    available_width := max_x - x + 1; if available_width > width { available_width = width }
+    available_height := max_y - y + 1; if available_height > height { available_height = height }
+    edges.available_width = available_width; edges.available_height = available_height
+    edges.have_above = have_above; edges.have_left = have_left
+    edges.bit_depth = bit_depth
+    return Error(DecodeOK)
+}
+
+// AV1 7.11.2.9.
+IntraEdgeFilterStrength :: (width: s32, height: s32, filter_type: s32, delta: s32) -> s32 {
+    d := ifx delta < 0 then -delta else delta
+    sum := width + height
+    strength: s32
+    if filter_type == 0 {
+        if sum <= 8 { if d >= 56 { strength = 1 } }
+        else if sum <= 16 { if d >= 40 { strength = 1 } }
+        else if sum <= 24 {
+            if d >= 8 { strength = 1 }
+            if d >= 16 { strength = 2 }
+            if d >= 32 { strength = 3 }
+        } else if sum <= 32 {
+            strength = 1
+            if d >= 4 { strength = 2 }
+            if d >= 32 { strength = 3 }
+        } else { strength = 3 }
+    } else {
+        if sum <= 8 {
+            if d >= 40 { strength = 1 }
+            if d >= 64 { strength = 2 }
+        } else if sum <= 16 {
+            if d >= 20 { strength = 1 }
+            if d >= 48 { strength = 2 }
+        } else if sum <= 24 { if d >= 4 { strength = 3 } }
+        else { strength = 3 }
+    }
+    return strength
+}
+
+// AV1 7.11.2.10.
+IntraUseUpsample :: (width: s32, height: s32, filter_type: s32, delta: s32) -> bool {
+    d := ifx delta < 0 then -delta else delta
+    if d <= 0 || d >= 40 { return false }
+    if filter_type == 0 { return width + height <= 16 }
+    return width + height <= 8
+}
+
+// AV1 7.11.2.12 on buf[-1..size-2]; size <= 129.
+IntraFilterEdge :: (buf: []s32, size: s32, strength: s32) {
+    if strength == 0 { return }
+    edge: [130]s32
+    for i: 0..cast(s64)size - 1 { edge[i] = buf[IntraEdgeOffset - 1 + i] }
+    kernels: [15]s32 = .[0,4,8,4,0, 0,5,6,5,0, 2,4,4,4,2]
+    for i: 1..cast(s64)size - 1 {
+        sum: s32
+        for j: 0..4 {
+            at := i - 2 + j
+            if at < 0 { at = 0 }
+            if at > size - 1 { at = size - 1 }
+            sum += kernels[(strength - 1) * 5 + j] * edge[at]
+        }
+        buf[IntraEdgeOffset - 1 + i] = (sum + 8) >> 4
+    }
+}
+
+// AV1 7.11.2.11: buf[-1..count-1] becomes buf[-2..2*count-2]; count <= 16.
+IntraUpsampleEdge :: (buf: []s32, count: s32, maximum: s32) {
+    duplicate: [19]s32
+    duplicate[0] = buf[IntraEdgeOffset - 1]
+    for i: -1..cast(s64)count - 1 { duplicate[i + 2] = buf[IntraEdgeOffset + i] }
+    duplicate[count + 2] = buf[IntraEdgeOffset + count - 1]
+    buf[IntraEdgeOffset - 2] = duplicate[0]
+    for i: 0..cast(s64)count - 1 {
+        sum := -duplicate[i] + 9 * duplicate[i + 1] + 9 * duplicate[i + 2] - duplicate[i + 3]
+        value := ifx sum <= 0 then 0 else (sum + 8) >> 4
+        if value > maximum { value = maximum }
+        buf[IntraEdgeOffset + 2 * i - 1] = value
+        buf[IntraEdgeOffset + 2 * i] = duplicate[i + 2]
+    }
+}
+
+// Predicts one transform block into out (row stride `stride`). filter_mode is
+// -1 or the recursive filter mode 0..4 (requires mode DC and sizes <= 32).
+// angle_delta (-3..3) only affects directional modes. filter_type is the
+// 7.11.2.8 neighbor smooth flag. Nothing is written on failure.
+PredictIntra :: (out: []u16, stride: s32, edges: *IntraEdges, mode: s32, angle_delta: s32,
+    filter_mode: s32, enable_edge_filter: bool, filter_type: s32,
+    cancellation: *Cancellation = null) -> DecodeError {
+    error := CancellationError(cancellation)
+    if error.code != DecodeOK { return error }
+    if edges == null { return Error(InvalidInput) }
+    width := edges.width; height := edges.height; bit_depth := edges.bit_depth
+    if !IntraSizeValid(width, height) || !IntraDepthValid(bit_depth) || mode < 0 || mode > 12 ||
+        angle_delta < -3 || angle_delta > 3 || filter_mode < -1 || filter_mode > 4 ||
+        (filter_mode >= 0 && (mode != 0 || width > 32 || height > 32)) ||
+        filter_type < 0 || filter_type > 1 || stride < width ||
+        edges.available_width < 1 || edges.available_width > width ||
+        edges.available_height < 1 || edges.available_height > height ||
+        cast(s64)(height - 1) * stride + width > out.count {
+        return Error(InvalidInput)
+    }
+    maximum := cast(s32)((cast(u32)1 << cast(u32)bit_depth) - 1)
+    total := width + height
+    for i: -1..cast(s64)total - 1 {
+        a := edges.above[IntraEdgeOffset + i]; l := edges.left[IntraEdgeOffset + i]
+        if a < 0 || a > maximum || l < 0 || l > maximum { return Error(InvalidInput) }
+    }
+    if edges.above[IntraEdgeOffset - 1] != edges.left[IntraEdgeOffset - 1] { return Error(InvalidInput) }
+    if filter_mode >= 0 {
+        PredictRecursiveIntra(out, stride, edges, filter_mode, maximum)
+    } else if mode >= 1 && mode <= 8 {
+        PredictDirectionalIntra(out, stride, edges, mode, angle_delta, enable_edge_filter, filter_type, maximum)
+    } else if mode >= 9 && mode <= 11 {
+        PredictSmoothIntra(out, stride, edges, mode)
+    } else if mode == 0 {
+        PredictDCIntra(out, stride, edges)
+    } else {
+        PredictPaethIntra(out, stride, edges)
+    }
+    return Error(DecodeOK)
+}
+
+// AV1 7.11.2.5.
+PredictDCIntra :: (out: []u16, stride: s32, edges: *IntraEdges) {
+    width := edges.width; height := edges.height
+    value := cast(s32)(cast(u32)1 << cast(u32)(edges.bit_depth - 1))
+    sum: s32
+    if edges.have_above { for k: 0..cast(s64)width - 1 { sum += edges.above[IntraEdgeOffset + k] } }
+    if edges.have_left { for k: 0..cast(s64)height - 1 { sum += edges.left[IntraEdgeOffset + k] } }
+    if edges.have_above && edges.have_left {
+        value = (sum + ((width + height) >> 1)) / (width + height)
+    } else if edges.have_left {
+        value = (sum + (height >> 1)) >> IntraLog2(height)
+    } else if edges.have_above {
+        value = (sum + (width >> 1)) >> IntraLog2(width)
+    }
+    sample := cast(u16)value
+    for i: 0..cast(s64)height - 1 {
+        line := i * stride
+        for j: 0..cast(s64)width - 1 { out[line + j] = sample }
+    }
+}
+
+// AV1 7.11.2.6.
+PredictSmoothIntra :: (out: []u16, stride: s32, edges: *IntraEdges, mode: s32) {
+    width := edges.width; height := edges.height
+    weights := IntraSmoothWeights()
+    x_base := width - 4; y_base := height - 4
+    bottom := edges.left[IntraEdgeOffset + height - 1]
+    right := edges.above[IntraEdgeOffset + width - 1]
+    for i: 0..cast(s64)height - 1 {
+        line := i * stride
+        wy := cast(s32)weights[y_base + i]
+        left := edges.left[IntraEdgeOffset + i]
+        for j: 0..cast(s64)width - 1 {
+            wx := cast(s32)weights[x_base + j]
+            above := edges.above[IntraEdgeOffset + j]
+            value: s32
+            if mode == 9 {
+                value = (wy * above + (256 - wy) * bottom + wx * left + (256 - wx) * right + 256) >> 9
+            } else if mode == 10 {
+                value = (wy * above + (256 - wy) * bottom + 128) >> 8
+            } else {
+                value = (wx * left + (256 - wx) * right + 128) >> 8
+            }
+            out[line + j] = cast(u16)value
+        }
+    }
+}
+
+// AV1 7.11.2.2 (PAETH_PRED).
+PredictPaethIntra :: (out: []u16, stride: s32, edges: *IntraEdges) {
+    corner := edges.above[IntraEdgeOffset - 1]
+    for i: 0..cast(s64)edges.height - 1 {
+        line := i * stride
+        left := edges.left[IntraEdgeOffset + i]
+        for j: 0..cast(s64)edges.width - 1 {
+            above := edges.above[IntraEdgeOffset + j]
+            base := above + left - corner
+            p_left := base - left; p_top := base - above; p_corner := base - corner
+            if p_left < 0 { p_left = -p_left }
+            if p_top < 0 { p_top = -p_top }
+            if p_corner < 0 { p_corner = -p_corner }
+            value := corner
+            if p_left <= p_top && p_left <= p_corner { value = left }
+            else if p_top <= p_corner { value = above }
+            out[line + j] = cast(u16)value
+        }
+    }
+}
+
+// AV1 7.11.2.3; each 4x2 group reads already predicted output samples.
+PredictRecursiveIntra :: (out: []u16, stride: s32, edges: *IntraEdges, filter_mode: s32, maximum: s32) {
+    taps := IntraFilterTaps()
+    groups_x := edges.width >> 2; groups_y := edges.height >> 1
+    neighbors: [7]s32
+    for i2: 0..cast(s64)groups_y - 1 {
+        for j4: 0..cast(s64)groups_x - 1 {
+            for i: 0..4 {
+                if i2 == 0 { neighbors[i] = edges.above[IntraEdgeOffset + (j4 << 2) + i - 1] }
+                else if j4 == 0 && i == 0 { neighbors[i] = edges.left[IntraEdgeOffset + (i2 << 1) - 1] }
+                else { neighbors[i] = cast(s32)out[((i2 << 1) - 1) * stride + (j4 << 2) + i - 1] }
+            }
+            for i: 5..6 {
+                if j4 == 0 { neighbors[i] = edges.left[IntraEdgeOffset + (i2 << 1) + i - 5] }
+                else { neighbors[i] = cast(s32)out[((i2 << 1) + i - 5) * stride + (j4 << 2) - 1] }
+            }
+            for k: 0..7 {
+                sum: s32
+                for i: 0..6 { sum += cast(s32)taps[(filter_mode * 8 + k) * 7 + i] * neighbors[i] }
+                value := ifx sum >= 0 then (sum + 8) >> 4 else -((-sum + 8) >> 4)
+                if value < 0 { value = 0 }
+                if value > maximum { value = maximum }
+                out[((i2 << 1) + (k >> 2)) * stride + (j4 << 2) + (k & 3)] = cast(u16)value
+            }
+        }
+    }
+}
+
+// AV1 7.11.2.4 with 7.11.2.7 and 7.11.2.9--12 on private edge copies.
+PredictDirectionalIntra :: (out: []u16, stride: s32, edges: *IntraEdges, mode: s32, angle_delta: s32,
+    enable_edge_filter: bool, filter_type: s32, maximum: s32) {
+    width := edges.width; height := edges.height
+    angles: [8]s32 = .[90,180,45,135,113,157,203,67]
+    angle := angles[mode - 1] + angle_delta * 3
+    above := edges.above; left := edges.left
+    upsample_above: s32; upsample_left: s32
+    if enable_edge_filter {
+        if angle != 90 && angle != 180 {
+            if angle > 90 && angle < 180 && width + height >= 24 {
+                corner := (left[IntraEdgeOffset] * 5 + above[IntraEdgeOffset - 1] * 6 + above[IntraEdgeOffset] * 5 + 8) >> 4
+                above[IntraEdgeOffset - 1] = corner; left[IntraEdgeOffset - 1] = corner
+            }
+            if edges.have_above {
+                strength := IntraEdgeFilterStrength(width, height, filter_type, angle - 90)
+                count := edges.available_width + (ifx angle < 90 then height else 0) + 1
+                IntraFilterEdge(above[:], count, strength)
+            }
+            if edges.have_left {
+                strength := IntraEdgeFilterStrength(width, height, filter_type, angle - 180)
+                count := edges.available_height + (ifx angle > 180 then width else 0) + 1
+                IntraFilterEdge(left[:], count, strength)
+            }
+        }
+        if IntraUseUpsample(width, height, filter_type, angle - 90) {
+            upsample_above = 1
+            IntraUpsampleEdge(above[:], width + (ifx angle < 90 then height else 0), maximum)
+        }
+        if IntraUseUpsample(width, height, filter_type, angle - 180) {
+            upsample_left = 1
+            IntraUpsampleEdge(left[:], height + (ifx angle > 180 then width else 0), maximum)
+        }
+    }
+    if angle == 90 || angle == 180 {
+        for i: 0..cast(s64)height - 1 {
+            line := i * stride
+            for j: 0..cast(s64)width - 1 {
+                out[line + j] = cast(u16)(ifx angle == 90 then above[IntraEdgeOffset + j] else left[IntraEdgeOffset + i])
+            }
+        }
+        return
+    }
+    dx: s32; dy: s32
+    if angle < 90 { dx = IntraDerivative(angle) }
+    else if angle < 180 { dx = IntraDerivative(180 - angle); dy = IntraDerivative(angle - 90) }
+    else { dy = IntraDerivative(270 - angle) }
+    max_base_x := (width + height - 1) << upsample_above
+    for i: 0..cast(s64)height - 1 {
+        line := i * stride
+        for j: 0..cast(s64)width - 1 {
+            value: s32
+            if angle < 90 {
+                index := (cast(s32)i + 1) * dx
+                base := (index >> (6 - upsample_above)) + (cast(s32)j << upsample_above)
+                shift := ((index << upsample_above) >> 1) & 31
+                if base < max_base_x {
+                    value = (above[IntraEdgeOffset + base] * (32 - shift) + above[IntraEdgeOffset + base + 1] * shift + 16) >> 5
+                } else {
+                    value = above[IntraEdgeOffset + max_base_x]
+                }
+            } else if angle < 180 {
+                index := (cast(s32)j << 6) - (cast(s32)i + 1) * dx
+                base := IntraFloorShift(index, 6 - upsample_above)
+                if base >= -(cast(s32)1 << upsample_above) {
+                    shift := IntraFloorShift(index * (1 + upsample_above), 1) % 32
+                    if shift < 0 { shift += 32 }
+                    value = (above[IntraEdgeOffset + base] * (32 - shift) + above[IntraEdgeOffset + base + 1] * shift + 16) >> 5
+                } else {
+                    index = (cast(s32)i << 6) - (cast(s32)j + 1) * dy
+                    base = IntraFloorShift(index, 6 - upsample_left)
+                    shift := IntraFloorShift(index * (1 + upsample_left), 1) % 32
+                    if shift < 0 { shift += 32 }
+                    value = (left[IntraEdgeOffset + base] * (32 - shift) + left[IntraEdgeOffset + base + 1] * shift + 16) >> 5
+                }
+            } else {
+                index := (cast(s32)j + 1) * dy
+                base := (index >> (6 - upsample_left)) + (cast(s32)i << upsample_left)
+                shift := ((index << upsample_left) >> 1) & 31
+                value = (left[IntraEdgeOffset + base] * (32 - shift) + left[IntraEdgeOffset + base + 1] * shift + 16) >> 5
+            }
+            out[line + j] = cast(u16)value
+        }
+    }
+}

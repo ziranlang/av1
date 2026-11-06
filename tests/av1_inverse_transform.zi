@@ -1,0 +1,88 @@
+#import, file "../src/transform/inverse_transform.zi";
+
+// Deterministic mid-range prediction shared with the oracle generator.
+TransformPrediction :: (width: s32, height: s32, depth: s32, seed: s32) -> [4096]u16 {
+    samples: [4096]u16
+    base := cast(s64)1 << cast(u32)(depth - 1); scale := cast(s64)1 << cast(u32)(depth - 8)
+    for i: 0..cast(s64)height - 1 { for j: 0..cast(s64)width - 1 {
+        samples[i * width + j] = cast(u16)(base + (((i * 7 + j * 13 + cast(s64)seed) % 64) - 32) * scale)
+    } }
+    return samples
+}
+
+AllEqual :: (values: []s32, expected: s32) -> bool {
+    for i: 0..values.count - 1 { if values[i] != expected { return false } }
+    return true
+}
+
+InverseTransformBoundaries :: () -> s32 {
+    dequant: [4096]s32; residual: [4096]s32
+    for i: 0..9 {
+        w: s32 = 8; h: s32 = 8; tx: s32; d: s32 = 8
+        if i == 0 { w = 2 }
+        if i == 1 { h = 128 }
+        if i == 2 { w = 4; h = 64 }
+        if i == 3 { w = 64; h = 8 }
+        if i == 4 { tx = -1 }
+        if i == 5 { tx = 16 }
+        if i == 6 { d = 9 }
+        if i == 7 { w = 32; h = 32; tx = 3 }
+        if i == 8 { w = 64; h = 64; tx = 9 }
+        if i == 9 { w = 16; h = 64; tx = 1 }
+        count := cast(s64)w * h
+        for j: 0..count - 1 { residual[j] = 7 }
+        if InverseTransform2D(dequant[:count], residual[:count], w, h, tx, d).code != InvalidInput { return 1 }
+        if !AllEqual(residual[:count], 0) { return 2 }
+    }
+    if InverseTransform2D(dequant[:63], residual[:64], 8, 8, 0, 8).code != InvalidInput { return 3 }
+    if InverseTransform2D(dequant[:64], residual[:65], 8, 8, 0, 8).code != InvalidInput { return 4 }
+    dequant[5] = 32768
+    for j: 0..63 { residual[j] = 7 }
+    if InverseTransform2D(dequant[:64], residual[:64], 8, 8, 0, 8).code != InvalidInput { return 5 }
+    if !AllEqual(residual[:64], 0) { return 6 }
+    dequant[5] = -32769
+    if InverseTransform2D(dequant[:64], residual[:64], 8, 8, 0, 8).code != InvalidInput { return 7 }
+    dequant[5] = -32768; dequant[6] = 32767
+    if InverseTransform2D(dequant[:64], residual[:64], 8, 8, 0, 8).code != DecodeOK { return 8 }
+    dequant[5] = 0; dequant[6] = 0
+    // DC-only 4x4 DCT_DCT: row 45, column 32, then Round2(.,4) = 2 everywhere.
+    dequant[0] = 64
+    if InverseTransform2D(dequant[:16], residual[:16], 4, 4, 0, 8).code != DecodeOK { return 9 }
+    if !AllEqual(residual[:16], 2) { return 10 }
+    token: Cancellation; Cancel(*token)
+    if InverseTransform2D(dequant[:16], residual[:16], 4, 4, 0, 8, *token).code != DecodeCancelled { return 11 }
+    if !AllEqual(residual[:16], 0) { return 12 }
+    // 64-point transforms ignore Dequant outside the upper-left 32x32.
+    for j: 0..4095 { dequant[j] = 0 }
+    dequant[0] = 1000; dequant[65] = -300
+    reference: [4096]s32
+    if InverseTransform2D(dequant[:], reference[:], 64, 64, 0, 10).code != DecodeOK { return 13 }
+    dequant[40] = 12345; dequant[33 * 64 + 1] = -999; dequant[4095] = 77
+    if InverseTransform2D(dequant[:], residual[:], 64, 64, 0, 10).code != DecodeOK { return 14 }
+    for j: 0..4095 { if residual[j] != reference[j] { return 15 } }
+    // Flipped addition, clipping and failure atomicity.
+    flat: [16]s32
+    for j: 0..15 { flat[j] = cast(s32)j - 4 }
+    samples: [20]u16
+    for j: 0..19 { samples[j] = 100 }
+    if AddResidual(samples[:], 5, flat[:], 4, 4, 6, 8).code != DecodeOK { return 16 }
+    for i: 0..3 { for j: 0..3 {
+        if cast(s32)samples[(3 - i) * 5 + 3 - j] != 100 + flat[i * 4 + j] { return 17 }
+    } }
+    for i: 0..3 { if samples[i * 5 + 4] != 100 { return 18 } }
+    high: [16]s32; for j: 0..15 { high[j] = ifx j % 2 == 0 then 4000 else -4000 }
+    if AddResidual(samples[:], 5, high[:], 4, 4, 0, 10).code != DecodeOK { return 19 }
+    for i: 0..3 { for j: 0..3 {
+        expected: u16 = ifx (i * 4 + j) % 2 == 0 then 1023 else 0
+        if samples[i * 5 + j] != expected { return 20 }
+    } }
+    saved: [20]u16; for j: 0..19 { saved[j] = samples[j] }
+    if AddResidual(samples[:], 3, flat[:], 4, 4, 0, 8).code != InvalidInput { return 21 }
+    if AddResidual(samples[:18], 5, flat[:], 4, 4, 0, 8).code != InvalidInput { return 22 }
+    if AddResidual(samples[:], 5, flat[:15], 4, 4, 0, 8).code != InvalidInput { return 23 }
+    if AddResidual(samples[:], 5, flat[:], 4, 4, 0, 9).code != InvalidInput { return 24 }
+    if AddResidual(samples[:], 5, flat[:], 4, 4, 0, 8).code != InvalidInput { return 25 }
+    if AddResidual(samples[:], 5, flat[:], 4, 4, 0, 8, *token).code != DecodeCancelled { return 26 }
+    for j: 0..19 { if samples[j] != saved[j] { return 27 } }
+    return 0
+}

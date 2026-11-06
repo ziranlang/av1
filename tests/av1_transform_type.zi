@@ -1,0 +1,54 @@
+#import, file "../src/transform/transform_type.zi";
+#import, file "../src/entropy/range.zi";
+
+TransformTypeBoundaries :: () -> s32 {
+    data: [2]u8 = .[128,0]
+    decoder := NewRange(BorrowBytes(data[:]), 0, 2)
+    state := NewTransformTypeCDFs()
+    if state.error.code != DecodeOK { return 1 }
+    saved: [501]u16; for i: 0..500 { saved[i] = state.values[i] }
+    for i: 0..1 {
+        value := ReadTransformType(*decoder, *state, 4, 4, i == 1, false, 0, 0)
+        if value.error.code != DecodeOK || value.value != 0 || value.tx_class != 0 { return 2 }
+    }
+    if decoder.bits.byte != 1 || decoder.bits.bit != 7 || decoder.max_bits != 1 { return 3 }
+    for i: 0..500 { if state.values[i] != saved[i] { return 4 } }
+    missing: *RangeDecoder; missing_cdfs: *TransformTypeCDFs
+    if ReadTransformType(missing, *state, 4, 4, false, false, 1, 0).error.code != InvalidInput { return 5 }
+    if ReadTransformType(*decoder, missing_cdfs, 4, 4, false, false, 1, 0).error.code != InvalidInput { return 6 }
+    for i: 0..7 {
+        w: s32 = 4; h: s32 = 4; q: s32 = 1; mode: s32; filter: s32 = -1
+        if i == 0 { w = 2147483647 }
+        if i == 1 { h = 64 }
+        if i == 2 { q = -1 }
+        if i == 3 { q = 256 }
+        if i == 4 { mode = -1 }
+        if i == 5 { mode = 13 }
+        if i == 6 { filter = -2 }
+        if i == 7 { filter = 5 }
+        value := ReadTransformType(*decoder, *state, w, h, false, false, q, mode, filter)
+        if value.error.code != InvalidInput || value.value != 0 || value.tx_class != 0 { return 7 }
+    }
+    if ReadTransformType(*decoder, *state, 4, 4, true, false, 1, 0, 0).error.code != InvalidInput { return 8 }
+    for i: 0..3 {
+        mode := ifx i == 0 then -1 else ifx i == 1 then 14 else ifx i == 2 then -1 else 16
+        value := ResolveChromaTransformType(4, 4, i >= 2, false, false, cast(s32)mode)
+        if value.error.code != InvalidInput || value.value != 0 || value.tx_class != 0 { return 9 }
+    }
+    token: Cancellation; Cancel(*token)
+    cancelled := NewTransformTypeCDFs(*token)
+    if cancelled.error.code != DecodeCancelled { return 10 }
+    for i: 0..500 { if cancelled.values[i] != 0 { return 11 } }
+    value := ReadTransformType(*decoder, *state, 4, 4, false, false, 1, 0, -1, *token)
+    if value.error.code != DecodeCancelled || value.value != 0 || value.tx_class != 0 { return 12 }
+    if ResolveChromaTransformType(4, 4, false, false, false, 0, *token).error.code != DecodeCancelled { return 13 }
+    decoder.error = Error(MalformedInput, 53)
+    value = ReadTransformType(*decoder, *state, 4, 4, false, false, 1, 0)
+    if value.error.code != MalformedInput || value.error.offset != 53 || value.value != 0 || value.tx_class != 0 { return 14 }
+    decoder.error = Error(DecodeOK); state.error = Error(MalformedInput, 71)
+    value = ReadTransformType(*decoder, *state, 4, 4, false, false, 1, 0)
+    if value.error.code != MalformedInput || value.error.offset != 71 || value.value != 0 || value.tx_class != 0 { return 15 }
+    fresh := NewTransformTypeCDFs(); fresh.values[0] = 1
+    for i: 0..500 { if state.values[i] != saved[i] { return 16 } }
+    return 0
+}

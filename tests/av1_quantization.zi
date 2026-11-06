@@ -1,0 +1,58 @@
+#import, file "../src/transform/quantization.zi";
+
+QuantizationBoundaries :: () -> s32 {
+    if ResolveQuantizerIndex(20, 90, false, false, false, 0).value != 20 { return 1 }
+    if ResolveQuantizerIndex(20, 90, true, false, false, 0).value != 90 { return 2 }
+    if ResolveQuantizerIndex(20, 90, true, true, false, 0).value != 20 { return 3 }
+    if ResolveQuantizerIndex(20, 90, true, false, true, -255).value != 0 { return 4 }
+    if ResolveQuantizerIndex(20, 90, true, true, true, 255).value != 255 { return 5 }
+    if ResolveQuantizerIndex(-1, 0, false, false, false, 0).error.code != InvalidInput { return 6 }
+    if ResolveQuantizerIndex(256, 0, false, false, false, 0).error.code != InvalidInput { return 7 }
+    if ResolveQuantizerIndex(0, -1, false, false, false, 0).error.code != InvalidInput { return 8 }
+    if ResolveQuantizerIndex(0, 256, false, false, false, 0).error.code != InvalidInput { return 9 }
+    if ResolveQuantizerIndex(0, 0, false, false, true, -256).error.code != InvalidInput { return 10 }
+    if ResolveQuantizerIndex(0, 0, false, false, true, 256).error.code != InvalidInput { return 11 }
+    if GetQuantizationSteps(-1, 0, 0, 8).error.code != InvalidInput { return 12 }
+    if GetQuantizationSteps(256, 0, 0, 8).error.code != InvalidInput { return 13 }
+    if GetQuantizationSteps(0, -65, 0, 8).error.code != InvalidInput { return 14 }
+    if GetQuantizationSteps(0, 64, 0, 8).error.code != InvalidInput { return 15 }
+    if GetQuantizationSteps(0, 0, -65, 8).error.code != InvalidInput { return 16 }
+    if GetQuantizationSteps(0, 0, 64, 8).error.code != InvalidInput { return 17 }
+    if GetQuantizationSteps(0, 0, 0, 9).error.code != InvalidInput { return 18 }
+    for d: 0..2 {
+        steps := GetQuantizationSteps(0, 0, 0, 8 + cast(s32)d * 2)
+        if steps.error.code != DecodeOK || steps.dc != 4 || steps.ac != 4 { return 19 }
+    }
+    quant: [16]s32; weights: [17]u8
+    for i: 0..16 { weights[i] = 32 }
+    quant[0] = -1; quant[1] = 1
+    identity := DequantizeBlock(quant[:], 4, 4, 0, 0, 0, 8, weights[:0])
+    if identity.error.code != DecodeOK || identity.samples[0] != -4 || identity.samples[1] != 4 { return 20 }
+    if DequantizeBlock(quant[:15], 4, 4, 0, 0, 0, 8, weights[:0]).error.code != InvalidInput { return 21 }
+    if DequantizeBlock(quant[:], 4, 4, 0, 0, 0, 8, weights[:15]).error.code != InvalidInput { return 22 }
+    if DequantizeBlock(quant[:], 4, 4, 0, 0, 0, 8, weights[:]).error.code != InvalidInput { return 23 }
+    if DequantizeBlock(quant[:], -2147483648, 4, 0, 0, 0, 8, weights[:0]).error.code != InvalidInput { return 24 }
+    if DequantizeBlock(quant[:], 4, 2147483647, 0, 0, 0, 8, weights[:0]).error.code != InvalidInput { return 25 }
+    sides: [7]s32 = .[0,3,5,12,128,2147483647,-1]
+    for i: 0..6 {
+        if DequantizeBlock(quant[:], sides[i], 4, 0, 0, 0, 8, weights[:0]).error.code != InvalidInput { return 26 }
+        if DequantizeBlock(quant[:], 4, sides[i], 0, 0, 0, 8, weights[:0]).error.code != InvalidInput { return 27 }
+    }
+    if DequantizeBlock(quant[:], 4, 32, 0, 0, 0, 8, weights[:0]).error.code != InvalidInput { return 28 }
+    if DequantizeBlock(quant[:], 32, 4, 0, 0, 0, 8, weights[:0]).error.code != InvalidInput { return 29 }
+    quant[15] = 1048576
+    failed := DequantizeBlock(quant[:], 4, 4, 0, 0, 0, 8, weights[:0])
+    if failed.error.code != InvalidInput || failed.width != 0 || failed.height != 0 { return 30 }
+    for i: 0..4095 { if failed.samples[i] != 0 { return 31 } }
+    quant[15] = -1048576
+    if DequantizeBlock(quant[:], 4, 4, 0, 0, 0, 8, weights[:0]).error.code != InvalidInput { return 32 }
+    quant[15] = 0; weights[15] = 0
+    if DequantizeBlock(quant[:], 4, 4, 0, 0, 0, 8, weights[:16]).error.code != InvalidInput { return 33 }
+    token: Cancellation; Cancel(*token)
+    if ResolveQuantizerIndex(0, 0, false, false, false, 0, *token).error.code != DecodeCancelled { return 34 }
+    if GetQuantizationSteps(0, 0, 0, 8, *token).error.code != DecodeCancelled { return 35 }
+    cancelled := DequantizeBlock(quant[:], 4, 4, 0, 0, 0, 8, weights[:0], *token)
+    if cancelled.error.code != DecodeCancelled || cancelled.width != 0 || cancelled.height != 0 { return 36 }
+    for i: 0..4095 { if cancelled.samples[i] != 0 { return 37 } }
+    return 0
+}

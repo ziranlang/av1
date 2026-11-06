@@ -1,0 +1,86 @@
+#import, file "./bits.zi";
+#import, file "./state.zi";
+
+TileSpan :: struct { index: s32; row: s32; column: s32; begin: s64; end: s64; }
+TileSpanResult :: struct { has_tile: bool; tile: TileSpan; error: DecodeError; }
+TileGroupCursor :: struct {
+    input: BorrowedBytes;
+    at: s64;
+    end: s64;
+    next_tile: s32;
+    last_tile: s32;
+    columns: s32;
+    size_bytes: s32;
+    cancellation: *Cancellation;
+    error: DecodeError;
+}
+
+// Parses AV1 tile_group_obu framing. Tile data remains borrowed and must be
+// consumed by the entropy engine; a successful span is not a decoded tile.
+// whole_frame marks the tile group of an OBU_FRAME, which must not signal
+// tile start/end and therefore carries every tile.
+NewTileGroup :: (input: BorrowedBytes, begin: s64, end: s64, layout: TileLayout,
+    cancellation: *Cancellation = null, whole_frame: bool = false) -> TileGroupCursor {
+    group: TileGroupCursor
+    group.input = input; group.at = begin; group.end = end; group.cancellation = cancellation
+    group.error = CancellationError(cancellation)
+    if group.error.code != DecodeOK { return group }
+    bits := NewBits(input, begin, end)
+    group.error = bits.error
+    if group.error.code != DecodeOK { return group }
+    if layout.columns < 1 || layout.columns > 64 || layout.rows < 1 || layout.rows > 64 ||
+        layout.column_log2 < 0 || layout.column_log2 > 6 || layout.row_log2 < 0 || layout.row_log2 > 6 ||
+        layout.columns > (cast(s32)1 << layout.column_log2) || layout.rows > (cast(s32)1 << layout.row_log2) {
+        group.error = Error(InvalidInput, begin); return group
+    }
+    count := layout.columns * layout.rows
+    group.columns = layout.columns; group.size_bytes = layout.size_bytes
+    group.last_tile = count - 1
+    if count > 1 {
+        if layout.size_bytes < 1 || layout.size_bytes > 4 { group.error = Error(InvalidInput, begin); return group }
+        present := ReadBits(*bits, 1) != 0
+        if present && whole_frame { group.error = Error(MalformedInput, begin); return group }
+        if present {
+            width := layout.column_log2 + layout.row_log2
+            group.next_tile = cast(s32)ReadBits(*bits, width)
+            group.last_tile = cast(s32)ReadBits(*bits, width)
+        }
+    }
+    group.error = AlignBits(*bits)
+    if group.error.code != DecodeOK { return group }
+    if group.next_tile > group.last_tile || group.last_tile >= count { group.error = Error(MalformedInput, begin); return group }
+    group.at = bits.byte
+    return group
+}
+
+NextTileSpan :: (group: *TileGroupCursor) -> TileSpanResult {
+    result: TileSpanResult
+    if group.error.code == DecodeOK { group.error = CancellationError(group.cancellation) }
+    if group.error.code != DecodeOK { result.error = group.error; return result }
+    if group.at < 0 || group.end < group.at || group.end > group.input.data.count || group.columns < 1 ||
+        group.columns > 64 || group.next_tile < 0 || group.last_tile < 0 || group.last_tile > 4095 ||
+        group.size_bytes < 0 || group.size_bytes > 4 {
+        group.error = Error(InvalidInput, group.at); result.error = group.error; return result
+    }
+    if group.next_tile > group.last_tile { return result }
+    begin := group.at
+    length := group.end - begin
+    if group.next_tile < group.last_tile {
+        if group.size_bytes == 0 { group.error = Error(InvalidInput, begin); result.error = group.error; return result }
+        if length < group.size_bytes { group.error = Error(TruncatedInput, group.end); result.error = group.error; return result }
+        value: u64
+        i: s32
+        while i < group.size_bytes {
+            value |= cast(u64)group.input.data[begin + i] << cast(u64)(8 * i)
+            i += 1
+        }
+        begin += group.size_bytes
+        length = cast(s64)(value + 1)
+        if length > group.end - begin { group.error = Error(TruncatedInput, group.end); result.error = group.error; return result }
+    }
+    if length == 0 { group.error = Error(TruncatedInput, group.end); result.error = group.error; return result }
+    result.tile = TileSpan.{group.next_tile, group.next_tile / group.columns, group.next_tile % group.columns, begin, begin + length}
+    result.has_tile = true
+    group.at = result.tile.end; group.next_tile += 1
+    return result
+}

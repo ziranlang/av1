@@ -1,0 +1,88 @@
+using Codec :: #import "image_codec/api"
+
+// AV1 7.18.3.2/4 scalar film-grain random and scaling primitives. State is
+// caller-owned, so independent pictures cannot share a hidden random register.
+GrainRandom :: struct { register_value: u32; }
+GrainNumber :: struct { value: s32; error: DecodeError; }
+GrainScaling :: struct { samples: [256]u16; error: DecodeError; }
+
+NextGrainRandom :: (state: *GrainRandom, bits: s32,
+    cancellation: *Cancellation = null) -> GrainNumber {
+    result: GrainNumber
+    result.error = CancellationError(cancellation)
+    if result.error.code != DecodeOK { return result }
+    if state == null || bits < 1 || bits > 16 { result.error = Error(InvalidInput); return result }
+    if state.register_value > 65535 { result.error = Error(InvalidInput); return result }
+    r := state.register_value
+    bit := (r ^ (r >> 1) ^ (r >> 3) ^ (r >> 12)) & 1
+    r = (r >> 1) | (bit << 15)
+    value := cast(s32)((r >> cast(u32)(16 - bits)) & ((cast(u32)1 << cast(u32)bits) - 1))
+    result.error = CancellationError(cancellation)
+    if result.error.code != DecodeOK { return result }
+    state.register_value = r; result.value = value
+    return result
+}
+
+#scope_file
+GrainScalingFloor :: (value: s64, divisor: s64) -> s64 {
+    return ifx value < 0 then -((-value + divisor - 1) / divisor) else value / divisor
+}
+
+#scope_export
+// Points are interleaved x,y values, at most 14 pairs. This also supports
+// chroma scaling from a 14-point luma curve; independent chroma syntax caps10.
+BuildGrainScaling :: (points: []s32, cancellation: *Cancellation = null) -> GrainScaling {
+    result: GrainScaling
+    result.error = CancellationError(cancellation)
+    if result.error.code != DecodeOK { return result }
+    if points.count < 0 || points.count > 28 || points.count % 2 != 0 { result.error = Error(InvalidInput); return result }
+    count := points.count / 2
+    for i: 0..count - 1 {
+        x := points[i * 2]; y := points[i * 2 + 1]
+        if x < 0 || x > 255 || y < 0 || y > 255 || (i > 0 && x <= points[(i - 1) * 2]) {
+            result.error = Error(InvalidInput); return result
+        }
+    }
+    if count == 0 { return result }
+    samples: [256]u16
+    for x: 0..points[0] - 1 { samples[x] = cast(u16)points[1] }
+    for i: 0..count - 2 {
+        result.error = CancellationError(cancellation)
+        if result.error.code != DecodeOK { return result }
+        dx := cast(s64)(points[(i + 1) * 2] - points[i * 2])
+        dy := cast(s64)(points[(i + 1) * 2 + 1] - points[i * 2 + 1])
+        delta := dy * ((65536 + dx / 2) / dx)
+        for x: 0..dx - 1 {
+            value := cast(s64)points[i * 2 + 1] + GrainScalingFloor(x * delta + 32768, 65536)
+            samples[points[i * 2] + x] = cast(u16)value
+        }
+    }
+    for x: points[(count - 1) * 2]..255 { samples[x] = cast(u16)points[(count - 1) * 2 + 1] }
+    result.error = CancellationError(cancellation)
+    if result.error.code != DecodeOK { return result }
+    result.samples = samples
+    return result
+}
+
+// Sampling is O(1), with high-depth interpolation and safe handling of bin255.
+SampleGrainScaling :: (lut: []u16, index: s32, bit_depth: s32) -> GrainNumber {
+    result: GrainNumber
+    if lut.count != 256 || (bit_depth != 8 && bit_depth != 10 && bit_depth != 12) || index < 0 {
+        result.error = Error(InvalidInput); return result
+    }
+    maximum := cast(s32)((cast(u32)1 << cast(u32)bit_depth) - 1)
+    if index > maximum { result.error = Error(InvalidInput); return result }
+    shift := bit_depth - 8
+    x := cast(s32)(cast(u32)index >> cast(u32)shift)
+    if lut[x] > 255 { result.error = Error(InvalidInput); return result }
+    value := cast(s64)lut[x]
+    if shift != 0 && x != 255 {
+        if lut[x + 1] > 255 { result.error = Error(InvalidInput); return result }
+        divisor := cast(s64)(cast(u64)1 << cast(u64)shift)
+        remainder := cast(s64)index % divisor
+        delta := cast(s64)lut[x + 1] - value
+        value += GrainScalingFloor(delta * remainder + divisor / 2, divisor)
+    }
+    result.value = cast(s32)value
+    return result
+}

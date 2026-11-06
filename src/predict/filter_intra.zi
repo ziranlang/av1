@@ -1,0 +1,22 @@
+using Codec :: #import "image_codec/api"
+
+// Probability constants from libaom d772e334cc724105040382a977ebb10dfd393293,
+// av1/common/entropymode.c. Copyright (c) 2016, 2017 Alliance
+// for Open Media. BSD 2-Clause and AOM Patent License retained in src/LICENSE.libaom and src/PATENTS.libaom.
+FilterIntraCDF :: struct { enabled: [66]u16; mode: [6]u16; }
+NewFilterIntraCDF :: () -> FilterIntraCDF {
+    result: FilterIntraCDF
+    probabilities: [22]u16 = .[4621,6743,5893,7866,12551,9394,12408,14301,12756,22343,16384,16384,16384,16384,16384,16384,12770,10368,20229,18101,16384,16384]
+    for i: 0..21 { result.enabled[i * 3] = probabilities[i]; result.enabled[i * 3 + 1] = 32768 }
+    modes: [6]u16 = .[8949,12776,17211,29558,32768,0]
+    result.mode = modes
+    return result
+}
+
+// AV1 BLOCK_SIZE enumeration, including the 1:4 and 4:1 extensions.
+FilterIntraBlockIndex :: (width: s32, height: s32) -> s32 {
+    widths: [22]s32 = .[4,4,8,8,8,16,16,16,32,32,32,64,64,64,128,128,4,16,8,32,16,64]
+    heights: [22]s32 = .[4,8,4,8,16,8,16,32,16,32,64,32,64,128,64,128,16,4,32,8,64,16]
+    for i: 0..21 { if widths[i] == width && heights[i] == height { return cast(s32)i } }
+    return -1
+}

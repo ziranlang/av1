@@ -1,0 +1,21 @@
+#import, file "../src/transform/lossless.zi";
+
+ScalarKernelBounds :: () -> s32 {
+    quant: [17]s32
+    if InverseLossless4x4(quant[:15], 8).error.code != InvalidInput { return 1 }
+    if InverseLossless4x4(quant[:], 8).error.code != InvalidInput { return 2 }
+    if InverseLossless4x4(quant[:16], 9).error.code != InvalidInput { return 3 }
+    quant[15] = -2147483648
+    if InverseLossless4x4(quant[:16], 12).error.code != InvalidInput { return 4 }
+    quant[15] = 2147483647
+    if InverseLossless4x4(quant[:16], 12).error.code != InvalidInput { return 5 }
+    for i: 0..15 { quant[i] = 1048575 }
+    bad := InverseLossless4x4(quant[:16], 8)
+    if bad.error.code != MalformedInput { return 6 }
+    for i: 0..15 { if bad.samples[i] != 0 { return 7 } }
+    token: Cancellation; Cancel(*token)
+    cancelled := InverseLossless4x4(quant[:16], 8, *token)
+    if cancelled.error.code != DecodeCancelled { return 8 }
+    for i: 0..15 { if cancelled.samples[i] != 0 { return 9 } }
+    return 0
+}

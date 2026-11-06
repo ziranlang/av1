@@ -1,0 +1,30 @@
+#import, file "../src/filter/sgr.zi";
+
+SgrBoundaries :: () -> s32 {
+    source: [196]u16
+    for i: 0..195 { source[i] = 128 }
+    if FilterSgrBlock(source[:195], 14, 8, 8, 0, 0, 0, 8).error.code != InvalidInput { return 1 }
+    if FilterSgrBlock(source[:], 13, 8, 8, 0, 0, 0, 8).error.code != InvalidInput { return 2 }
+    if FilterSgrBlock(source[:], 65, 8, 8, 0, 0, 0, 8).error.code != InvalidInput { return 3 }
+    if FilterSgrBlock(source[:], 14, 0, 8, 0, 0, 0, 8).error.code != InvalidInput { return 4 }
+    if FilterSgrBlock(source[:], 14, 8, 9, 0, 0, 0, 8).error.code != InvalidInput { return 5 }
+    if FilterSgrBlock(source[:], 14, 8, 8, 0, 0, 0, 9).error.code != InvalidInput { return 6 }
+    if FilterSgrBlock(source[:], 14, 8, 8, -1, 0, 0, 8).error.code != InvalidInput { return 7 }
+    if FilterSgrBlock(source[:], 14, 8, 8, 16, 0, 0, 8).error.code != InvalidInput { return 8 }
+    if FilterSgrBlock(source[:], 14, 8, 8, 0, -97, 0, 8).error.code != InvalidInput { return 9 }
+    if FilterSgrBlock(source[:], 14, 8, 8, 0, 32, 0, 8).error.code != InvalidInput { return 10 }
+    if FilterSgrBlock(source[:], 14, 8, 8, 0, 0, -33, 8).error.code != InvalidInput { return 11 }
+    if FilterSgrBlock(source[:], 14, 8, 8, 0, 0, 96, 8).error.code != InvalidInput { return 12 }
+    source[195] = 256
+    bad := FilterSgrBlock(source[:], 14, 8, 8, 0, 0, 0, 8)
+    if bad.error.code != InvalidInput || bad.width != 0 || bad.height != 0 { return 13 }
+    for i: 0..63 { if bad.samples[i] != 0 { return 14 } }
+    source[195] = 128
+    token: Cancellation; Cancel(*token)
+    cancelled := FilterSgrBlock(source[:], 14, 8, 8, 0, 0, 0, 8, *token)
+    if cancelled.error.code != DecodeCancelled || cancelled.width != 0 || cancelled.height != 0 { return 15 }
+    for i: 0..63 { if cancelled.samples[i] != 0 { return 16 } }
+    if FilterSgrBlock(source[:], 14, 8, 8, 10, 1, 0, 8).error.code != InvalidInput { return 17 }
+    if FilterSgrBlock(source[:], 14, 8, 8, 14, 0, 94, 8).error.code != InvalidInput { return 18 }
+    return 0
+}

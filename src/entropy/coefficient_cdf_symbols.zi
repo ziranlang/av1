@@ -1,0 +1,64 @@
+#import, file "./coefficient_cdfs.zi";
+#import, file "./range.zi";
+
+CoefficientCDFAddress :: struct { offset: s32; count: s32; error: DecodeError; }
+CoefficientSymbol :: struct { value: s32; error: DecodeError; }
+
+// Bounded address metadata for state-owned CDF rows. No borrowed storage escapes.
+// Symbol decoding below owns selection and synchronous mutation together.
+// size_context is txSzCtx(0..4), except DC(0) and EOB's area index(0..6).
+// Skip already encodes plane in its13 contexts; its plane argument is ignored.
+// BR clamps txSzCtx to32, so unused native TX64 BR rows are not stored.
+SelectCoefficientCDF :: (state: *CoefficientCDFs, family: s32, size_context: s32,
+    plane: s32, context: s32) -> CoefficientCDFAddress {
+    result: CoefficientCDFAddress
+    if state == null { result.error = Error(InvalidInput); return result }
+    if state.error.code != DecodeOK { result.error = state.error; return result }
+    if family < 0 || family > 6 || size_context < 0 || plane < 0 || plane > 1 || context < 0 {
+        result.error = Error(InvalidInput); return result
+    }
+    offset: s32; count: s32
+    if family == CoefficientCDFSkip {
+        if size_context > 4 || context > 12 { result.error = Error(InvalidInput); return result }
+        offset = (size_context * 13 + context) * 3; count = 3
+    } else if family == CoefficientCDFDC {
+        if size_context != 0 || context > 2 { result.error = Error(InvalidInput); return result }
+        offset = 195 + (plane * 3 + context) * 3; count = 3
+    } else if family == CoefficientCDFBase {
+        if size_context > 4 || context > 41 { result.error = Error(InvalidInput); return result }
+        offset = 213 + ((size_context * 2 + plane) * 42 + context) * 5; count = 5
+    } else if family == CoefficientCDFBR {
+        if size_context > 4 || context > 20 { result.error = Error(InvalidInput); return result }
+        size := ifx size_context > 3 then 3 else size_context
+        offset = 2313 + ((size * 2 + plane) * 21 + context) * 5; count = 5
+    } else if family == CoefficientCDFBaseEOB {
+        if size_context > 4 || context > 3 { result.error = Error(InvalidInput); return result }
+        offset = 3153 + ((size_context * 2 + plane) * 4 + context) * 4; count = 4
+    } else if family == CoefficientCDFExtra {
+        if size_context > 4 || context > 8 { result.error = Error(InvalidInput); return result }
+        offset = 3313 + ((size_context * 2 + plane) * 9 + context) * 3; count = 3
+    } else {
+        if size_context > 6 || context > 1 { result.error = Error(InvalidInput); return result }
+        count = size_context + 6
+        offset = 3583 + 2 * size_context * (size_context + 11) + (plane * 2 + context) * count
+    }
+    result.offset = offset; result.count = count
+    return result
+}
+
+// The state owner performs the entropy operation directly. The temporary slice
+// is borrowed only for this call; counters update the tile-owned pool.
+ReadCoefficientSymbol :: (decoder: *RangeDecoder, state: *CoefficientCDFs, family: s32,
+    size_context: s32, plane: s32, context: s32,
+    cancellation: *Cancellation = null) -> CoefficientSymbol {
+    result: CoefficientSymbol
+    result.error = CancellationError(cancellation)
+    if result.error.code != DecodeOK { return result }
+    if decoder == null { result.error = Error(InvalidInput); return result }
+    if decoder.error.code != DecodeOK { result.error = decoder.error; return result }
+    address := SelectCoefficientCDF(state, family, size_context, plane, context)
+    if address.error.code != DecodeOK { result.error = address.error; return result }
+    result.value = ReadSymbol(decoder, state.values[address.offset:address.offset + address.count])
+    result.error = decoder.error
+    return result
+}

@@ -1,0 +1,26 @@
+[package]
+name = "av1"
+module_roots = ["src"]
+
+[toolchain]
+git = "https://github.com/ziranlang/ziran.git"
+ref = "03e01d08d9f12a68693294a3bd12f6c758290e45"
+
+[exports]
+decoder = "src/decoder.zi"
+
+[dependencies.image_codec]
+git = "https://github.com/ziranlang/image-codec.git"
+ref = "360553150917f352e49e1beb78917370792ccaef"
+
+# Test oracle only; no product module links it.
+[dependencies.libaom]
+git = "https://aomedia.googlesource.com/aom"
+ref = "d772e334cc724105040382a977ebb10dfd393293"
+source = true
+
+# Test oracle only; no product module links it.
+[dependencies.dav1d]
+git = "https://github.com/videolan/dav1d.git"
+ref = "54706fc6bc0cdecab7e9593974a4039cc038fca7"
+source = true

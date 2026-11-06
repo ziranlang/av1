@@ -1,0 +1,32 @@
+#import, file "../src/entropy/coefficient_context.zi";
+
+ContextBoundaries :: () -> s32 {
+    levels: [16]u8
+    if GetCoefficientContexts(levels[:], 4, 4, 0, 0, 0, false).error.code != DecodeOK { return 1 }
+    if GetCoefficientContexts(levels[:], 4, 4, 0, 0, 0, false).base != 0 { return 2 }
+    if GetCoefficientContexts(levels[:], 4, 4, 1, 1, 0, false).base != 1 { return 3 }
+    if GetCoefficientContexts(levels[:], 4, 4, 15, 15, 0, false).br != 14 { return 4 }
+    if GetCoefficientContexts(levels[:], 4, 4, 15, 15, 0, true).base != 3 { return 5 }
+    invalid: [7]s32 = .[-2147483648,-1,0,3,5,128,2147483647]
+    for i: 0..6 {
+        if GetCoefficientContexts(levels[:], invalid[i], 4, 0, 0, 0, false).error.code != InvalidInput { return 6 }
+        if GetCoefficientContexts(levels[:], 4, invalid[i], 0, 0, 0, false).error.code != InvalidInput { return 7 }
+    }
+    if GetCoefficientContexts(levels[:15], 4, 4, 0, 0, 0, false).error.code != InvalidInput { return 8 }
+    if GetCoefficientContexts(levels[:], 4, 4, -1, 0, 0, false).error.code != InvalidInput { return 9 }
+    if GetCoefficientContexts(levels[:], 4, 4, 16, 0, 0, false).error.code != InvalidInput { return 10 }
+    if GetCoefficientContexts(levels[:], 4, 4, 1, -1, 0, false).error.code != InvalidInput { return 11 }
+    if GetCoefficientContexts(levels[:], 4, 4, 1, 16, 0, false).error.code != InvalidInput { return 12 }
+    if GetCoefficientContexts(levels[:], 4, 4, 1, 0, 0, false).error.code != InvalidInput { return 13 }
+    if GetCoefficientContexts(levels[:], 4, 4, 0, 1, 0, false).error.code != InvalidInput { return 14 }
+    if GetCoefficientContexts(levels[:], 4, 4, 0, 0, -1, false).error.code != InvalidInput { return 15 }
+    if GetCoefficientContexts(levels[:], 4, 4, 0, 0, 3, false).error.code != InvalidInput { return 16 }
+    if GetCoefficientContexts(levels[:], 16, 32, 0, 0, 1, false).error.code != InvalidInput { return 17 }
+    if GetCoefficientContexts(levels[:], 32, 16, 0, 0, 2, false).error.code != InvalidInput { return 18 }
+    failed := GetCoefficientContexts(levels[:], 0, 4, 0, 0, 0, false)
+    if failed.base != 0 || failed.br != 0 { return 19 }
+    token: Cancellation; Cancel(*token)
+    failed = GetCoefficientContexts(levels[:], 4, 4, 0, 0, 0, false, *token)
+    if failed.error.code != DecodeCancelled || failed.base != 0 || failed.br != 0 { return 20 }
+    return 0
+}

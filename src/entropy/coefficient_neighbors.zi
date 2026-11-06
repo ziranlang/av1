@@ -1,0 +1,66 @@
+#import, file "./coefficient_geometry.zi";
+using Codec :: #import "image_codec/api"
+
+TransformCoefficientContexts :: struct { skip: s32; dc: s32; error: DecodeError; }
+
+// Resolve AV1 all_zero/DC sign contexts from caller-selected above/left spans.
+// Entries beyond the frame boundary are omitted, not read. Span counts must
+// match their respective DC spans and may be shorter than tx width/height/4.
+// Levels are cumulative magnitudes0..63; DC categories are0/negative1/positive2.
+// The caller updates its edge arrays only after successful block decoding.
+GetTransformCoefficientContexts :: (above_levels: []u8, left_levels: []u8,
+    above_dc: []u8, left_dc: []u8, width: s32, height: s32,
+    block_width: s32, block_height: s32, plane: s32,
+    cancellation: *Cancellation = null) -> TransformCoefficientContexts {
+    result: TransformCoefficientContexts; result.error = CancellationError(cancellation)
+    if result.error.code != DecodeOK { return result }
+    shape := GetCoefficientShape(width, height)
+    if shape.error.code != DecodeOK { result.error = shape.error; return result }
+    if (block_width != 4 && block_width != 8 && block_width != 16 && block_width != 32 && block_width != 64 && block_width != 128) ||
+        (block_height != 4 && block_height != 8 && block_height != 16 && block_height != 32 && block_height != 64 && block_height != 128) {
+        result.error = Error(InvalidInput); return result
+    }
+    if plane < 0 || plane > 1 || block_width < width || block_height < height ||
+        block_width > block_height * 4 || block_height > block_width * 4 ||
+        (block_width == 128 && block_height < 64) || (block_height == 128 && block_width < 64) ||
+        above_levels.count < 0 || above_levels.count > cast(s64)(width / 4) ||
+        left_levels.count < 0 || left_levels.count > cast(s64)(height / 4) ||
+        above_dc.count != above_levels.count || left_dc.count != left_levels.count {
+        result.error = Error(InvalidInput); return result
+    }
+    top: s32; left: s32; dc: s32; above_present: bool; left_present: bool
+    for i: 0..above_levels.count - 1 {
+        level := cast(s32)above_levels[i]; sign := cast(s32)above_dc[i]
+        if level > 63 || sign > 2 { result.error = Error(InvalidInput); return result }
+        if level > top { top = level }
+        if level != 0 || sign != 0 { above_present = true }
+        if sign == 1 { dc -= 1 }
+        if sign == 2 { dc += 1 }
+    }
+    for i: 0..left_levels.count - 1 {
+        level := cast(s32)left_levels[i]; sign := cast(s32)left_dc[i]
+        if level > 63 || sign > 2 { result.error = Error(InvalidInput); return result }
+        if level > left { left = level }
+        if level != 0 || sign != 0 { left_present = true }
+        if sign == 1 { dc -= 1 }
+        if sign == 2 { dc += 1 }
+    }
+    skip: s32
+    if plane == 0 {
+        high := ifx top > left then top else left; low := ifx top < left then top else left
+        if block_width == width && block_height == height { skip = 0 }
+        else if high == 0 { skip = 1 }
+        else if low == 0 { skip = ifx high > 3 then 3 else 2 }
+        else if high <= 3 { skip = 4 }
+        else if low <= 3 { skip = 5 }
+        else { skip = 6 }
+    } else {
+        skip = ifx block_width * block_height > width * height then 10 else 7
+        if above_present { skip += 1 }
+        if left_present { skip += 1 }
+    }
+    result.error = CancellationError(cancellation)
+    if result.error.code != DecodeOK { return result }
+    result.skip = skip; result.dc = ifx dc < 0 then 1 else ifx dc > 0 then 2 else 0
+    return result
+}

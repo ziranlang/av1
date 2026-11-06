@@ -1,0 +1,35 @@
+#import, file "../src/filter/wiener.zi";
+
+WienerBoundaries :: () -> s32 {
+    source: [196]u16; coefficients: [4]s32
+    for i: 0..195 { source[i] = 128 }
+    if FilterWienerBlock(source[:195], 14, 8, 8, coefficients[:3], coefficients[:3], 8).error.code != InvalidInput { return 1 }
+    if FilterWienerBlock(source[:], 13, 8, 8, coefficients[:3], coefficients[:3], 8).error.code != InvalidInput { return 2 }
+    if FilterWienerBlock(source[:], 65, 8, 8, coefficients[:3], coefficients[:3], 8).error.code != InvalidInput { return 3 }
+    if FilterWienerBlock(source[:], 14, 0, 8, coefficients[:3], coefficients[:3], 8).error.code != InvalidInput { return 4 }
+    if FilterWienerBlock(source[:], 14, 8, 9, coefficients[:3], coefficients[:3], 8).error.code != InvalidInput { return 5 }
+    if FilterWienerBlock(source[:], 14, 8, 8, coefficients[:3], coefficients[:3], 9).error.code != InvalidInput { return 6 }
+    if FilterWienerBlock(source[:], 14, 8, 8, coefficients[:2], coefficients[:3], 8).error.code != InvalidInput { return 7 }
+    if FilterWienerBlock(source[:], 14, 8, 8, coefficients[:3], coefficients[:], 8).error.code != InvalidInput { return 8 }
+    lower: [3]s32 = .[-6,-24,-18]; upper: [3]s32 = .[11,9,47]
+    for i: 0..2 {
+        coefficients[i] = lower[i]
+        if FilterWienerBlock(source[:], 14, 8, 8, coefficients[:3], coefficients[:3], 8).error.code != InvalidInput { return 9 }
+        coefficients[i] = upper[i]
+        if FilterWienerBlock(source[:], 14, 8, 8, coefficients[:3], coefficients[:3], 8).error.code != InvalidInput { return 10 }
+        coefficients[i] = 0
+    }
+    source[195] = 256
+    bad := FilterWienerBlock(source[:], 14, 8, 8, coefficients[:3], coefficients[:3], 8)
+    if bad.error.code != InvalidInput || bad.width != 0 || bad.height != 0 { return 11 }
+    for i: 0..63 { if bad.samples[i] != 0 { return 12 } }
+    source[195] = 128
+    identity := FilterWienerBlock(source[:], 14, 8, 8, coefficients[:3], coefficients[:3], 8)
+    if identity.error.code != DecodeOK || identity.width != 8 || identity.height != 8 { return 13 }
+    for i: 0..63 { if identity.samples[i] != 128 { return 14 } }
+    token: Cancellation; Cancel(*token)
+    cancelled := FilterWienerBlock(source[:], 14, 8, 8, coefficients[:3], coefficients[:3], 8, *token)
+    if cancelled.error.code != DecodeCancelled || cancelled.width != 0 || cancelled.height != 0 { return 15 }
+    for i: 0..63 { if cancelled.samples[i] != 0 { return 16 } }
+    return 0
+}

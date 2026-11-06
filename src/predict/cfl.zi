@@ -1,0 +1,64 @@
+#import, file "./intra_predict.zi";
+using Codec :: #import "image_codec/api"
+
+// AV1 7.11.5 for any CfL transform size (4..32 per side). chroma holds the DC
+// prediction and is updated in place; luma starts at the co-located luma
+// sample (startX << subsampling_x, startY << subsampling_y), and luma_width /
+// luma_height are MaxLumaW / MaxLumaH relative to that origin. Validation and
+// all reads finish before the first write, so failure changes nothing.
+ApplyCfl :: (chroma: []u16, chroma_stride: s32, luma: []u16, luma_stride: s32,
+    width: s32, height: s32, subsampling_x: s32, subsampling_y: s32,
+    luma_width: s32, luma_height: s32, alpha: s32, bit_depth: s32,
+    cancellation: *Cancellation = null) -> DecodeError {
+    error := CancellationError(cancellation)
+    if error.code != DecodeOK { return error }
+    if !IntraSizeValid(width, height) || width > 32 || height > 32 || !IntraDepthValid(bit_depth) ||
+        subsampling_x < 0 || subsampling_x > 1 || subsampling_y < 0 || subsampling_y > subsampling_x ||
+        alpha < -16 || alpha > 16 || chroma_stride < width ||
+        cast(s64)(height - 1) * chroma_stride + width > chroma.count {
+        return Error(InvalidInput)
+    }
+    step_x := cast(s32)1 << subsampling_x; step_y := cast(s32)1 << subsampling_y
+    if luma_width < step_x || luma_height < step_y || luma_stride < luma_width ||
+        cast(s64)(luma_height - 1) * luma_stride + luma_width > luma.count {
+        return Error(InvalidInput)
+    }
+    maximum := cast(s32)((cast(u32)1 << cast(u32)bit_depth) - 1)
+    values: [1024]s32
+    sum: s32
+    scale := 3 - subsampling_x - subsampling_y
+    for i: 0..cast(s64)height - 1 {
+        luma_y := cast(s32)i << subsampling_y
+        if luma_y > luma_height - step_y { luma_y = luma_height - step_y }
+        for j: 0..cast(s64)width - 1 {
+            luma_x := cast(s32)j << subsampling_x
+            if luma_x > luma_width - step_x { luma_x = luma_width - step_x }
+            total: s32
+            for dy: 0..cast(s64)subsampling_y {
+                line := (cast(s64)luma_y + dy) * luma_stride + luma_x
+                for dx: 0..cast(s64)subsampling_x {
+                    sample := cast(s32)luma[line + dx]
+                    if sample > maximum { return Error(InvalidInput) }
+                    total += sample
+                }
+            }
+            value := total << scale
+            values[i * width + j] = value; sum += value
+        }
+        for j: 0..cast(s64)width - 1 { if chroma[i * chroma_stride + j] > maximum { return Error(InvalidInput) } }
+    }
+    bits := IntraLog2(width) + IntraLog2(height)
+    average := (sum + cast(s32)(cast(u32)1 << cast(u32)(bits - 1))) >> bits
+    for i: 0..cast(s64)height - 1 {
+        line := i * chroma_stride
+        for j: 0..cast(s64)width - 1 {
+            product := alpha * (values[i * width + j] - average)
+            scaled := ifx product >= 0 then (product + 32) >> 6 else -((-product + 32) >> 6)
+            value := cast(s32)chroma[line + j] + scaled
+            if value < 0 { value = 0 }
+            if value > maximum { value = maximum }
+            chroma[line + j] = cast(u16)value
+        }
+    }
+    return Error(DecodeOK)
+}

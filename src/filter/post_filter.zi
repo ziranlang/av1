@@ -1,0 +1,310 @@
+#import, file "../syntax/state.zi";
+#import, file "../decode/intra_frame.zi";
+#import, file "./deblock.zi";
+#import, file "./cdef.zi";
+#import, file "./wiener.zi";
+#import, file "./sgr.zi";
+using Codec :: #import "image_codec/api"
+
+// AV1 7.14-7.17 frame post filters for intra frames, scalar reference order:
+// deblocking in place (7.14), CDEF into a second frame (7.15) and loop
+// restoration into a third (7.17). Superres is rejected before decoding, so
+// the upscaled frames equal their sources. Every buffer is a caller-owned
+// view of IntraFrame.sample_count samples in the IntraFrame plane layout.
+
+#scope_file
+PostMin :: (a: s32, b: s32) -> s32 { return ifx a < b then a else b }
+PostMax :: (a: s32, b: s32) -> s32 { return ifx a > b then a else b }
+PostClip :: (value: s32, low: s32, high: s32) -> s32 { return PostMax(low, PostMin(high, value)) }
+PostIndex :: (frame: *IntraFrame, plane: s32, x: s32, y: s32) -> s64 {
+    return frame.plane_offset[plane] + cast(s64)y * frame.plane_stride[plane] + x
+}
+
+PostStrength :: struct { level: s32; limit: s32; block_limit: s32; threshold: s32; }
+
+// 7.14.4/7.14.5 for an intra mode-info position (ref is INTRA_FRAME).
+PostFilterStrength :: (frame: *IntraFrame, header: *StillFrameHeader,
+    row: s32, column: s32, plane: s32, pass: s32) -> PostStrength {
+    result: PostStrength
+    at := IntraMiAt(frame, row, column)
+    i: s32 = ifx plane == 0 then pass else plane + 1
+    delta_index: s32 = ifx header.delta_lf_multi then i else 0
+    delta := cast(s32)frame.mi[at + IntraMiDeltaLF + delta_index] - 64
+    level := PostClip(delta + header.loop_filter_levels[i], 0, 63)
+    feature := cast(s32)frame.mi[at + IntraMiSegment] * 8 + 1 + i
+    if header.segmentation_enabled && header.features[feature].enabled {
+        level = PostClip(level + header.features[feature].value, 0, 63)
+    }
+    if header.loop_filter_delta_enabled {
+        scale: s32 = ifx level >= 32 then 2 else 1
+        level = PostClip(level + header.loop_filter_ref_deltas[0] * scale, 0, 63)
+    }
+    sharpness := header.loop_filter_sharpness
+    shift: s32 = ifx sharpness > 4 then 2 else ifx sharpness > 0 then 1 else 0
+    limit := ifx sharpness > 0 then PostClip(level >> shift, 1, 9 - sharpness) else PostMax(1, level >> shift)
+    result.level = level; result.limit = limit
+    result.block_limit = 2 * (level + 2) + limit; result.threshold = level >> 4
+    return result
+}
+
+// 7.14.2 edge process at luma 4x4 position (row, column). Intra blocks filter
+// every transform edge, so the prediction-block edge test is not needed.
+PostDeblockEdge :: (frame: *IntraFrame, samples: []u16, header: *StillFrameHeader,
+    plane: s32, pass: s32, luma_row: s32, luma_column: s32, cancellation: *Cancellation) -> DecodeError {
+    sx := IntraSubX(frame, plane); sy := IntraSubY(frame, plane)
+    x := luma_column * 4; y := luma_row * 4
+    if x >= frame.width || y >= frame.height || (pass == 0 && x == 0) || (pass == 1 && y == 0) {
+        return Error(DecodeOK)
+    }
+    row := luma_row | sy; column := luma_column | sx
+    dx: s32 = ifx pass == 0 then 1 else 0
+    dy := 1 - dx
+    xp := x >> sx; yp := y >> sy
+    prev_row := row - (dy << sy); prev_column := column - (dx << sx)
+    tx := frame.mi[IntraMiAt(frame, row >> sy, column >> sx) + IntraMiLoopTx + plane]
+    prev_tx := frame.mi[IntraMiAt(frame, prev_row >> sy, prev_column >> sx) + IntraMiLoopTx + plane]
+    size := ifx pass == 0 then IntraPackedWidth(tx) else IntraPackedHeight(tx)
+    prev_size := ifx pass == 0 then IntraPackedWidth(prev_tx) else IntraPackedHeight(prev_tx)
+    position := ifx pass == 0 then xp else yp
+    if position % size != 0 { return Error(DecodeOK) }
+    filter_size := PostMin(ifx plane == 0 then 16 else 8, PostMin(size, prev_size))
+    strength := PostFilterStrength(frame, header, row, column, plane, pass)
+    if strength.level == 0 { strength = PostFilterStrength(frame, header, prev_row, prev_column, plane, pass) }
+    if strength.level == 0 { return Error(DecodeOK) }
+    length: s32 = 4
+    if filter_size == 8 { length = ifx plane == 0 then 8 else 6 }
+    if filter_size == 16 { length = 14 }
+    half := length / 2
+    step: s64 = ifx pass == 0 then 1 else cast(s64)frame.plane_stride[plane]
+    for i: 0..3 {
+        center := PostIndex(frame, plane, xp + dy * cast(s32)i, yp + dx * cast(s32)i)
+        input: [16]u16
+        for k: 8 - half..7 + half { input[k] = samples[center + (k - 8) * step] }
+        edge := FilterDeblockEdge(input[:], length, strength.block_limit, strength.limit,
+            strength.threshold, frame.bit_depth, cancellation)
+        if edge.error.code != DecodeOK { return edge.error }
+        for k: 8 - half..7 + half { samples[center + (k - 8) * step] = edge.samples[k] }
+    }
+    return Error(DecodeOK)
+}
+
+PostFloorLog2 :: (value: u32) -> s32 {
+    log: s32 = -1; n := value
+    while n != 0 { log += 1; n = n >> 1 }
+    return log
+}
+
+// 7.15.3 for one plane of the 8x8 luma block at (row, column). Availability
+// is the whole mode-info grid; unavailable taps take CdefMissingSample.
+PostCdefPlane :: (frame: *IntraFrame, source: []u16, destination: []u16, plane: s32,
+    row: s32, column: s32, primary: s32, secondary: s32, damping: s32, direction: s32,
+    cancellation: *Cancellation) -> DecodeError {
+    sx := IntraSubX(frame, plane); sy := IntraSubY(frame, plane)
+    x0 := (column * 4) >> sx; y0 := (row * 4) >> sy
+    w := 8 >> sx; h := 8 >> sy
+    input: [144]u16
+    for i: 0..h + 3 {
+        y := y0 + cast(s32)i - 2
+        for j: 0..w + 3 {
+            x := x0 + cast(s32)j - 2
+            value := cast(u16)CdefMissingSample
+            if y >= 0 && x >= 0 && ((y << sy) >> 2) < frame.mi_rows && ((x << sx) >> 2) < frame.mi_cols {
+                value = source[PostIndex(frame, plane, x, y)]
+            }
+            input[i * 12 + j] = value
+        }
+    }
+    block := FilterCdefBlock(input[:], 12, w, h, primary, secondary, damping, direction, frame.bit_depth, cancellation)
+    if block.error.code != DecodeOK { return block.error }
+    for i: 0..h - 1 {
+        line := PostIndex(frame, plane, x0, y0 + cast(s32)i)
+        for j: 0..w - 1 { destination[line + j] = block.samples[i * 8 + j] }
+    }
+    return Error(DecodeOK)
+}
+
+PostRestorationInput :: struct {
+    plane: s32; end_x: s32; end_y: s32; stripe_start: s32; stripe_end: s32;
+}
+
+// 7.17.6: rows inside the current stripe come from CDEF output, at most two
+// rows beyond it from the deblocked frame. An empty cdef view means CDEF was
+// the identity and both sources are the deblocked frame.
+PostSourceSample :: (frame: *IntraFrame, deblocked: []u16, cdef: []u16,
+    input: *PostRestorationInput, x: s32, y: s32) -> u16 {
+    cx := PostClip(x, 0, input.end_x); cy := PostClip(y, 0, input.end_y)
+    if cy < input.stripe_start {
+        return deblocked[PostIndex(frame, input.plane, cx, PostMax(input.stripe_start - 2, cy))]
+    }
+    if cy > input.stripe_end {
+        return deblocked[PostIndex(frame, input.plane, cx, PostMin(input.stripe_end + 2, cy))]
+    }
+    at := PostIndex(frame, input.plane, cx, cy)
+    return ifx cdef.count == 0 then deblocked[at] else cdef[at]
+}
+
+#scope_export
+// Whole-frame loop filter (7.14.1), modifying samples in place. Returns at
+// once when both luma levels are zero, as decode_frame_wrapup requires.
+ApplyIntraLoopFilter :: (frame: *IntraFrame, samples: []u16, header: *StillFrameHeader,
+    cancellation: *Cancellation = null) -> DecodeError {
+    if frame == null || header == null || samples.count != frame.sample_count { return Error(InvalidInput) }
+    if header.loop_filter_levels[0] == 0 && header.loop_filter_levels[1] == 0 { return Error(DecodeOK) }
+    for plane_index: 0..frame.planes - 1 {
+        plane := cast(s32)plane_index
+        if plane > 0 && header.loop_filter_levels[1 + plane] == 0 { continue }
+        row_step: s32 = ifx plane == 0 then 1 else 1 << IntraSubY(frame, plane)
+        column_step: s32 = ifx plane == 0 then 1 else 1 << IntraSubX(frame, plane)
+        for pass_index: 0..1 {
+            pass := cast(s32)pass_index
+            row: s32 = 0
+            while row < frame.mi_rows {
+                error := CancellationError(cancellation)
+                if error.code != DecodeOK { return error }
+                column: s32 = 0
+                while column < frame.mi_cols {
+                    error = PostDeblockEdge(frame, samples, header, plane, pass, row, column, cancellation)
+                    if error.code != DecodeOK { return error }
+                    column += column_step
+                }
+                row += row_step
+            }
+        }
+    }
+    return Error(DecodeOK)
+}
+
+// Whole-frame CDEF (7.15): destination receives a copy of source, then each
+// non-skip 8x8 block with a coded cdef_idx is filtered from source.
+ApplyIntraCdef :: (frame: *IntraFrame, source: []u16, destination: []u16, header: *StillFrameHeader,
+    cancellation: *Cancellation = null) -> DecodeError {
+    if frame == null || header == null || source.count != frame.sample_count ||
+        destination.count != frame.sample_count { return Error(InvalidInput) }
+    for i: 0..frame.sample_count - 1 { destination[i] = source[i] }
+    uv_directions: [32]s32 = .[0,1,2,3,4,5,6,7, 1,2,2,2,3,4,6,0, 7,0,2,4,5,6,6,6, 0,1,2,3,4,5,6,7]
+    shift := frame.bit_depth - 8
+    stride0 := cast(s64)frame.plane_stride[0]
+    row: s32 = 0
+    while row < frame.mi_rows {
+        error := CancellationError(cancellation)
+        if error.code != DecodeOK { return error }
+        column: s32 = 0
+        while column < frame.mi_cols {
+            stored := frame.cdef[cast(s64)(row >> 4) * frame.cdef_columns + (column >> 4)]
+            skip := frame.mi[IntraMiAt(frame, row, column) + IntraMiSkip] != 0 &&
+                frame.mi[IntraMiAt(frame, row + 1, column) + IntraMiSkip] != 0 &&
+                frame.mi[IntraMiAt(frame, row, column + 1) + IntraMiSkip] != 0 &&
+                frame.mi[IntraMiAt(frame, row + 1, column + 1) + IntraMiSkip] != 0
+            if stored != 0 && !skip {
+                index := cast(s32)stored - 1
+                luma: [64]u16
+                base := PostIndex(frame, 0, column * 4, row * 4)
+                for i: 0..7 { for j: 0..7 { luma[i * 8 + j] = source[base + i * stride0 + j] } }
+                found := FindCdefDirection(luma[:], 8, frame.bit_depth, cancellation)
+                if found.error.code != DecodeOK { return found.error }
+                primary := header.cdef_y_primary[index] << shift
+                secondary := header.cdef_y_secondary[index] << shift
+                direction: s32 = ifx primary == 0 then 0 else found.direction
+                variance := found.variance
+                variance_strength: s32 = ifx (variance >> 6) != 0 then PostMin(PostFloorLog2(variance >> 6), 12) else 0
+                primary = ifx variance != 0 then (primary * (4 + variance_strength) + 8) >> 4 else 0
+                error = PostCdefPlane(frame, source, destination, 0, row, column, primary, secondary,
+                    header.cdef_damping + shift, direction, cancellation)
+                if error.code != DecodeOK { return error }
+                if frame.planes > 1 {
+                    primary = header.cdef_uv_primary[index] << shift
+                    secondary = header.cdef_uv_secondary[index] << shift
+                    table := (frame.subsampling_x * 2 + frame.subsampling_y) * 8 + found.direction
+                    direction = ifx primary == 0 then 0 else uv_directions[table]
+                    for plane: 1..2 {
+                        error = PostCdefPlane(frame, source, destination, cast(s32)plane, row, column, primary,
+                            secondary, header.cdef_damping + shift - 1, direction, cancellation)
+                        if error.code != DecodeOK { return error }
+                    }
+                }
+            }
+            column += 2
+        }
+        row += 2
+    }
+    return Error(DecodeOK)
+}
+
+// Whole-frame loop restoration (7.17) into output. cdef is the CDEF frame,
+// or an empty view when CDEF was the identity. Blocks are at most 8x8 and
+// never cross a restoration unit or a 64-luma-row stripe.
+ApplyIntraRestoration :: (frame: *IntraFrame, deblocked: []u16, cdef: []u16, output: []u16,
+    header: *StillFrameHeader, cancellation: *Cancellation = null) -> DecodeError {
+    if frame == null || header == null || deblocked.count != frame.sample_count ||
+        (cdef.count != 0 && cdef.count != frame.sample_count) || output.count != frame.sample_count {
+        return Error(InvalidInput)
+    }
+    for i: 0..frame.sample_count - 1 { output[i] = ifx cdef.count == 0 then deblocked[i] else cdef[i] }
+    for plane_index: 0..frame.planes - 1 {
+        plane := cast(s32)plane_index
+        if frame.restoration_type[plane] == 0 { continue }
+        sx := IntraSubX(frame, plane); sy := IntraSubY(frame, plane)
+        input: PostRestorationInput
+        input.plane = plane
+        input.end_x = ((header.upscaled_width + sx) >> sx) - 1
+        input.end_y = ((frame.height + sy) >> sy) - 1
+        unit := frame.restoration_size[plane]
+        offset := 8 >> sy; stripe_height := 64 >> sy
+        y0: s32 = 0
+        while y0 <= input.end_y {
+            error := CancellationError(cancellation)
+            if error.code != DecodeOK { return error }
+            next := ((y0 + offset) / 8 + 1) * 8 - offset
+            h := PostMin(next, input.end_y + 1) - y0
+            stripe := (y0 + offset) / stripe_height
+            input.stripe_start = stripe * stripe_height - offset
+            input.stripe_end = input.stripe_start + stripe_height - 1
+            unit_row := PostMin(frame.restoration_rows[plane] - 1, (y0 + offset) / unit)
+            x0: s32 = 0
+            while x0 <= input.end_x {
+                w := PostMin(8, input.end_x - x0 + 1)
+                unit_column := PostMin(frame.restoration_columns[plane] - 1, x0 / unit)
+                at := frame.restoration_offset[plane] +
+                    (cast(s64)unit_row * frame.restoration_columns[plane] + unit_column) * IntraRestorationFields
+                kind := cast(s32)frame.restoration[at]
+                if kind != 0 {
+                    halo: [196]u16
+                    for i: 0..h + 5 { for j: 0..w + 5 {
+                        halo[i * 14 + j] = PostSourceSample(frame, deblocked, cdef, *input,
+                            x0 + cast(s32)j - 3, y0 + cast(s32)i - 3)
+                    } }
+                    filtered: [64]u16
+                    if kind == 1 {
+                        vertical: [3]s32; horizontal: [3]s32
+                        for k: 0..2 {
+                            vertical[k] = cast(s32)frame.restoration[at + 1 + k]
+                            horizontal[k] = cast(s32)frame.restoration[at + 4 + k]
+                        }
+                        block := FilterWienerBlock(halo[:], 14, w, h, horizontal[:], vertical[:], frame.bit_depth, cancellation)
+                        if block.error.code != DecodeOK { return block.error }
+                        filtered = block.samples
+                    } else {
+                        block := FilterSgrBlock(halo[:], 14, w, h, cast(s32)frame.restoration[at + 7],
+                            cast(s32)frame.restoration[at + 8], cast(s32)frame.restoration[at + 9], frame.bit_depth, cancellation)
+                        if block.error.code != DecodeOK { return block.error }
+                        filtered = block.samples
+                    }
+                    for i: 0..h - 1 {
+                        line := PostIndex(frame, plane, x0, y0 + cast(s32)i)
+                        for j: 0..w - 1 { output[line + j] = filtered[i * 8 + j] }
+                    }
+                }
+                x0 += 8
+            }
+            y0 += h
+        }
+    }
+    return Error(DecodeOK)
+}
+
+// Copies a post-filter result back into the decoded frame buffer.
+CopyIntraSamples :: (source: []u16, destination: []u16) -> DecodeError {
+    if source.count != destination.count { return Error(InvalidInput) }
+    for i: 0..source.count - 1 { destination[i] = source[i] }
+    return Error(DecodeOK)
+}

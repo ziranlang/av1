@@ -1,0 +1,160 @@
+using Codec :: #import "image_codec/api"
+
+// AV1 scalar CDEF direction/filter semantics. Reference tables also appear in
+// libaom d772e334cc724105040382a977ebb10dfd393293, av1/common/cdef_block.c.
+// Copyright (c) 2016, Alliance for Open Media. BSD2/AOM Patent notices retained
+// in LICENSE.libaom and PATENTS.libaom. No allocation or native codec calls.
+CdefMissingSample :: 30000
+CdefDirection :: struct { direction: s32; variance: u32; error: DecodeError; }
+CdefBlock :: struct { samples: [64]u16; width: s32; height: s32; error: DecodeError; }
+
+FindCdefDirection :: (input: []u16, stride: s32, bit_depth: s32,
+    cancellation: *Cancellation = null) -> CdefDirection {
+    result: CdefDirection
+    result.error = CancellationError(cancellation)
+    if result.error.code != DecodeOK { return result }
+    if (bit_depth != 8 && bit_depth != 10 && bit_depth != 12) || stride < 8 || stride > 64 ||
+        input.count < 7 * cast(s64)stride + 8 || input.count > 4096 { result.error = Error(InvalidInput); return result }
+    maximum := cast(u32)((cast(u32)1 << cast(u32)bit_depth) - 1)
+    partial: [120]s64; cost: [8]s64
+    for row: 0..7 {
+        result.error = CancellationError(cancellation)
+        if result.error.code != DecodeOK { return result }
+        for column: 0..7 {
+            value := input[row * stride + column]
+            if cast(u32)value > maximum { result.error = Error(InvalidInput); return result }
+            x := cast(s64)(cast(s32)(value >> cast(u32)(bit_depth - 8)) - 128)
+            partial[row + column] += x
+            partial[15 + row + column / 2] += x
+            partial[30 + row] += x
+            partial[45 + 3 + row - column / 2] += x
+            partial[60 + 7 + row - column] += x
+            partial[75 + 3 - row / 2 + column] += x
+            partial[90 + column] += x
+            partial[105 + row / 2 + column] += x
+        }
+    }
+    divisors: [9]s64 = .[0,840,420,280,210,168,140,120,105]
+    for i: 0..7 {
+        cost[2] += partial[30 + i] * partial[30 + i]
+        cost[6] += partial[90 + i] * partial[90 + i]
+    }
+    cost[2] *= divisors[8]; cost[6] *= divisors[8]
+    for i: 0..6 {
+        cost[0] += (partial[i] * partial[i] + partial[14 - i] * partial[14 - i]) * divisors[i + 1]
+        cost[4] += (partial[60 + i] * partial[60 + i] + partial[74 - i] * partial[74 - i]) * divisors[i + 1]
+    }
+    cost[0] += partial[7] * partial[7] * divisors[8]
+    cost[4] += partial[67] * partial[67] * divisors[8]
+    for direction: 1..7 {
+        if direction % 2 == 0 { continue }
+        for j: 0..4 { cost[direction] += partial[direction * 15 + 3 + j] * partial[direction * 15 + 3 + j] }
+        cost[direction] *= divisors[8]
+        for j: 0..2 {
+            a := partial[direction * 15 + j]; b := partial[direction * 15 + 10 - j]
+            cost[direction] += (a * a + b * b) * divisors[2 * j + 2]
+        }
+    }
+    best: s32
+    for direction: 1..7 { if cost[direction] > cost[best] { best = cast(s32)direction } }
+    result.error = CancellationError(cancellation)
+    if result.error.code != DecodeOK { return result }
+    result.direction = best
+    result.variance = cast(u32)((cost[best] - cost[(best + 4) & 7]) / 1024)
+    return result
+}
+
+#scope_file
+CdefConstrain :: (difference: s32, threshold: s32, damping: s32) -> s32 {
+    if threshold == 0 { return 0 }
+    log: s32; remaining := threshold
+    while remaining > 1 { log += 1; remaining /= 2 }
+    shift := damping - log; if shift < 0 { shift = 0 }
+    magnitude := ifx difference < 0 then -difference else difference
+    constrained := threshold - cast(s32)(cast(u32)magnitude >> cast(u32)shift)
+    if constrained < 0 { constrained = 0 }
+    if constrained > magnitude { constrained = magnitude }
+    return ifx difference < 0 then -constrained else constrained
+}
+CdefFloor16 :: (value: s32) -> s32 {
+    return ifx value < 0 then -((-value + 15) / 16) else value / 16
+}
+
+#scope_export
+// Input starts at the top-left of a two-sample halo. Missing neighbors must
+// equal CdefMissingSample; center samples must be real source-depth samples.
+// Strengths and damping include bit_depth-8 scaling. Luma primary strength
+// includes the normative variance adjustment, which need not preserve scaling.
+// Width/height are 4 or 8; output stride is 8. Nothing commits after an error.
+FilterCdefBlock :: (input: []u16, stride: s32, width: s32, height: s32,
+    primary_strength: s32, secondary_strength: s32, damping: s32,
+    direction: s32, bit_depth: s32, cancellation: *Cancellation = null) -> CdefBlock {
+    result: CdefBlock
+    result.error = CancellationError(cancellation)
+    if result.error.code != DecodeOK { return result }
+    if (bit_depth != 8 && bit_depth != 10 && bit_depth != 12) ||
+        (width != 4 && width != 8) || (height != 4 && height != 8) || stride < width + 4 || stride > 64 ||
+        input.count < cast(s64)(height + 3) * stride + width + 4 || input.count > 4096 || direction < 0 || direction > 7 {
+        result.error = Error(InvalidInput); return result
+    }
+    shift := bit_depth - 8
+    scale := cast(s32)(cast(u32)1 << cast(u32)shift)
+    maximum := cast(u32)((cast(u32)1 << cast(u32)bit_depth) - 1)
+    if primary_strength < 0 || primary_strength > 15 * scale ||
+        secondary_strength < 0 || secondary_strength > 4 * scale || secondary_strength % scale != 0 ||
+        secondary_strength / scale == 3 || damping < 2 + shift || damping > 6 + shift {
+        result.error = Error(InvalidInput); return result
+    }
+    for row: 0..height + 3 {
+        for column: 0..width + 3 {
+            sample := input[row * stride + column]
+            if sample == CdefMissingSample {
+                if row >= 2 && row < height + 2 && column >= 2 && column < width + 2 {
+                    result.error = Error(InvalidInput); return result
+                }
+            } else if cast(u32)sample > maximum { result.error = Error(InvalidInput); return result }
+        }
+    }
+    // Pairs are (dy,dx), two distances for each of eight directions.
+    directions: [32]s32 = .[-1,1,-2,2,0,1,-1,2,0,1,0,2,0,1,1,2,1,1,2,2,1,0,2,1,1,0,2,0,1,0,2,-1]
+    primary_taps: [4]s32 = .[4,2,3,3]
+    samples: [64]u16
+    for row: 0..height - 1 {
+        result.error = CancellationError(cancellation)
+        if result.error.code != DecodeOK { return result }
+        for column: 0..width - 1 {
+            current := cast(s32)input[(row + 2) * stride + column + 2]
+            minimum := current; maximum_sample := current; sum: s32
+            for tap: 0..1 {
+                for family: 0..2 {
+                    filter_direction := direction; strength := primary_strength
+                    weight := primary_taps[(primary_strength / scale & 1) * 2 + tap]
+                    if family > 0 {
+                        offset: s32 = ifx family == 1 then 6 else 2
+                        filter_direction = (direction + offset) % 8
+                        strength = secondary_strength
+                        weight = ifx tap == 0 then 2 else 1
+                    }
+                    for side: 0..1 {
+                        sign: s32 = ifx side == 0 then -1 else 1
+                        y := row + 2 + sign * directions[(filter_direction * 2 + tap) * 2]
+                        x := column + 2 + sign * directions[(filter_direction * 2 + tap) * 2 + 1]
+                        sample := input[y * stride + x]
+                        if sample == CdefMissingSample { continue }
+                        value := cast(s32)sample
+                        sum += weight * CdefConstrain(value - current, strength, damping)
+                        if value < minimum { minimum = value }; if value > maximum_sample { maximum_sample = value }
+                    }
+                }
+            }
+            negative: s32 = ifx sum < 0 then 1 else 0
+            value := current + CdefFloor16(8 + sum - negative)
+            if value < minimum { value = minimum }; if value > maximum_sample { value = maximum_sample }
+            samples[row * 8 + column] = cast(u16)value
+        }
+    }
+    result.error = CancellationError(cancellation)
+    if result.error.code != DecodeOK { return result }
+    result.samples = samples; result.width = width; result.height = height
+    return result
+}

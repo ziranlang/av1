@@ -1,0 +1,228 @@
+#import, file "./bits.zi";
+#import, file "./profile.zi";
+#import, file "./state.zi";
+#import, file "./tiles.zi";
+#import, file "../grain/grain_params.zi";
+
+StillFrameHeaderResult :: struct { header: StillFrameHeader; next: s64; error: DecodeError; }
+
+#scope_file
+FrameFlag :: (bits: *BitReader) -> bool { return ReadBits(bits, 1) != 0 }
+FrameField :: (bits: *BitReader, count: s32) -> s32 { return cast(s32)ReadBits(bits, count) }
+ClipFrame :: (value: s32, low: s32, high: s32) -> s32 {
+    if value < low { return low }
+    return ifx value > high then high else value
+}
+DeltaQ :: (bits: *BitReader) -> s32 {
+    if FrameFlag(bits) { return ReadSignedBits(bits, 7) }
+    return 0
+}
+UnsupportedFrame :: (bits: *BitReader, at: s64) -> DecodeError {
+    return ifx bits.error.code != DecodeOK then bits.error else Error(UnsupportedCapability, at)
+}
+Quantization :: (bits: *BitReader, seq: SequenceHeader, frame: *StillFrameHeader) {
+    frame.base_q_idx = FrameField(bits, 8); frame.delta_q[0] = DeltaQ(bits)
+    if !seq.monochrome {
+        diff := seq.separate_uv_delta_q && FrameFlag(bits)
+        frame.delta_q[1] = DeltaQ(bits); frame.delta_q[2] = DeltaQ(bits)
+        if diff { frame.delta_q[3] = DeltaQ(bits); frame.delta_q[4] = DeltaQ(bits) }
+        else { frame.delta_q[3] = frame.delta_q[1]; frame.delta_q[4] = frame.delta_q[2] }
+    }
+    frame.using_qmatrix = FrameFlag(bits)
+    if frame.using_qmatrix {
+        frame.qm[0] = FrameField(bits, 4); frame.qm[1] = FrameField(bits, 4)
+        frame.qm[2] = ifx seq.separate_uv_delta_q then FrameField(bits, 4) else frame.qm[1]
+    }
+}
+Segmentation :: (bits: *BitReader, frame: *StillFrameHeader) {
+    frame.segmentation_enabled = FrameFlag(bits)
+    if !frame.segmentation_enabled { return }
+    widths: [8]s32 = .[8,6,6,6,6,3,0,0]
+    limits: [8]s32 = .[255,63,63,63,63,7,0,0]
+    for segment: 0..7 {
+        for feature: 0..7 {
+            at := segment * 8 + feature
+            frame.features[at].enabled = FrameFlag(bits)
+            if frame.features[at].enabled {
+                value: s32
+                if feature < 5 { value = ReadSignedBits(bits, widths[feature] + 1) }
+                else { value = FrameField(bits, widths[feature]) }
+                frame.features[at].value = ClipFrame(value, -limits[feature], limits[feature])
+                frame.last_active_segment_id = cast(s32)segment
+                if feature >= 5 { frame.segment_id_pre_skip = true }
+            }
+        }
+    }
+}
+Lossless :: (frame: *StillFrameHeader) {
+    frame.coded_lossless = true
+    for segment: 0..7 {
+        qindex := frame.base_q_idx
+        if frame.features[segment * 8].enabled { qindex = ClipFrame(qindex + frame.features[segment * 8].value, 0, 255) }
+        value := qindex == 0
+        for q: 0..4 { if frame.delta_q[q] != 0 { value = false } }
+        frame.lossless[segment] = value
+        if !value { frame.coded_lossless = false }
+    }
+    frame.all_lossless = frame.coded_lossless && frame.width == frame.upscaled_width
+}
+LoopFilter :: (bits: *BitReader, seq: SequenceHeader, frame: *StillFrameHeader) {
+    frame.loop_filter_ref_deltas[0] = 1
+    frame.loop_filter_ref_deltas[4] = -1; frame.loop_filter_ref_deltas[6] = -1; frame.loop_filter_ref_deltas[7] = -1
+    if frame.coded_lossless || frame.allow_intrabc { return }
+    frame.loop_filter_levels[0] = FrameField(bits, 6); frame.loop_filter_levels[1] = FrameField(bits, 6)
+    if !seq.monochrome && (frame.loop_filter_levels[0] != 0 || frame.loop_filter_levels[1] != 0) {
+        frame.loop_filter_levels[2] = FrameField(bits, 6); frame.loop_filter_levels[3] = FrameField(bits, 6)
+    }
+    frame.loop_filter_sharpness = FrameField(bits, 3)
+    frame.loop_filter_delta_enabled = FrameFlag(bits)
+    if frame.loop_filter_delta_enabled && FrameFlag(bits) {
+        for i: 0..7 { if FrameFlag(bits) { frame.loop_filter_ref_deltas[i] = ReadSignedBits(bits, 7) } }
+        for i: 0..1 { if FrameFlag(bits) { frame.loop_filter_mode_deltas[i] = ReadSignedBits(bits, 7) } }
+    }
+}
+CdefHeader :: (bits: *BitReader, seq: SequenceHeader, frame: *StillFrameHeader) {
+    frame.cdef_damping = 3
+    if frame.coded_lossless || frame.allow_intrabc || !seq.enable_cdef { return }
+    frame.cdef_damping += FrameField(bits, 2); frame.cdef_bits = FrameField(bits, 2)
+    count := cast(s32)1 << frame.cdef_bits
+    for i: 0..count - 1 {
+        frame.cdef_y_primary[i] = FrameField(bits, 4); frame.cdef_y_secondary[i] = FrameField(bits, 2)
+        if frame.cdef_y_secondary[i] == 3 { frame.cdef_y_secondary[i] = 4 }
+        if !seq.monochrome {
+            frame.cdef_uv_primary[i] = FrameField(bits, 4); frame.cdef_uv_secondary[i] = FrameField(bits, 2)
+            if frame.cdef_uv_secondary[i] == 3 { frame.cdef_uv_secondary[i] = 4 }
+        }
+    }
+}
+RestorationHeader :: (bits: *BitReader, seq: SequenceHeader, frame: *StillFrameHeader) {
+    if frame.all_lossless || frame.allow_intrabc || !seq.enable_restoration { return }
+    planes: s32 = ifx seq.monochrome then 1 else 3
+    used := false; chroma := false
+    for i: 0..planes - 1 {
+        // Store the syntax remapping: none=0, switchable=1, Wiener=2, SGR=3.
+        frame.restoration_types[i] = FrameField(bits, 2)
+        if frame.restoration_types[i] != 0 { used = true; if i > 0 { chroma = true } }
+    }
+    if used {
+        shift := FrameField(bits, 1)
+        if seq.use_128x128_superblock { shift += 1 }
+        else if shift != 0 { shift += FrameField(bits, 1) }
+        frame.restoration_sizes[0] = 256 >> (2 - shift)
+        uv: s32
+        if seq.subsampling_x != 0 && seq.subsampling_y != 0 && chroma { uv = FrameField(bits, 1) }
+        frame.restoration_sizes[1] = frame.restoration_sizes[0] >> uv
+        frame.restoration_sizes[2] = frame.restoration_sizes[1]
+    }
+}
+
+#scope_export
+// Current control-flow subset: shown KEY_FRAME headers with fresh contexts. This
+// describes tools; it does not decode them or claim reconstructed pixels.
+// For OBU_FRAME, combined=true consumes byte_alignment and next starts its
+// tile-group header. Otherwise the entire OBU_FRAME_HEADER tail is validated.
+ParseStillFrameHeader :: (input: BorrowedBytes, begin: s64, end: s64, seq: SequenceHeader,
+    limits: DecodeLimits, combined: bool = true) -> StillFrameHeaderResult {
+    result: StillFrameHeaderResult
+    result.error = ValidateLimits(limits)
+    if result.error.code != DecodeOK { return result }
+    bits := NewBits(input, begin, end)
+    if bits.error.code != DecodeOK { result.error = bits.error; return result }
+    result.error = ValidatePixelDimensions(seq.max_frame_width, seq.max_frame_height, limits)
+    if result.error.code != DecodeOK { result.error.offset = begin; return result }
+    if (seq.reduced_still_picture_header && !seq.still_picture) || seq.profile < 0 || seq.profile > 2 {
+        result.error = Error(UnsupportedCapability, begin); return result
+    }
+    frame: StillFrameHeader
+    frame.show_frame = true; frame.error_resilient_mode = true
+    frame.primary_ref_frame = 7; frame.refresh_frame_flags = 255
+    if !seq.reduced_still_picture_header {
+        // Showing an old reference, hidden pictures and inter/intra-only
+        // frames require retained state. They remain explicitly unsupported.
+        if FrameFlag(*bits) { result.error = UnsupportedFrame(*bits, begin); return result }
+        frame.frame_type = FrameField(*bits, 2)
+        if frame.frame_type != 0 { result.error = UnsupportedFrame(*bits, begin); return result }
+        frame.show_frame = FrameFlag(*bits)
+        if !frame.show_frame { result.error = UnsupportedFrame(*bits, begin); return result }
+        if seq.decoder_model_info_present && !seq.equal_picture_interval {
+            if seq.frame_presentation_time_length < 1 || seq.frame_presentation_time_length > 32 {
+                result.error = Error(InvalidInput, begin); return result
+            }
+            frame.frame_presentation_time = ReadBits(*bits, seq.frame_presentation_time_length)
+        }
+    }
+    frame.disable_cdf_update = FrameFlag(*bits)
+    screen_selector: s32 = ifx seq.reduced_still_picture_header then 2 else seq.force_screen_content_tools
+    integer_selector: s32 = ifx seq.reduced_still_picture_header then 2 else seq.force_integer_mv
+    if screen_selector < 0 || screen_selector > 2 || integer_selector < 0 || integer_selector > 2 {
+        result.error = Error(InvalidInput, begin); return result
+    }
+    frame.allow_screen_content_tools = ifx screen_selector == 2 then FrameFlag(*bits) else screen_selector != 0
+    if frame.allow_screen_content_tools && integer_selector == 2 { force_integer_mv := FrameFlag(*bits) }
+    // Intra pictures force integer motion regardless of the transmitted hint.
+    frame.force_integer_mv = true
+    if !seq.reduced_still_picture_header {
+        if seq.frame_id_numbers_present {
+            if seq.frame_id_length < 1 || seq.frame_id_length > 32 { result.error = Error(InvalidInput, begin); return result }
+            frame.current_frame_id = ReadBits(*bits, seq.frame_id_length)
+        }
+        frame.frame_size_override = FrameFlag(*bits)
+        if seq.enable_order_hint {
+            if seq.order_hint_bits < 1 || seq.order_hint_bits > 8 { result.error = Error(InvalidInput, begin); return result }
+            frame.order_hint = ReadBits(*bits, seq.order_hint_bits)
+        }
+        if seq.decoder_model_info_present {
+            if seq.operating_point_count < 1 || seq.operating_point_count > 32 ||
+                seq.buffer_removal_time_length < 1 || seq.buffer_removal_time_length > 32 { result.error = Error(InvalidInput, begin); return result }
+            frame.buffer_removal_time_present = FrameFlag(*bits)
+            if frame.buffer_removal_time_present {
+                for op: 0..seq.operating_point_count - 1 {
+                    idc := seq.operating_points[op].idc
+                    // This entry accepts only layer0 OBU headers; extensions
+                    // are rejected by the outer framing layer before parsing.
+                    if seq.operating_points[op].decoder_model_present && (idc == 0 || (idc & 257) == 257) {
+                        frame.buffer_removal_times[op] = ReadBits(*bits, seq.buffer_removal_time_length)
+                    }
+                }
+            }
+        }
+    }
+    frame.upscaled_width = seq.max_frame_width; frame.width = frame.upscaled_width; frame.height = seq.max_frame_height
+    if frame.frame_size_override {
+        if seq.frame_width_bits < 1 || seq.frame_width_bits > 16 || seq.frame_height_bits < 1 || seq.frame_height_bits > 16 {
+            result.error = Error(InvalidInput, begin); return result
+        }
+        frame.upscaled_width = FrameField(*bits, seq.frame_width_bits) + 1; frame.height = FrameField(*bits, seq.frame_height_bits) + 1
+        frame.width = frame.upscaled_width
+        if bits.error.code != DecodeOK { result.error = bits.error; return result }
+        if frame.width > seq.max_frame_width || frame.height > seq.max_frame_height { result.error = Error(MalformedInput, bits.byte); return result }
+    }
+    frame.superres_denominator = 8
+    if seq.enable_superres && FrameFlag(*bits) {
+        frame.superres_denominator = FrameField(*bits, 3) + 9
+        frame.width = (frame.upscaled_width * 8 + frame.superres_denominator / 2) / frame.superres_denominator
+    }
+    frame.render_width = frame.upscaled_width; frame.render_height = frame.height
+    if FrameFlag(*bits) { frame.render_width = FrameField(*bits, 16) + 1; frame.render_height = FrameField(*bits, 16) + 1 }
+    if frame.allow_screen_content_tools && frame.width == frame.upscaled_width { frame.allow_intrabc = FrameFlag(*bits) }
+    frame.disable_frame_end_update_cdf = seq.reduced_still_picture_header || frame.disable_cdf_update
+    if !frame.disable_frame_end_update_cdf { frame.disable_frame_end_update_cdf = FrameFlag(*bits) }
+    frame.tiles = ReadTileLayout(*bits, frame.width, frame.height, seq.use_128x128_superblock)
+    Quantization(*bits, seq, *frame); Segmentation(*bits, *frame)
+    if frame.base_q_idx > 0 { frame.delta_q_present = FrameFlag(*bits) }
+    if frame.delta_q_present {
+        frame.delta_q_res = FrameField(*bits, 2)
+        if !frame.allow_intrabc { frame.delta_lf_present = FrameFlag(*bits) }
+        if frame.delta_lf_present { frame.delta_lf_res = FrameField(*bits, 2); frame.delta_lf_multi = FrameFlag(*bits) }
+    }
+    Lossless(*frame); LoopFilter(*bits, seq, *frame); CdefHeader(*bits, seq, *frame); RestorationHeader(*bits, seq, *frame)
+    if !frame.coded_lossless { frame.tx_mode = ifx FrameFlag(*bits) then 2 else 1 }
+    frame.reduced_tx_set = FrameFlag(*bits)
+    grain := ReadStillFilmGrain(*bits, seq.film_grain_params_present, seq.monochrome, seq.subsampling_x, seq.subsampling_y)
+    if grain.error.code != DecodeOK { result.error = grain.error; return result }
+    frame.grain_parameters = grain.parameters
+    result.error = ifx combined then AlignBits(*bits) else FinishBits(*bits)
+    if result.error.code != DecodeOK { return result }
+    result.header = frame; result.next = bits.byte
+    return result
+}

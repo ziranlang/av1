@@ -1,0 +1,37 @@
+#import, file "../src/predict/palette.zi";
+#import, file "../src/entropy/palette_cdfs.zi";
+#import, file "../src/entropy/range.zi";
+using Codec :: #import "image_codec/api"
+
+PaletteBoundaries :: () -> s32 {
+    first: [4]u16 = .[7,1,7,3]; second: [4]u16 = .[1,4,3,9]
+    cache := BuildPaletteCache(first[:], second[:])
+    expected: [6]u16 = .[1,3,4,7,9,0]
+    if cache.error.code != DecodeOK || cache.count != 5 { return 1 }
+    for i: 0..4 { if cache.colors[i] != expected[i] { return 2 } }
+    too_many: [9]u16
+    if BuildPaletteCache(too_many[:], second[:]).error.code != InvalidInput { return 3 }
+    map: [4]u8
+    if PaletteColorContext(map[:], 2, 0, 0, 2).error.code != InvalidInput { return 4 }
+    if PaletteColorContext(map[:], 0, 1, 1, 2).error.code != InvalidInput { return 5 }
+    if PaletteColorContext(map[:3], 2, 1, 1, 2).error.code != InvalidInput { return 6 }
+    if PaletteColorContext(map[:], 2, 1, 1, 1).error.code != InvalidInput { return 7 }
+    map[1] = 2
+    if PaletteColorContext(map[:], 2, 1, 1, 2).error.code != InvalidInput { return 8 }
+    bytes: [2]u8
+    decoder := NewRange(BorrowBytes(bytes[:]), 0, 2)
+    cdfs := NewPaletteCDF(); output: PaletteBlock
+    token: Cancellation; Cancel(*token)
+    if PaletteCeilLog2(0) != 0 || PaletteCeilLog2(1) != 0 || PaletteCeilLog2(2) != 1 || PaletteCeilLog2(4095) != 12 { return 15 }
+    output.count = 8
+    if ReadPaletteColors(*decoder, cdfs.size[:55], 0, first[:0], 8, true, *output).code != InvalidInput || output.count != 0 { return 16 }
+    output.count = 8
+    if ReadPaletteColors(*decoder, cdfs.size[:], 0, first[:0], 8, true, *output, *token).code != DecodeCancelled || output.count != 0 { return 17 }
+    output.count = 9
+    if ReadPaletteMap(*decoder, cdfs.color[:], 8, 8, 8, 8, *output).code != InvalidInput || output.count != 0 { return 18 }
+    output.count = 2
+    if ReadPaletteMap(*decoder, cdfs.color[:314], 8, 8, 8, 8, *output).code != InvalidInput || output.count != 0 { return 19 }
+    output.count = 2
+    if ReadPaletteMap(*decoder, cdfs.color[:], 8, 8, 8, 8, *output, *token).code != DecodeCancelled || output.count != 0 { return 20 }
+    return 0
+}

@@ -1,0 +1,7 @@
+#import, file "../src/predict/filter_intra.zi";
+
+FilterIntraBoundaries :: () -> s32 {
+    if FilterIntraBlockIndex(4, 16) != 16 || FilterIntraBlockIndex(16, 4) != 17 || FilterIntraBlockIndex(32, 8) != 19 { return 12 }
+    if FilterIntraBlockIndex(3, 4) != -1 || FilterIntraBlockIndex(4, 128) != -1 { return 13 }
+    return 0
+}

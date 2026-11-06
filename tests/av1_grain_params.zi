@@ -1,0 +1,39 @@
+#import, file "../src/grain/grain_params.zi";
+#import, file "../src/syntax/bits.zi";
+
+GrainParametersEmpty :: (parameters: FilmGrainParams) -> bool {
+    if parameters.apply_grain || parameters.random_seed != 0 || parameters.num_y_points != 0 ||
+        parameters.num_cb_points != 0 || parameters.num_cr_points != 0 || parameters.chroma_scaling_from_luma ||
+        parameters.scaling_shift != 0 || parameters.ar_coeff_lag != 0 || parameters.ar_coeff_shift != 0 ||
+        parameters.grain_scale_shift != 0 || parameters.cb_mult != 0 || parameters.cb_luma_mult != 0 || parameters.cb_offset != 0 ||
+        parameters.cr_mult != 0 || parameters.cr_luma_mult != 0 || parameters.cr_offset != 0 ||
+        parameters.overlap_flag || parameters.clip_to_restricted_range { return false }
+    for i: 0..27 { if parameters.scaling_points_y[i] != 0 { return false } }
+    for i: 0..19 { if parameters.scaling_points_cb[i] != 0 || parameters.scaling_points_cr[i] != 0 { return false } }
+    for i: 0..23 { if parameters.ar_coeffs_y[i] != 0 { return false } }
+    for i: 0..24 { if parameters.ar_coeffs_cb[i] != 0 || parameters.ar_coeffs_cr[i] != 0 { return false } }
+    return true
+}
+GrainParameterBounds :: () -> s32 {
+    data: [3]u8 = .[128,0,120]
+    bits := NewBits(BorrowBytes(data[:]), 0, 3)
+    bad := ReadStillFilmGrain(*bits, true, true, 1, 1)
+    if bad.error.code != MalformedInput || bad.error.offset != 2 || !GrainParametersEmpty(bad.parameters) { return 1 }
+    bits = NewBits(BorrowBytes(data[:]), 0, 3)
+    bad = ReadStillFilmGrain(*bits, true, false, -1, 1)
+    if bad.error.code != InvalidInput || !GrainParametersEmpty(bad.parameters) || bits.byte != 0 || bits.bit != 0 { return 2 }
+    bad = ReadStillFilmGrain(null, false, true, 1, 1)
+    if bad.error.code != InvalidInput || !GrainParametersEmpty(bad.parameters) { return 3 }
+    bits = NewBits(BorrowBytes(data[:0]), 0, 0)
+    absent := ReadStillFilmGrain(*bits, false, true, 1, 1)
+    if absent.error.code != DecodeOK || !GrainParametersEmpty(absent.parameters) { return 4 }
+    bits = NewBits(BorrowBytes(data[:]), 0, 3)
+    bits.error = Error(MalformedInput, 17)
+    bad = ReadStillFilmGrain(*bits, false, true, 1, 1)
+    if bad.error.code != MalformedInput || bad.error.offset != 17 || !GrainParametersEmpty(bad.parameters) { return 5 }
+    bits = NewBits(BorrowBytes(data[:]), 0, 3)
+    token: Cancellation; Cancel(*token)
+    bad = ReadStillFilmGrain(*bits, true, true, 1, 1, *token)
+    if bad.error.code != DecodeCancelled || !GrainParametersEmpty(bad.parameters) || bits.byte != 0 || bits.bit != 0 { return 6 }
+    return 0
+}

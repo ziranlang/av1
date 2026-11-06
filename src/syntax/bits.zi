@@ -1,0 +1,85 @@
+using Codec :: #import "image_codec/api"
+
+// AV1 f(n): most-significant bit first. No entropy decoding happens here.
+// Input is borrowed synchronously and must remain unchanged while in use.
+BitReader :: struct {
+    input: BorrowedBytes;
+    begin: s64;
+    end: s64;
+    byte: s64;
+    bit: s32;
+    error: DecodeError;
+}
+
+NewBits :: (input: BorrowedBytes, begin: s64, end: s64) -> BitReader {
+    reader: BitReader
+    reader.input = input; reader.begin = begin; reader.end = end; reader.byte = begin
+    if begin < 0 || end < begin || end > input.data.count { reader.error = Error(InvalidInput, begin) }
+    return reader
+}
+
+// Sticky errors; failed reads return zero and do not consume any input.
+ReadBits :: (reader: *BitReader, count: s32) -> u32 {
+    if reader.error.code != DecodeOK { return 0 }
+    if count < 0 || count > 32 || reader.begin < 0 || reader.end < reader.begin ||
+        reader.end > reader.input.data.count || reader.bit < 0 || reader.bit > 7 ||
+        reader.byte < reader.begin || reader.byte > reader.end || (reader.byte == reader.end && reader.bit != 0) {
+        reader.error = Error(InvalidInput, reader.byte); return 0
+    }
+    required := cast(s64)((reader.bit + count + 7) / 8)
+    if count == 0 { return 0 }
+    if required > reader.end - reader.byte { reader.error = Error(TruncatedInput, reader.end); return 0 }
+    value: u32
+    remaining := count
+    while remaining > 0 {
+        value = (value << 1) | ((cast(u32)reader.input.data[reader.byte] >> cast(u32)(7 - reader.bit)) & 1)
+        reader.bit += 1; remaining -= 1
+        if reader.bit == 8 { reader.byte += 1; reader.bit = 0 }
+    }
+    return value
+}
+
+ReadSignedBits :: (reader: *BitReader, count: s32) -> s32 {
+    if reader.error.code != DecodeOK { return 0 }
+    if count < 1 || count > 32 { reader.error = Error(InvalidInput, reader.byte); return 0 }
+    raw := ReadBits(reader, count)
+    value := cast(s64)raw
+    if (raw >> cast(u32)(count - 1)) != 0 { value -= cast(s64)1 << cast(s64)count }
+    return cast(s32)value
+}
+
+// AV1 ns(n), a non-symmetric literal. n=1 consumes no bits.
+ReadNS :: (reader: *BitReader, n: u32) -> u32 {
+    if reader.error.code != DecodeOK { return 0 }
+    if n == 0 { reader.error = Error(InvalidInput, reader.byte); return 0 }
+    if n == 1 { return 0 }
+    width: s32
+    while (cast(u64)1 << cast(u64)width) < n { width += 1 }
+    m := (cast(u64)1 << cast(u64)width) - cast(u64)n
+    value := cast(u64)ReadBits(reader, width - 1)
+    if value < m { return cast(u32)value }
+    low := ReadBits(reader, 1)
+    if reader.error.code != DecodeOK { return 0 }
+    return cast(u32)((value << 1) - m + low)
+}
+
+// byte_alignment() consumes zero bits, never an entropy-coded literal.
+AlignBits :: (reader: *BitReader) -> DecodeError {
+    while reader.bit != 0 && reader.error.code == DecodeOK {
+        at := reader.byte
+        if ReadBits(reader, 1) != 0 { reader.error = Error(MalformedInput, at) }
+    }
+    return reader.error
+}
+
+// trailing_bits() for non-tile OBUs: one followed by zeros to payload end.
+FinishBits :: (reader: *BitReader) -> DecodeError {
+    if reader.error.code != DecodeOK { return reader.error }
+    at := reader.byte
+    if ReadBits(reader, 1) != 1 && reader.error.code == DecodeOK { reader.error = Error(MalformedInput, at) }
+    while reader.byte < reader.end && reader.error.code == DecodeOK {
+        at = reader.byte
+        if ReadBits(reader, 1) != 0 { reader.error = Error(MalformedInput, at) }
+    }
+    return reader.error
+}

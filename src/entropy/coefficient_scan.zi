@@ -1,0 +1,69 @@
+using Codec :: #import "image_codec/api"
+
+ScanDefault :: 0
+ScanRows :: 1
+ScanColumns :: 2
+CoefficientScan :: struct {
+    positions: [1024]u16;
+    inverse: [1024]u16;
+    count: s32;
+    coded_width: s32;
+    coded_height: s32;
+    error: DecodeError;
+}
+
+ScanFailure :: (error: DecodeError) -> CoefficientScan {
+    result: CoefficientScan; result.error = error; return result
+}
+
+// AV1 get_scan / chapter10 tables, compact row-major coefficient positions.
+// Default covers all nineteen sizes, using the normative upper-left32 mapping.
+// Row/column tables exist for the nine sizes whose longest side is <=16.
+// The caller selects the mode from PlaneTxType and validates the frame's
+// transform set. In particular,64-sized transforms select Default before any
+// one-dimensional type mapping; this helper is not transform-set validation.
+BuildCoefficientScan :: (width: s32, height: s32, mode: s32,
+    cancellation: *Cancellation = null) -> CoefficientScan {
+    error := CancellationError(cancellation)
+    if error.code != DecodeOK { return ScanFailure(error) }
+    if (width != 4 && width != 8 && width != 16 && width != 32 && width != 64) ||
+        (height != 4 && height != 8 && height != 16 && height != 32 && height != 64) {
+        return ScanFailure(Error(InvalidInput))
+    }
+    if width > height * 4 || height > width * 4 || mode < ScanDefault || mode > ScanColumns ||
+        (mode != ScanDefault && (width > 16 || height > 16)) {
+        return ScanFailure(Error(InvalidInput))
+    }
+    cw := ifx width < 32 then width else 32; ch := ifx height < 32 then height else 32
+    count := cw * ch
+    result: CoefficientScan
+    if mode == ScanRows || mode == ScanColumns {
+        for i: 0..count - 1 {
+            if i % cw == 0 {
+                error = CancellationError(cancellation)
+                if error.code != DecodeOK { return ScanFailure(error) }
+            }
+            position := ifx mode == ScanRows then i else (i % ch) * cw + i / ch
+            result.positions[i] = cast(u16)position; result.inverse[position] = cast(u16)i
+        }
+    } else {
+        at: s32
+        for diagonal: 0..cw + ch - 2 {
+            error = CancellationError(cancellation)
+            if error.code != DecodeOK { return ScanFailure(error) }
+            low := ifx diagonal >= cw then diagonal - cw + 1 else 0
+            high := ifx diagonal < ch then diagonal else ch - 1
+            reverse := cw > ch || (cw == ch && (diagonal & 1) == 0)
+            for i: 0..high - low {
+                row := ifx reverse then high - i else low + i
+                column := diagonal - row; position := row * cw + column
+                result.positions[at] = cast(u16)position; result.inverse[position] = cast(u16)at
+                at += 1
+            }
+        }
+    }
+    error = CancellationError(cancellation)
+    if error.code != DecodeOK { return ScanFailure(error) }
+    result.count = count; result.coded_width = cw; result.coded_height = ch
+    return result
+}

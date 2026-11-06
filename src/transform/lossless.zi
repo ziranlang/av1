@@ -1,0 +1,59 @@
+using Codec :: #import "image_codec/api"
+
+Residual4x4 :: struct { samples: [16]s32; error: DecodeError; }
+
+// AV1 7.13.2.10 reversible inverse Walsh-Hadamard butterfly. All intermediate
+// values are widened. Input/output vectors are four consecutive row samples.
+InverseWHT4 :: (values: []s64, shift: u32) {
+    a := values[0] >> shift; c := values[1] >> shift
+    d := values[2] >> shift; b := values[3] >> shift
+    a += c; d -= b
+    e := (a - d) >> 1
+    b = e - b; c = e - c; a -= b; d += c
+    values[0] = a; values[1] = b; values[2] = c; values[3] = d
+}
+
+// Lossless quantizers are 4 for DC/AC at every AV1 bit depth. Quant is
+// row-major, already sign-decoded and masked to 20 bits by coefficient syntax.
+// Invalid descriptors or nonconforming residual ranges return no samples.
+InverseLossless4x4 :: (quant: []s32, bit_depth: s32, cancellation: *Cancellation = null) -> Residual4x4 {
+    result: Residual4x4
+    result.error = CancellationError(cancellation)
+    if result.error.code != DecodeOK { return result }
+    if quant.count != 16 || (bit_depth != 8 && bit_depth != 10 && bit_depth != 12) {
+        result.error = Error(InvalidInput); return result
+    }
+    dequant_limit := cast(s64)1 << cast(u32)(bit_depth + 7)
+    intermediate_limit := cast(s64)1 << cast(u32)(ifx bit_depth + 6 > 16 then bit_depth + 5 else 15)
+    temporary: [16]s64
+    for i: 0..15 {
+        value := cast(s64)quant[i]
+        if value < -1048575 || value > 1048575 { result.error = Error(InvalidInput); return result }
+        value *= 4
+        if value < -dequant_limit { value = -dequant_limit }
+        if value >= dequant_limit { value = dequant_limit - 1 }
+        temporary[i] = value
+    }
+    for row: 0..3 {
+        InverseWHT4(temporary[row * 4:row * 4 + 4], 2)
+        for column: 0..3 {
+            at := row * 4 + column
+            if temporary[at] < -intermediate_limit { temporary[at] = -intermediate_limit }
+            if temporary[at] >= intermediate_limit { temporary[at] = intermediate_limit - 1 }
+        }
+    }
+    limit := cast(s64)1 << cast(u32)bit_depth
+    for column: 0..3 {
+        values: [4]s64
+        for row: 0..3 { values[row] = temporary[row * 4 + column] }
+        InverseWHT4(values[:], 0)
+        for row: 0..3 {
+            if values[row] < -limit || values[row] >= limit {
+                failed: Residual4x4; failed.error = Error(MalformedInput); return failed
+            }
+            result.samples[row * 4 + column] = cast(s32)values[row]
+        }
+    }
+    result.error = CancellationError(cancellation)
+    return result
+}

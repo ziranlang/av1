@@ -1,0 +1,194 @@
+#import, file "../entropy/range.zi";
+#import, file "../entropy/palette_cdfs.zi";
+using Codec :: #import "image_codec/api"
+
+// AV1 palette metadata, cache and diagonal index-map parsing. All storage is
+// fixed because palette blocks are at most 64x64; no native calls or allocation.
+PaletteBlock :: struct { colors: [8]u16; v_colors: [8]u16; count: s32; indices: [4096]u8; }
+PaletteCache :: struct { colors: [16]u16; count: s32; error: DecodeError; }
+PaletteIndexContext :: struct { order: [8]u8; context: s32; error: DecodeError; }
+
+BuildPaletteCache :: (above: []u16, left: []u16) -> PaletteCache {
+    result: PaletteCache
+    if above.count < 0 || above.count > 8 || left.count < 0 || left.count > 8 { result.error = Error(InvalidInput); return result }
+    combined: [16]u16
+    for i: 0..above.count - 1 { combined[i] = above[i] }
+    for i: 0..left.count - 1 { combined[above.count + i] = left[i] }
+    for i: 1..above.count + left.count - 1 {
+        value := combined[i]; at := i
+        while at > 0 && combined[at - 1] > value { combined[at] = combined[at - 1]; at -= 1 }
+        combined[at] = value
+    }
+    for i: 0..above.count + left.count - 1 {
+        if result.count == 0 || combined[i] != result.colors[result.count - 1] {
+            result.colors[result.count] = combined[i]; result.count += 1
+        }
+    }
+    return result
+}
+
+PaletteColorContext :: (indices: []u8, stride: s32, row: s32, column: s32, colors: s32) -> PaletteIndexContext {
+    result: PaletteIndexContext
+    if indices.count < 1 || indices.count > 4096 || stride < 1 || stride > 64 || row < 0 || row >= 64 ||
+        column < 0 || column >= stride || (row == 0 && column == 0) || colors < 2 || colors > 8 {
+        result.error = Error(InvalidInput); return result
+    }
+    if cast(s64)row * stride + column >= indices.count { result.error = Error(InvalidInput); return result }
+    scores: [8]s32
+    for i: 0..7 { result.order[i] = cast(u8)i }
+    if column > 0 {
+        neighbor := cast(s32)indices[row * stride + column - 1]
+        if neighbor >= colors { result.error = Error(InvalidInput); return result }
+        scores[neighbor] += 2
+    }
+    if row > 0 && column > 0 {
+        neighbor := cast(s32)indices[(row - 1) * stride + column - 1]
+        if neighbor >= colors { result.error = Error(InvalidInput); return result }
+        scores[neighbor] += 1
+    }
+    if row > 0 {
+        neighbor := cast(s32)indices[(row - 1) * stride + column]
+        if neighbor >= colors { result.error = Error(InvalidInput); return result }
+        scores[neighbor] += 2
+    }
+    for i: 0..2 {
+        maximum := i
+        for j: i + 1..colors - 1 { if scores[j] > scores[maximum] { maximum = j } }
+        score := scores[maximum]; order := result.order[maximum]; at := maximum
+        while at > i { scores[at] = scores[at - 1]; result.order[at] = result.order[at - 1]; at -= 1 }
+        scores[i] = score; result.order[i] = order
+    }
+    hash := scores[0] + 2 * scores[1] + 2 * scores[2]
+    contexts: [9]s32 = .[-1,-1,0,-1,-1,4,3,2,1]
+    if hash < 0 || hash > 8 { result.error = Error(MalformedInput); return result }
+    result.context = contexts[hash]
+    if result.context < 0 { result.error = Error(MalformedInput) }
+    return result
+}
+
+PaletteCeilLog2 :: (value: s32) -> s32 {
+    bits: s32
+    remaining := value - 1
+    while remaining > 0 { bits += 1; remaining /= 2 }
+    return bits
+}
+ReadPaletteUniform :: (decoder: *RangeDecoder, count: s32) -> s32 {
+    if count < 2 || count > 8 {
+        if decoder.error.code == DecodeOK { decoder.error = Error(InvalidInput, decoder.bits.byte) }
+        return 0
+    }
+    width := PaletteCeilLog2(count)
+    cutoff := cast(s32)(cast(u32)1 << cast(u32)width) - count
+    value := cast(s32)ReadLiteral(decoder, width - 1)
+    if value < cutoff { return value }
+    return value * 2 - cutoff + cast(s32)ReadLiteral(decoder, 1)
+}
+
+// Metadata precedes both planes' index maps. Luma has strictly positive
+// transmitted deltas; chroma U permits zero deltas and uses a different range.
+ReadPaletteColors :: (decoder: *RangeDecoder, size_cdf: []u16, size_context: s32,
+    cache: []u16, bit_depth: s32, chroma: bool, output: *PaletteBlock,
+    cancellation: *Cancellation = null) -> DecodeError {
+    if decoder == null || output == null { return Error(InvalidInput) }
+    output.count = 0
+    error := CancellationError(cancellation)
+    if error.code != DecodeOK { return error }
+    if size_cdf.count != 56 || size_context < 0 || size_context > 6 || cache.count < 0 || cache.count > 16 ||
+        (bit_depth != 8 && bit_depth != 10 && bit_depth != 12) { return Error(InvalidInput, decoder.bits.byte) }
+    maximum := cast(s32)((cast(u32)1 << cast(u32)bit_depth) - 1)
+    for i: 0..cache.count - 1 {
+        if cache[i] > maximum || (i > 0 && cache[i] <= cache[i - 1]) { return Error(InvalidInput, decoder.bits.byte) }
+    }
+    at := size_context * 8
+    count := ReadSymbol(decoder, size_cdf[at:at + 8]) + 2
+    if decoder.error.code != DecodeOK { return decoder.error }
+    index: s32
+    for i: 0..cache.count - 1 {
+        if index >= count { break }
+        selected := ReadLiteral(decoder, 1)
+        if selected != 0 { output.colors[index] = cache[i]; index += 1 }
+    }
+    if index < count { output.colors[index] = cast(u16)ReadLiteral(decoder, bit_depth); index += 1 }
+    bits: s32
+    if index < count { bits = bit_depth - 3 + cast(s32)ReadLiteral(decoder, 2) }
+    increment: s32 = ifx chroma then 0 else 1
+    while index < count {
+        delta := cast(s32)ReadLiteral(decoder, bits) + increment
+        value := cast(s32)output.colors[index - 1] + delta
+        if value > maximum { value = maximum }
+        output.colors[index] = cast(u16)value
+        remaining_bits := PaletteCeilLog2(maximum - value + 1 - increment)
+        if bits > remaining_bits { bits = remaining_bits }
+        index += 1
+    }
+    if decoder.error.code != DecodeOK { return decoder.error }
+    for i: 1..count - 1 {
+        color := output.colors[i]; position := i
+        while position > 0 && output.colors[position - 1] > color { output.colors[position] = output.colors[position - 1]; position -= 1 }
+        output.colors[position] = color
+    }
+    if chroma {
+        delta_encoded := ReadLiteral(decoder, 1)
+        if delta_encoded != 0 {
+            bits = bit_depth - 4 + cast(s32)ReadLiteral(decoder, 2)
+            output.v_colors[0] = cast(u16)ReadLiteral(decoder, bit_depth)
+            for i: 1..count - 1 {
+                delta := cast(s32)ReadLiteral(decoder, bits)
+                if delta != 0 && ReadLiteral(decoder, 1) != 0 { delta = -delta }
+                value := cast(s32)output.v_colors[i - 1] + delta
+                if value < 0 { value += maximum + 1 }
+                if value > maximum { value -= maximum + 1 }
+                output.v_colors[i] = cast(u16)value
+            }
+        } else {
+            for i: 0..count - 1 { output.v_colors[i] = cast(u16)ReadLiteral(decoder, bit_depth) }
+        }
+    }
+    if decoder.error.code != DecodeOK { return decoder.error }
+    error = CancellationError(cancellation)
+    if error.code != DecodeOK { return error }
+    output.count = count
+    return Error(DecodeOK)
+}
+
+// Shared normative Y/UV diagonal map; UV has its own adapted probabilities.
+// Count commits only after the complete map, extension and cancellation checks.
+ReadPaletteMap :: (decoder: *RangeDecoder, color_cdf: []u16, width: s32, height: s32,
+    onscreen_width: s32, onscreen_height: s32, output: *PaletteBlock,
+    cancellation: *Cancellation = null) -> DecodeError {
+    if decoder == null || output == null { return Error(InvalidInput) }
+    count := output.count; output.count = 0
+    error := CancellationError(cancellation)
+    if error.code != DecodeOK { return error }
+    if color_cdf.count != 315 || count < 2 || count > 8 || width < 4 || width > 64 || height < 4 || height > 64 ||
+        onscreen_width < 1 || onscreen_width > width || onscreen_height < 1 || onscreen_height > height { return Error(InvalidInput, decoder.bits.byte) }
+    output.indices[0] = cast(u8)ReadPaletteUniform(decoder, count)
+    if decoder.error.code != DecodeOK { return decoder.error }
+    for diagonal: 1..onscreen_height + onscreen_width - 2 {
+        error = CancellationError(cancellation)
+        if error.code != DecodeOK { return error }
+        column := ifx diagonal < onscreen_width then diagonal else onscreen_width - 1
+        last := ifx diagonal - onscreen_height + 1 > 0 then diagonal - onscreen_height + 1 else 0
+        while column >= last {
+            row := diagonal - column
+            context := PaletteColorContext(output.indices[:], 64, cast(s32)row, cast(s32)column, count)
+            if context.error.code != DecodeOK { return Error(context.error.code, decoder.bits.byte) }
+            at := (count - 2) * 45 + context.context * 9
+            symbol := ReadSymbol(decoder, color_cdf[at:at + count + 1])
+            if decoder.error.code != DecodeOK { return decoder.error }
+            output.indices[row * 64 + column] = context.order[symbol]
+            column -= 1
+        }
+    }
+    for row: 0..height - 1 {
+        error = CancellationError(cancellation)
+        if error.code != DecodeOK { return error }
+        if row < onscreen_height {
+            for column: onscreen_width..width - 1 { output.indices[row * 64 + column] = output.indices[row * 64 + onscreen_width - 1] }
+        } else {
+            for column: 0..width - 1 { output.indices[row * 64 + column] = output.indices[(onscreen_height - 1) * 64 + column] }
+        }
+    }
+    output.count = count
+    return Error(DecodeOK)
+}

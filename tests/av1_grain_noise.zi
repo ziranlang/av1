@@ -1,0 +1,46 @@
+#import, file "../src/grain/grain_noise.zi";
+#import, file "../src/grain/grain_params.zi";
+
+GrainNoiseEmpty :: (noise: GrainNoise) -> bool {
+    if noise.chroma_width != 0 || noise.chroma_height != 0 { return false }
+    for i: 0..5985 { if noise.y[i] != 0 || noise.cb[i] != 0 || noise.cr[i] != 0 { return false } }
+    return true
+}
+GrainNoiseBounds :: () -> s32 {
+    p: FilmGrainParams; p.apply_grain = true; p.num_y_points = 1
+    p.ar_coeff_shift = 6
+    if GenerateGrainNoise(p, true, 1, 1, 9).error.code != InvalidInput { return 1 }
+    if GenerateGrainNoise(p, true, -1, 1, 8).error.code != InvalidInput { return 2 }
+    p.random_seed = 65536
+    bad := GenerateGrainNoise(p, true, 1, 1, 8)
+    if bad.error.code != InvalidInput || !GrainNoiseEmpty(bad) { return 3 }
+    p.random_seed = 1; p.ar_coeff_lag = 4
+    if GenerateGrainNoise(p, true, 1, 1, 8).error.code != InvalidInput { return 4 }
+    p.ar_coeff_lag = 3; p.ar_coeffs_y[23] = -129
+    if GenerateGrainNoise(p, true, 1, 1, 8).error.code != InvalidInput { return 5 }
+    p.ar_coeffs_y[23] = 128
+    if GenerateGrainNoise(p, true, 1, 1, 8).error.code != InvalidInput { return 6 }
+    p.ar_coeffs_y[23] = 0; p.ar_coeff_shift = 10
+    if GenerateGrainNoise(p, true, 1, 1, 8).error.code != InvalidInput { return 7 }
+    p.ar_coeff_shift = 5
+    if GenerateGrainNoise(p, true, 1, 1, 8).error.code != InvalidInput { return 8 }
+    p.ar_coeff_shift = 6; p.grain_scale_shift = 4
+    if GenerateGrainNoise(p, true, 1, 1, 8).error.code != InvalidInput { return 9 }
+    p.grain_scale_shift = 0; p.num_cb_points = 1
+    if GenerateGrainNoise(p, true, 1, 1, 8).error.code != InvalidInput { return 10 }
+    if GenerateGrainNoise(p, false, 1, 1, 8).error.code != InvalidInput { return 11 }
+    p.num_cr_points = 1; p.ar_coeffs_cb[24] = 128
+    if GenerateGrainNoise(p, false, 1, 1, 8).error.code != InvalidInput { return 12 }
+    p.ar_coeffs_cb[24] = 0; p.ar_coeffs_cr[24] = -129
+    if GenerateGrainNoise(p, false, 1, 1, 8).error.code != InvalidInput { return 13 }
+    p.ar_coeffs_cr[24] = 0; p.chroma_scaling_from_luma = true
+    if GenerateGrainNoise(p, false, 1, 1, 8).error.code != InvalidInput { return 14 }
+    p.num_cb_points = 0; p.num_cr_points = 0; p.chroma_scaling_from_luma = false
+    token: Cancellation; Cancel(*token)
+    cancelled := GenerateGrainNoise(p, true, 1, 1, 8, *token)
+    if cancelled.error.code != DecodeCancelled || !GrainNoiseEmpty(cancelled) { return 15 }
+    p.apply_grain = false
+    absent := GenerateGrainNoise(p, true, 1, 1, 8)
+    if absent.error.code != DecodeOK || !GrainNoiseEmpty(absent) { return 16 }
+    return 0
+}

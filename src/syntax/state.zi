@@ -1,0 +1,73 @@
+#import, file "../grain/grain_params.zi";
+
+TileLayout :: struct {
+    columns: s32;
+    rows: s32;
+    column_log2: s32;
+    row_log2: s32;
+    column_starts: [65]s32;
+    row_starts: [65]s32;
+    context_update_tile_id: s32;
+    size_bytes: s32;
+}
+SegmentFeature :: struct { enabled: bool; value: s32; }
+
+// Parsed still-frame control state only. Plane ownership and tile contexts are
+// established by the reconstruction engine, not by these fixed-size records.
+StillFrameHeader :: struct {
+    frame_type: s32;
+    show_frame: bool;
+    error_resilient_mode: bool;
+    force_integer_mv: bool;
+    current_frame_id: u32;
+    frame_size_override: bool;
+    order_hint: u32;
+    primary_ref_frame: s32;
+    refresh_frame_flags: u32;
+    frame_presentation_time: u32;
+    buffer_removal_time_present: bool;
+    buffer_removal_times: [32]u32;
+    disable_frame_end_update_cdf: bool;
+    width: s32;
+    upscaled_width: s32;
+    height: s32;
+    render_width: s32;
+    render_height: s32;
+    superres_denominator: s32;
+    disable_cdf_update: bool;
+    allow_screen_content_tools: bool;
+    allow_intrabc: bool;
+    tiles: TileLayout;
+    base_q_idx: s32;
+    delta_q: [5]s32;
+    using_qmatrix: bool;
+    qm: [3]s32;
+    segmentation_enabled: bool;
+    features: [64]SegmentFeature;
+    segment_id_pre_skip: bool;
+    last_active_segment_id: s32;
+    delta_q_present: bool;
+    delta_q_res: s32;
+    delta_lf_present: bool;
+    delta_lf_res: s32;
+    delta_lf_multi: bool;
+    lossless: [8]bool;
+    coded_lossless: bool;
+    all_lossless: bool;
+    loop_filter_levels: [4]s32;
+    loop_filter_sharpness: s32;
+    loop_filter_delta_enabled: bool;
+    loop_filter_ref_deltas: [8]s32;
+    loop_filter_mode_deltas: [2]s32;
+    cdef_damping: s32;
+    cdef_bits: s32;
+    cdef_y_primary: [8]s32;
+    cdef_y_secondary: [8]s32;
+    cdef_uv_primary: [8]s32;
+    cdef_uv_secondary: [8]s32;
+    restoration_types: [3]s32;
+    restoration_sizes: [3]s32;
+    tx_mode: s32;
+    reduced_tx_set: bool;
+    grain_parameters: FilmGrainParams;
+}

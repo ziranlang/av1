@@ -1,0 +1,46 @@
+#import, file "../src/grain/grain_scaling.zi";
+
+GrainScalingBounds :: () -> s32 {
+    state: GrainRandom; state.register_value = 12345
+    if NextGrainRandom(null, 8).error.code != InvalidInput { return 1 }
+    if NextGrainRandom(*state, 0).error.code != InvalidInput || state.register_value != 12345 { return 2 }
+    if NextGrainRandom(*state, 17).error.code != InvalidInput || state.register_value != 12345 { return 3 }
+    state.register_value = 65536
+    if NextGrainRandom(*state, 8).error.code != InvalidInput || state.register_value != 65536 { return 4 }
+    state.register_value = 12345
+    token: Cancellation; Cancel(*token)
+    cancelled := NextGrainRandom(*state, 8, *token)
+    if cancelled.error.code != DecodeCancelled || cancelled.value != 0 || state.register_value != 12345 { return 5 }
+    points: [30]s32
+    if BuildGrainScaling(points[:1]).error.code != InvalidInput { return 6 }
+    if BuildGrainScaling(points[:]).error.code != InvalidInput { return 7 }
+    if BuildGrainScaling(points[:4]).error.code != InvalidInput { return 8 }
+    points[0] = -1
+    if BuildGrainScaling(points[:2]).error.code != InvalidInput { return 9 }
+    points[0] = 256
+    if BuildGrainScaling(points[:2]).error.code != InvalidInput { return 10 }
+    points[0] = 0; points[1] = 256
+    if BuildGrainScaling(points[:2]).error.code != InvalidInput { return 11 }
+    points[1] = -1
+    if BuildGrainScaling(points[:2]).error.code != InvalidInput { return 12 }
+    points[1] = 255
+    cancelled_lut := BuildGrainScaling(points[:2], *token)
+    if cancelled_lut.error.code != DecodeCancelled { return 13 }
+    for i: 0..255 { if cancelled_lut.samples[i] != 0 { return 14 } }
+    lut: [256]u16
+    if SampleGrainScaling(lut[:255], 0, 8).error.code != InvalidInput { return 15 }
+    if SampleGrainScaling(lut[:], -1, 8).error.code != InvalidInput { return 16 }
+    if SampleGrainScaling(lut[:], 256, 8).error.code != InvalidInput { return 17 }
+    if SampleGrainScaling(lut[:], 1024, 10).error.code != InvalidInput { return 18 }
+    if SampleGrainScaling(lut[:], 4096, 12).error.code != InvalidInput { return 19 }
+    if SampleGrainScaling(lut[:], 0, 9).error.code != InvalidInput { return 20 }
+    lut[0] = 256
+    bad := SampleGrainScaling(lut[:], 0, 8)
+    if bad.error.code != InvalidInput || bad.value != 0 { return 21 }
+    lut[0] = 0; lut[1] = 256
+    if SampleGrainScaling(lut[:], 1, 10).error.code != InvalidInput { return 22 }
+    // The final bin must never read a nonexistent neighbor at bin256.
+    lut[255] = 42
+    if SampleGrainScaling(lut[:], 4095, 12).value != 42 { return 23 }
+    return 0
+}

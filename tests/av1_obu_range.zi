@@ -1,0 +1,112 @@
+#import, file "../src/syntax/obu.zi";
+#import, file "../src/syntax/bits.zi";
+#import, file "../src/entropy/range.zi";
+
+#program_export
+main :: () -> s32 {
+    data: [10]u8 = .[0xaa, 0x31, 0x80, 0, 0, 0, 0, 0, 0, 0]
+    input := BorrowBytes(data[:])
+    bits := NewBits(input, 0, 2)
+    if ReadBits(*bits, 3) != 5 || ReadBits(*bits, 7) != 40 || ReadBits(*bits, 6) != 49 { return 1 }
+    if bits.byte != 2 || bits.bit != 0 { return 2 }
+    if ReadBits(*bits, 1) != 0 || bits.error.code != TruncatedInput || bits.error.offset != 2 { return 3 }
+    if bits.byte != 2 || ReadBits(*bits, 0) != 0 || bits.error.code != TruncatedInput { return 4 }
+    bits = NewBits(input, -1, 2)
+    if bits.error.code != InvalidInput { return 5 }
+    bits = NewBits(input, 2, 3)
+    if FinishBits(*bits).code != DecodeOK { return 6 }
+    bits = NewBits(input, 0, 1)
+    if FinishBits(*bits).code != MalformedInput { return 7 }
+    bits = NewBits(input, 2, 3)
+    if ReadBits(*bits, 1) != 1 || AlignBits(*bits).code != DecodeOK { return 8 }
+    bits = NewBits(input, 0, 1)
+    if ReadBits(*bits, 1) != 1 || AlignBits(*bits).code != MalformedInput { return 9 }
+    bits = NewBits(input, 0, 2)
+    if ReadBits(*bits, 33) != 0 || bits.error.code != InvalidInput || bits.byte != 0 { return 10 }
+
+    // Minimal and non-minimal eight-byte encodings are both AV1 syntax.
+    for i: 0..7 { data[i] = 0x80 }
+    data[7] = 0
+    leb := ReadLEB128(input, 0, 8)
+    if leb.error.code != DecodeOK || leb.value != 0 || leb.bytes != 8 || leb.next != 8 { return 11 }
+    data[7] = 128
+    leb = ReadLEB128(input, 0, 8)
+    if leb.error.code != MalformedInput || leb.error.offset != 7 { return 12 }
+    leb = ReadLEB128(input, 0, 7)
+    if leb.error.code != TruncatedInput || leb.error.offset != 7 { return 13 }
+    data[0] = 255; data[1] = 255; data[2] = 255; data[3] = 255; data[4] = 15
+    leb = ReadLEB128(input, 0, 5)
+    if leb.error.code != DecodeOK || leb.value != 4294967295 { return 14 }
+    data[4] = 16
+    leb = ReadLEB128(input, 0, 5)
+    if leb.error.code != MalformedInput || leb.error.offset != 4 { return 15 }
+
+    data[0] = 0x0e; data[1] = 0xb0; data[2] = 1; data[3] = 0x80
+    obu := ReadOBU(input, 0, 4)
+    if obu.error.code != DecodeOK || obu.obu.kind != Av1SequenceHeader || obu.obu.payload != 3 ||
+        obu.obu.end != 4 || obu.obu.temporal_id != 5 || obu.obu.spatial_id != 2 { return 16 }
+    obu = ReadOBU(input, 0, 3)
+    if obu.error.code != TruncatedInput || obu.error.offset != 3 { return 17 }
+    data[0] = 0x8e
+    if ReadOBU(input, 0, 4).error.code != MalformedInput { return 18 }
+    data[0] = 0x0f
+    if ReadOBU(input, 0, 4).error.code != MalformedInput { return 19 }
+    data[0] = 0x0e; data[1] = 0xb1
+    if ReadOBU(input, 0, 4).error.offset != 1 { return 20 }
+    data[0] = 0x08
+    if ReadOBU(input, 0, 4).error.code != MalformedInput { return 21 }
+    obu = ReadOBU(input, 0, 4, true)
+    if obu.error.code != DecodeOK || obu.obu.payload != 1 || obu.obu.end != 4 { return 22 }
+    data[0] = 0x12; data[1] = 0
+    obu = ReadOBU(input, 0, 4)
+    if obu.error.code != DecodeOK || obu.obu.end != 2 || obu.obu.kind != Av1TemporalDelimiter { return 23 }
+    if ReadOBU(input, 0, 4, true).error.code != MalformedInput { return 24 }
+    if ReadOBU(input, 4, 4).error.code != TruncatedInput || ReadOBU(input, -1, 4).error.code != InvalidInput { return 25 }
+
+    // Spec exit_symbol examples: actual entropy data followed by one and zeros.
+    data[0] = 0x20
+    decoder := NewRange(input, 0, 1)
+    if ReadBool(*decoder) != 0 || FinishRange(*decoder).code != DecodeOK { return 26 }
+    data[0] = 0xc0
+    decoder = NewRange(input, 0, 1)
+    if ReadBool(*decoder) != 1 || FinishRange(*decoder).code != DecodeOK { return 27 }
+    data[0] = 0
+    decoder = NewRange(input, 0, 1)
+    if ReadBool(*decoder) != 0 || FinishRange(*decoder).code != MalformedInput { return 28 }
+    data[0] = 0x21
+    decoder = NewRange(input, 0, 1)
+    if ReadBool(*decoder) != 0 || FinishRange(*decoder).code != MalformedInput { return 29 }
+    decoder = NewRange(input, 2, 2)
+    if decoder.error.code != TruncatedInput || decoder.error.offset != 2 { return 30 }
+    data[0] = 0
+    decoder = NewRange(input, 0, 1)
+    for i: 0..31 { discarded := ReadBool(*decoder) }
+    if decoder.error.code != TruncatedInput || decoder.error.offset != 1 { return 31 }
+    bad: [3]u16 = .[32769, 32768, 0]
+    decoder = NewRange(input, 0, 1)
+    if ReadSymbol(*decoder, bad[:]) != 0 || decoder.error.code != InvalidInput { return 32 }
+    bad[0] = 16384; bad[2] = 33
+    decoder = NewRange(input, 0, 1)
+    if ReadSymbol(*decoder, bad[:]) != 0 || decoder.error.code != InvalidInput { return 33 }
+    data[0] = 0xc0; bad[2] = 0
+    decoder = NewRange(input, 0, 1, true)
+    if ReadSymbol(*decoder, bad[:]) != 1 || bad[0] != 16384 || bad[2] != 0 { return 34 }
+    signed_data: [4]u8 = .[255,255,255,255]
+    for count: cast(s32)1..32 {
+        signed_bits := NewBits(BorrowBytes(signed_data[:]), 0, 4)
+        if ReadSignedBits(*signed_bits, count) != -1 || signed_bits.error.code != DecodeOK { return 35 }
+    }
+    signed_data[0] = 128; signed_data[1] = 0; signed_data[2] = 0; signed_data[3] = 0
+    for count: cast(s32)1..32 {
+        signed_bits := NewBits(BorrowBytes(signed_data[:]), 0, 4)
+        expected := -(cast(s64)1 << cast(s64)(count - 1))
+        if ReadSignedBits(*signed_bits, count) != expected || signed_bits.error.code != DecodeOK { return 36 }
+    }
+    counts: [9]u32 = .[1,2,3,4,5,255,256,257,4294967295]
+    for i: 0..3 { signed_data[i] = 255 }
+    for i: 0..8 {
+        ns_bits := NewBits(BorrowBytes(signed_data[:]), 0, 4)
+        if ReadNS(*ns_bits, counts[i]) != counts[i] - 1 || ns_bits.error.code != DecodeOK { return 37 }
+    }
+    return 0
+}

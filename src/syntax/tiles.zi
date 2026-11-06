@@ -1,0 +1,81 @@
+#import, file "./bits.zi";
+#import, file "./state.zi";
+
+#scope_file
+TileLog2 :: (block: s32, target: s32) -> s32 {
+    bits: s32
+    while block < target { block <<= 1; bits += 1 }
+    return bits
+}
+MinTile :: (a: s32, b: s32) -> s32 { return ifx a < b then a else b }
+MaxTile :: (a: s32, b: s32) -> s32 { return ifx a > b then a else b }
+
+#scope_export
+// AV1 tile_info(): fixed storage, at most 64 rows/columns. Units are 4x4 mi.
+// This is tile geometry, not an entropy decoder or worker scheduler.
+ReadTileLayout :: (bits: *BitReader, width: s32, height: s32, sb128: bool) -> TileLayout {
+    layout: TileLayout
+    if bits.error.code != DecodeOK { return layout }
+    if width < 1 || height < 1 || width > 32768 || height > 32768 { bits.error = Error(InvalidInput, bits.byte); return layout }
+    mi_cols := 2 * ((width + 7) >> 3); mi_rows := 2 * ((height + 7) >> 3)
+    shift: s32 = ifx sb128 then 5 else 4
+    sb_cols := (mi_cols + (1 << shift) - 1) >> shift
+    sb_rows := (mi_rows + (1 << shift) - 1) >> shift
+    max_width := 4096 >> (shift + 2)
+    max_area := 9437184 >> (2 * (shift + 2))
+    min_cols := TileLog2(max_width, sb_cols)
+    max_cols := TileLog2(1, MinTile(sb_cols, 64))
+    max_rows := TileLog2(1, MinTile(sb_rows, 64))
+    min_tiles := MaxTile(min_cols, TileLog2(max_area, sb_cols * sb_rows))
+    uniform := ReadBits(bits, 1) != 0
+    if uniform {
+        layout.column_log2 = min_cols
+        while layout.column_log2 < max_cols && ReadBits(bits, 1) != 0 { layout.column_log2 += 1 }
+        tile_width := (sb_cols + (1 << layout.column_log2) - 1) >> layout.column_log2
+        start: s32
+        while start < sb_cols {
+            if layout.columns >= 64 { bits.error = Error(MalformedInput, bits.byte); return layout }
+            layout.column_starts[layout.columns] = start << shift
+            layout.columns += 1; start += tile_width
+        }
+        layout.row_log2 = MaxTile(min_tiles - layout.column_log2, 0)
+        while layout.row_log2 < max_rows && ReadBits(bits, 1) != 0 { layout.row_log2 += 1 }
+        tile_height := (sb_rows + (1 << layout.row_log2) - 1) >> layout.row_log2
+        start = 0
+        while start < sb_rows {
+            if layout.rows >= 64 { bits.error = Error(MalformedInput, bits.byte); return layout }
+            layout.row_starts[layout.rows] = start << shift
+            layout.rows += 1; start += tile_height
+        }
+    } else {
+        start: s32
+        widest: s32
+        while start < sb_cols && bits.error.code == DecodeOK {
+            if layout.columns >= 64 { bits.error = Error(MalformedInput, bits.byte); return layout }
+            layout.column_starts[layout.columns] = start << shift
+            span := cast(s32)ReadNS(bits, cast(u32)MinTile(sb_cols - start, max_width)) + 1
+            widest = MaxTile(widest, span); start += span; layout.columns += 1
+        }
+        if bits.error.code != DecodeOK { return layout }
+        layout.column_log2 = TileLog2(1, layout.columns)
+        area := sb_rows * sb_cols
+        if min_tiles > 0 { area >>= min_tiles + 1 }
+        max_height := MaxTile(area / widest, 1)
+        start = 0
+        while start < sb_rows && bits.error.code == DecodeOK {
+            if layout.rows >= 64 { bits.error = Error(MalformedInput, bits.byte); return layout }
+            layout.row_starts[layout.rows] = start << shift
+            start += cast(s32)ReadNS(bits, cast(u32)MinTile(sb_rows - start, max_height)) + 1
+            layout.rows += 1
+        }
+        if bits.error.code != DecodeOK { return layout }
+        layout.row_log2 = TileLog2(1, layout.rows)
+    }
+    layout.column_starts[layout.columns] = mi_cols; layout.row_starts[layout.rows] = mi_rows
+    if layout.column_log2 > 0 || layout.row_log2 > 0 {
+        layout.context_update_tile_id = cast(s32)ReadBits(bits, layout.column_log2 + layout.row_log2)
+        layout.size_bytes = cast(s32)ReadBits(bits, 2) + 1
+        if bits.error.code == DecodeOK && layout.context_update_tile_id >= layout.rows * layout.columns { bits.error = Error(MalformedInput, bits.byte) }
+    }
+    return layout
+}

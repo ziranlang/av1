@@ -1,0 +1,140 @@
+#import, file "./grain_params.zi";
+#import, file "./grain_scaling.zi";
+#import, file "./gaussian.zi";
+using Codec :: #import "image_codec/api"
+
+// AV1 7.18.3.3 scalar Gaussian/AR reference. Every plane has fixed stride82;
+// luma is82x73, chroma is44/82 by38/73. Inactive cells/planes are zero.
+GrainNoise :: struct {
+    y: [5986]s16; cb: [5986]s16; cr: [5986]s16;
+    chroma_width: s32; chroma_height: s32; error: DecodeError;
+}
+
+#scope_file
+GrainNoiseRound :: (value: s64, shift: s32) -> s64 {
+    divisor := cast(s64)(cast(u64)1 << cast(u64)shift)
+    biased := value + divisor / 2
+    return ifx biased < 0 then -((-biased + divisor - 1) / divisor) else biased / divisor
+}
+GrainNoiseClip :: (value: s64, center: s32) -> s16 {
+    if value < -cast(s64)center { return cast(s16)-center }
+    if value >= center { return cast(s16)(center - 1) }
+    return cast(s16)value
+}
+GrainWhiteNoise :: (table: []s16, output: []s16, width: s32, height: s32,
+    active: bool, seed: u32, shift: s32, cancellation: *Cancellation) -> DecodeError {
+    if !active { return CancellationError(cancellation) }
+    random: GrainRandom; random.register_value = seed
+    for y: 0..height - 1 {
+        error := CancellationError(cancellation)
+        if error.code != DecodeOK { return error }
+        for x: 0..width - 1 {
+            value := NextGrainRandom(*random, 11, cancellation)
+            if value.error.code != DecodeOK { return value.error }
+            output[y * 82 + x] = cast(s16)GrainNoiseRound(cast(s64)table[value.value], shift)
+        }
+    }
+    return CancellationError(cancellation)
+}
+
+#scope_export
+GenerateGrainNoise :: (parameters: FilmGrainParams, monochrome: bool,
+    subsampling_x: s32, subsampling_y: s32, bit_depth: s32,
+    cancellation: *Cancellation = null) -> GrainNoise {
+    result: GrainNoise
+    result.error = CancellationError(cancellation)
+    if result.error.code != DecodeOK { return result }
+    if (bit_depth != 8 && bit_depth != 10 && bit_depth != 12) || subsampling_x < 0 || subsampling_x > 1 ||
+        subsampling_y < 0 || subsampling_y > 1 { result.error = Error(InvalidInput); return result }
+    if !parameters.apply_grain { return result }
+    if parameters.random_seed > 65535 || parameters.num_y_points < 0 || parameters.num_y_points > 14 ||
+        parameters.num_cb_points < 0 || parameters.num_cb_points > 10 || parameters.num_cr_points < 0 || parameters.num_cr_points > 10 ||
+        parameters.ar_coeff_lag < 0 || parameters.ar_coeff_lag > 3 || parameters.ar_coeff_shift < 6 || parameters.ar_coeff_shift > 9 ||
+        parameters.grain_scale_shift < 0 || parameters.grain_scale_shift > 3 ||
+        (monochrome && (parameters.num_cb_points != 0 || parameters.num_cr_points != 0 || parameters.chroma_scaling_from_luma)) ||
+        (parameters.chroma_scaling_from_luma && (parameters.num_cb_points != 0 || parameters.num_cr_points != 0)) {
+        result.error = Error(InvalidInput); return result
+    }
+    if !monochrome && subsampling_x == 1 && subsampling_y == 1 &&
+        (((parameters.num_cb_points == 0) != (parameters.num_cr_points == 0)) ||
+         (parameters.num_y_points == 0 && (parameters.num_cb_points != 0 || parameters.num_cr_points != 0))) {
+        result.error = Error(InvalidInput); return result
+    }
+    luma_count := 2 * parameters.ar_coeff_lag * (parameters.ar_coeff_lag + 1)
+    chroma_count := luma_count
+    if parameters.num_y_points > 0 { chroma_count += 1 }
+    for i: 0..luma_count - 1 {
+        if parameters.num_y_points > 0 && (parameters.ar_coeffs_y[i] < -128 || parameters.ar_coeffs_y[i] > 127) {
+            result.error = Error(InvalidInput); return result
+        }
+    }
+    cb_active := !monochrome && (parameters.num_cb_points > 0 || parameters.chroma_scaling_from_luma)
+    cr_active := !monochrome && (parameters.num_cr_points > 0 || parameters.chroma_scaling_from_luma)
+    for i: 0..chroma_count - 1 {
+        if (cb_active && (parameters.ar_coeffs_cb[i] < -128 || parameters.ar_coeffs_cb[i] > 127)) ||
+            (cr_active && (parameters.ar_coeffs_cr[i] < -128 || parameters.ar_coeffs_cr[i] > 127)) {
+            result.error = Error(InvalidInput); return result
+        }
+    }
+    table := Av1GaussianSequence()
+    y_grain: [5986]s16; cb_grain: [5986]s16; cr_grain: [5986]s16
+    shift := 12 - bit_depth + parameters.grain_scale_shift
+    width: s32 = ifx subsampling_x == 1 then 44 else 82
+    height: s32 = ifx subsampling_y == 1 then 38 else 73
+    result.error = GrainWhiteNoise(table[:], y_grain[:], 82, 73, parameters.num_y_points > 0, parameters.random_seed, shift, cancellation)
+    if result.error.code != DecodeOK { return result }
+    center := cast(s32)(cast(u32)128 << cast(u32)(bit_depth - 8))
+    lag := parameters.ar_coeff_lag
+    if parameters.num_y_points > 0 { for y: 3..72 {
+        result.error = CancellationError(cancellation)
+        if result.error.code != DecodeOK { return result }
+        for x: 3..78 {
+            sum: s64; position: s32
+            for row: 0..lag { for column: 0..2 * lag {
+                dy := cast(s32)row - lag; dx := cast(s32)column - lag
+                if dy == 0 && dx == 0 { break }
+                sum += cast(s64)parameters.ar_coeffs_y[position] * y_grain[(y + dy) * 82 + x + dx]
+                position += 1
+            } }
+            y_grain[y * 82 + x] = GrainNoiseClip(cast(s64)y_grain[y * 82 + x] + GrainNoiseRound(sum, parameters.ar_coeff_shift), center)
+        }
+    } }
+    if !monochrome {
+        result.error = GrainWhiteNoise(table[:], cb_grain[:], width, height, cb_active, parameters.random_seed ^ 46372, shift, cancellation)
+        if result.error.code != DecodeOK { return result }
+        result.error = GrainWhiteNoise(table[:], cr_grain[:], width, height, cr_active, parameters.random_seed ^ 18904, shift, cancellation)
+        if result.error.code != DecodeOK { return result }
+        for y: 3..height - 1 {
+            result.error = CancellationError(cancellation)
+            if result.error.code != DecodeOK { return result }
+            for x: 3..width - 4 {
+                sum_cb: s64; sum_cr: s64; position: s32
+                for row: 0..lag { for column: 0..2 * lag {
+                    dy := cast(s32)row - lag; dx := cast(s32)column - lag
+                    if dy == 0 && dx == 0 {
+                        if parameters.num_y_points > 0 {
+                            luma: s64
+                            luma_x := (x - 3) * (1 + subsampling_x) + 3
+                            luma_y := (y - 3) * (1 + subsampling_y) + 3
+                            for sy: 0..subsampling_y { for sx: 0..subsampling_x { luma += y_grain[(luma_y + sy) * 82 + luma_x + sx] } }
+                            luma = GrainNoiseRound(luma, subsampling_x + subsampling_y)
+                            sum_cb += luma * parameters.ar_coeffs_cb[position]
+                            sum_cr += luma * parameters.ar_coeffs_cr[position]
+                        }
+                        break
+                    }
+                    sum_cb += cast(s64)parameters.ar_coeffs_cb[position] * cb_grain[(y + dy) * 82 + x + dx]
+                    sum_cr += cast(s64)parameters.ar_coeffs_cr[position] * cr_grain[(y + dy) * 82 + x + dx]
+                    position += 1
+                } }
+                if cb_active { cb_grain[y * 82 + x] = GrainNoiseClip(cast(s64)cb_grain[y * 82 + x] + GrainNoiseRound(sum_cb, parameters.ar_coeff_shift), center) }
+                if cr_active { cr_grain[y * 82 + x] = GrainNoiseClip(cast(s64)cr_grain[y * 82 + x] + GrainNoiseRound(sum_cr, parameters.ar_coeff_shift), center) }
+            }
+        }
+    }
+    result.error = CancellationError(cancellation)
+    if result.error.code != DecodeOK { return result }
+    result.y = y_grain; result.cb = cb_grain; result.cr = cr_grain
+    if !monochrome { result.chroma_width = width; result.chroma_height = height }
+    return result
+}

@@ -1,0 +1,227 @@
+#import, file "./grain_params.zi";
+#import, file "./grain_noise.zi";
+#import, file "./grain_scaling.zi";
+using Codec :: #import "image_codec/api"
+
+// Source-domain sample planes that ApplyFilmGrain updates in place. Strides
+// are samples, not bytes. Monochrome pictures use Y alone.
+GrainPlanes :: struct {
+    y: []u16; u: []u16; v: []u16; y_stride: s64; chroma_stride: s64;
+    width: s32; height: s32; monochrome: bool; subsampling_x: s32;
+    subsampling_y: s32; bit_depth: s32; matrix_identity: bool;
+}
+
+// One noise-stripe row: 32 columns per 32x32 luma grain block plus the last
+// block's two-column overlap.
+GrainStripeColumns :: (width: s32) -> s64 {
+    if width < 1 { return 0 }
+    return cast(s64)(((width + 1) / 2 + 15) / 16) * 32 + 2
+}
+// Caller-owned s16 scratch for ApplyFilmGrain: per plane, the current 34-row
+// noise stripe and the two rows the previous stripe overlaps into it.
+GrainScratchCount :: (width: s32) -> s64 { return 3 * 36 * GrainStripeColumns(width) }
+
+#scope_file
+GrainApplyFloor :: (value: s64, divisor: s64) -> s64 {
+    return ifx value < 0 then -((-value + divisor - 1) / divisor) else value / divisor
+}
+GrainApplyRound :: (value: s64, shift: s32) -> s64 {
+    divisor := cast(s64)(cast(u64)1 << cast(u64)shift)
+    return GrainApplyFloor(value + divisor / 2, divisor)
+}
+GrainApplyClip :: (value: s64, minimum: s64, maximum: s64) -> s64 {
+    if value < minimum { return minimum }; if value > maximum { return maximum }; return value
+}
+// Division-only check that (height-1)*stride+width samples fit count.
+GrainPlaneFits :: (count: s64, width: s32, height: s32, stride: s64) -> bool {
+    if width < 1 || height < 1 || stride < width || count < width { return false }
+    return cast(s64)(height - 1) <= (count - width) / stride
+}
+// Stripe-relative noise at (row, x), blended with the previous stripe's two
+// carried rows when vertical overlap applies (7.18.3.5 noise image).
+GrainStripeSample :: (scratch: []s16, base: s64, columns: s64, row: s64, x: s64,
+    sub_y: s32, overlap: bool, center: s32) -> s64 {
+    value := cast(s64)scratch[base + row * columns + x]
+    if overlap && row < 2 / (1 + sub_y) {
+        old := cast(s64)scratch[base + (34 + row) * columns + x]
+        if sub_y == 1 { value = old * 23 + value * 22 }
+        else if row == 0 { value = old * 27 + value * 17 }
+        else { value = old * 17 + value * 27 }
+        value = GrainApplyClip(GrainApplyRound(value, 5), -cast(s64)center, cast(s64)center - 1)
+    }
+    return value
+}
+
+#scope_export
+// AV1 7.18.3.5 in place over the whole picture, one 32-row luma stripe at a
+// time: grain blocks with horizontal and vertical overlap, chroma scaling from
+// the original luma, signed chroma mixing and full/restricted clipping.
+// Geometry, parameters and scratch are validated before the first write. A
+// sample above the bit depth or a cancellation returns an error with the
+// planes partly updated; callers then discard them.
+ApplyFilmGrain :: (picture: GrainPlanes, parameters: FilmGrainParams, scratch: []s16,
+    cancellation: *Cancellation = null) -> DecodeError {
+    error := CancellationError(cancellation)
+    if error.code != DecodeOK { return error }
+    width := picture.width; height := picture.height
+    if (picture.bit_depth != 8 && picture.bit_depth != 10 && picture.bit_depth != 12) ||
+        picture.subsampling_x < 0 || picture.subsampling_x > 1 || picture.subsampling_y < 0 || picture.subsampling_y > 1 ||
+        !GrainPlaneFits(picture.y.count, width, height, picture.y_stride) {
+        return Error(InvalidInput)
+    }
+    sub_x := picture.subsampling_x; sub_y := picture.subsampling_y
+    chroma_width := (width + sub_x) / (1 + sub_x)
+    chroma_height := (height + sub_y) / (1 + sub_y)
+    if !picture.monochrome && (!GrainPlaneFits(picture.u.count, chroma_width, chroma_height, picture.chroma_stride) ||
+        !GrainPlaneFits(picture.v.count, chroma_width, chroma_height, picture.chroma_stride)) {
+        return Error(InvalidInput)
+    }
+    if !parameters.apply_grain { return CancellationError(cancellation) }
+    if parameters.scaling_shift < 8 || parameters.scaling_shift > 11 ||
+        parameters.cb_mult < 0 || parameters.cb_mult > 255 || parameters.cb_luma_mult < 0 || parameters.cb_luma_mult > 255 ||
+        parameters.cb_offset < 0 || parameters.cb_offset > 511 || parameters.cr_mult < 0 || parameters.cr_mult > 255 ||
+        parameters.cr_luma_mult < 0 || parameters.cr_luma_mult > 255 || parameters.cr_offset < 0 || parameters.cr_offset > 511 {
+        return Error(InvalidInput)
+    }
+    columns := GrainStripeColumns(width)
+    if scratch.count < GrainScratchCount(width) { return Error(InvalidInput) }
+    noise := GenerateGrainNoise(parameters, picture.monochrome, sub_x, sub_y, picture.bit_depth, cancellation)
+    if noise.error.code != DecodeOK { return noise.error }
+    y_lut := BuildGrainScaling(parameters.scaling_points_y[:parameters.num_y_points * 2], cancellation)
+    if y_lut.error.code != DecodeOK { return y_lut.error }
+    u_lut := y_lut; v_lut := y_lut
+    if !picture.monochrome && !parameters.chroma_scaling_from_luma {
+        u_lut = BuildGrainScaling(parameters.scaling_points_cb[:parameters.num_cb_points * 2], cancellation)
+        if u_lut.error.code != DecodeOK { return u_lut.error }
+        v_lut = BuildGrainScaling(parameters.scaling_points_cr[:parameters.num_cr_points * 2], cancellation)
+        if v_lut.error.code != DecodeOK { return v_lut.error }
+    }
+    maximum := cast(s64)((cast(u64)1 << cast(u64)picture.bit_depth) - 1)
+    center := cast(s32)((maximum + 1) / 2)
+    depth_scale := cast(s64)(cast(u64)1 << cast(u64)(picture.bit_depth - 8))
+    minimum: s64; max_luma := maximum; max_chroma := maximum
+    if parameters.clip_to_restricted_range {
+        minimum = 16 * depth_scale; max_luma = 235 * depth_scale
+        max_chroma = (ifx picture.matrix_identity then 235 else 240) * depth_scale
+    }
+    luma := picture.y; cb := picture.u; cr := picture.v
+    last_plane: s32 = ifx picture.monochrome then 0 else 2
+    blocks := ((width + 1) / 2 + 15) / 16
+    stripes := ((height + 1) / 2 + 15) / 16
+    for stripe: 0..stripes - 1 {
+        error = CancellationError(cancellation)
+        if error.code != DecodeOK { return error }
+        random: GrainRandom; random.register_value = (parameters.random_seed ^
+            (cast(u32)((stripe * 37 + 178) & 255) << 8) ^ cast(u32)((stripe * 173 + 105) & 255))
+        for block: 0..blocks - 1 {
+            offset := NextGrainRandom(*random, 8, cancellation)
+            if offset.error.code != DecodeOK { return offset.error }
+            offset_x := offset.value / 16; offset_y := offset.value & 15
+            for plane: 0..last_plane {
+                plane_sub_x: s32; plane_sub_y: s32; source := noise.y[:]
+                if plane > 0 {
+                    plane_sub_x = sub_x; plane_sub_y = sub_y
+                    source = ifx plane == 1 then noise.cb[:] else noise.cr[:]
+                }
+                base := cast(s64)plane * 36 * columns
+                first_column := cast(s64)block * (32 / (1 + plane_sub_x))
+                start_x: s32 = ifx plane_sub_x == 1 then 6 + offset_x else 9 + offset_x * 2
+                start_y: s32 = ifx plane_sub_y == 1 then 6 + offset_y else 9 + offset_y * 2
+                for row: 0..34 / (1 + plane_sub_y) - 1 {
+                    for column: 0..34 / (1 + plane_sub_x) - 1 {
+                        at := base + row * columns + first_column + column
+                        value := cast(s64)source[(start_y + row) * 82 + start_x + column]
+                        if parameters.overlap_flag && block > 0 && column < 2 / (1 + plane_sub_x) {
+                            old := cast(s64)scratch[at]
+                            if plane_sub_x == 1 { value = old * 23 + value * 22 }
+                            else if column == 0 { value = old * 27 + value * 17 }
+                            else { value = old * 17 + value * 27 }
+                            value = GrainApplyClip(GrainApplyRound(value, 5), -cast(s64)center, cast(s64)center - 1)
+                        }
+                        scratch[at] = cast(s16)value
+                    }
+                }
+            }
+        }
+        vertical := parameters.overlap_flag && stripe > 0
+        // Chroma first: it scales from the original luma of this stripe.
+        if !picture.monochrome {
+            rows := 32 / (1 + sub_y)
+            first := cast(s64)stripe * rows
+            last := first + rows - 1
+            if last > chroma_height - 1 { last = chroma_height - 1 }
+            for y: first..last {
+                error = CancellationError(cancellation)
+                if error.code != DecodeOK { return error }
+                luma_row := y * (1 + sub_y) * picture.y_stride
+                for x: 0..chroma_width - 1 {
+                    luma_x := x * (1 + sub_x)
+                    average := cast(s64)luma[luma_row + luma_x]
+                    if average > maximum { return Error(InvalidInput) }
+                    if sub_x == 1 {
+                        next_x := luma_x + 1; if next_x >= width { next_x = width - 1 }
+                        next := cast(s64)luma[luma_row + next_x]
+                        if next > maximum { return Error(InvalidInput) }
+                        average = GrainApplyRound(average + next, 1)
+                    }
+                    at := y * picture.chroma_stride + x
+                    for plane: 1..2 {
+                        target := ifx plane == 1 then cb else cr
+                        original := cast(s64)target[at]
+                        if original > maximum { return Error(InvalidInput) }
+                        if !parameters.chroma_scaling_from_luma &&
+                            ((plane == 1 && parameters.num_cb_points == 0) || (plane == 2 && parameters.num_cr_points == 0)) { continue }
+                        lut := u_lut.samples[:]
+                        multiplier := parameters.cb_mult; luma_multiplier := parameters.cb_luma_mult; mix_offset := parameters.cb_offset
+                        if plane == 2 {
+                            lut = v_lut.samples[:]
+                            multiplier = parameters.cr_mult; luma_multiplier = parameters.cr_luma_mult; mix_offset = parameters.cr_offset
+                        }
+                        merged := average
+                        if !parameters.chroma_scaling_from_luma {
+                            combined := average * (luma_multiplier - 128) + original * (multiplier - 128)
+                            merged = GrainApplyClip(GrainApplyFloor(combined, 64) + (mix_offset - 256) * depth_scale, 0, maximum)
+                        }
+                        sampled := SampleGrainScaling(lut, cast(s32)merged, picture.bit_depth)
+                        if sampled.error.code != DecodeOK { return sampled.error }
+                        grain := GrainStripeSample(scratch, cast(s64)plane * 36 * columns, columns, y - first, x, sub_y, vertical, center)
+                        delta := GrainApplyRound(cast(s64)sampled.value * grain, parameters.scaling_shift)
+                        target[at] = cast(u16)GrainApplyClip(original + delta, minimum, max_chroma)
+                    }
+                }
+            }
+        }
+        first := cast(s64)stripe * 32
+        last := first + 31
+        if last > height - 1 { last = height - 1 }
+        for y: first..last {
+            error = CancellationError(cancellation)
+            if error.code != DecodeOK { return error }
+            for x: 0..width - 1 {
+                at := y * picture.y_stride + x
+                original := cast(s64)luma[at]
+                if original > maximum { return Error(InvalidInput) }
+                if parameters.num_y_points == 0 { continue }
+                sampled := SampleGrainScaling(y_lut.samples[:], cast(s32)original, picture.bit_depth)
+                if sampled.error.code != DecodeOK { return sampled.error }
+                grain := GrainStripeSample(scratch, 0, columns, y - first, x, 0, vertical, center)
+                delta := GrainApplyRound(cast(s64)sampled.value * grain, parameters.scaling_shift)
+                luma[at] = cast(u16)GrainApplyClip(original + delta, minimum, max_luma)
+            }
+        }
+        // Carry rows 32-33 (16 when vertically subsampled) into the next stripe.
+        if parameters.overlap_flag {
+            for plane: 0..last_plane {
+                plane_sub_y: s32 = ifx plane > 0 then sub_y else 0
+                base := cast(s64)plane * 36 * columns
+                rows := 32 / (1 + plane_sub_y)
+                for row: 0..2 / (1 + plane_sub_y) - 1 {
+                    for column: 0..columns - 1 {
+                        scratch[base + (34 + row) * columns + column] = scratch[base + (rows + row) * columns + column]
+                    }
+                }
+            }
+        }
+    }
+    return CancellationError(cancellation)
+}

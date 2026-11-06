@@ -1,0 +1,25 @@
+#import, file "../src/entropy/coefficient_scan.zi";
+
+ScanBoundaries :: () -> s32 {
+    invalid: [8]s32 = .[-2147483648,-1,0,3,5,12,128,2147483647]
+    for i: 0..7 {
+        if BuildCoefficientScan(invalid[i], 4, 0).error.code != InvalidInput { return 1 }
+        if BuildCoefficientScan(4, invalid[i], 0).error.code != InvalidInput { return 2 }
+    }
+    if BuildCoefficientScan(4, 32, 0).error.code != InvalidInput { return 3 }
+    if BuildCoefficientScan(32, 4, 0).error.code != InvalidInput { return 4 }
+    if BuildCoefficientScan(4, 4, -1).error.code != InvalidInput { return 5 }
+    if BuildCoefficientScan(4, 4, 3).error.code != InvalidInput { return 6 }
+    if BuildCoefficientScan(16, 32, 1).error.code != InvalidInput { return 7 }
+    if BuildCoefficientScan(32, 16, 2).error.code != InvalidInput { return 8 }
+    if BuildCoefficientScan(64, 64, 1).error.code != InvalidInput { return 9 }
+    if BuildCoefficientScan(64, 64, 2).error.code != InvalidInput { return 10 }
+    failed := BuildCoefficientScan(0, 4, 0)
+    if failed.count != 0 || failed.coded_width != 0 || failed.coded_height != 0 { return 11 }
+    for i: 0..1023 { if failed.positions[i] != 0 || failed.inverse[i] != 0 { return 12 } }
+    token: Cancellation; Cancel(*token)
+    cancelled := BuildCoefficientScan(32, 32, 0, *token)
+    if cancelled.error.code != DecodeCancelled || cancelled.count != 0 || cancelled.coded_width != 0 || cancelled.coded_height != 0 { return 13 }
+    for i: 0..1023 { if cancelled.positions[i] != 0 || cancelled.inverse[i] != 0 { return 14 } }
+    return 0
+}

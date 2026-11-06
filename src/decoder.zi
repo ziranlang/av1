@@ -1,0 +1,246 @@
+#import, file "./syntax/obu.zi";
+#import, file "./syntax/headers.zi";
+#import, file "./syntax/frame.zi";
+#import, file "./syntax/profile.zi";
+#import, file "./syntax/state.zi";
+#import, file "./grain/grain_apply.zi";
+#import, file "./decode/intra_frame.zi";
+#import, file "./decode/tile_walk.zi";
+#import, file "./filter/post_filter.zi";
+using Codec :: #import "image_codec/api"
+
+// Owned source-domain samples, independent of the encoded input. Monochrome
+// returns Y alone; color returns independent Y/U/V planes of the source depth.
+Av1YUVResult :: struct {
+    is_ok: bool;
+    sequence: SequenceHeader;
+    frame: StillFrameHeader;
+    y: Plane;
+    u: Plane;
+    v: Plane;
+    error: DecodeError;
+}
+Av1Failure :: (error: DecodeError) -> Av1YUVResult {
+    result: Av1YUVResult
+    result.error = error
+    if error.code == DecodeOK { result.error = Error(InvalidInput) }
+    return result
+}
+
+// Conservative bound for the fixed control records, header copies and film
+// grain arrays on this path, excluding the borrowed input, caller-owned output
+// and the frame planes/mode records reserved separately from the frame header.
+// This is not a process RSS claim.
+Av1StillWorkingBytes :: 1048576;
+
+// Authored scalar subset, not a full AV1 engine: 8/10/12-bit mono/420/422/444
+// shown KEY frames with intra tools, palette, CfL, filter intra, lossy and
+// lossless transforms, segmentation, delta q/lf, multiple tiles, deblocking,
+// CDEF, loop restoration and film grain. Superres, quantizer matrices and
+// intra block copy reject explicitly; no bridge or native decoder is called.
+// Do not switch the AVIF default until the full required frame/plane corpus
+// passes.
+// Film grain in place over the filtered frame planes, whole picture.
+ApplyIntraFrameGrain :: (samples: []u16, scratch: []s16, intra: *IntraFrame, sequence: *SequenceHeader,
+    frame: *StillFrameHeader, cancellation: *Cancellation) -> DecodeError {
+    planes: GrainPlanes
+    luma_count := cast(s64)intra.plane_stride[0] * intra.plane_rows[0]
+    planes.y = samples[intra.plane_offset[0]:intra.plane_offset[0] + luma_count]
+    if !sequence.monochrome {
+        chroma_count := cast(s64)intra.plane_stride[1] * intra.plane_rows[1]
+        planes.u = samples[intra.plane_offset[1]:intra.plane_offset[1] + chroma_count]
+        planes.v = samples[intra.plane_offset[2]:intra.plane_offset[2] + chroma_count]
+        planes.chroma_stride = intra.plane_stride[1]
+    }
+    planes.y_stride = intra.plane_stride[0]
+    planes.width = frame.width; planes.height = frame.height; planes.monochrome = sequence.monochrome
+    planes.subsampling_x = sequence.subsampling_x; planes.subsampling_y = sequence.subsampling_y
+    planes.bit_depth = sequence.bit_depth; planes.matrix_identity = sequence.matrix_coefficients == 0
+    return ApplyFilmGrain(planes, frame.grain_parameters, scratch, cancellation)
+}
+
+DecodeAv1YUV :: (input: BorrowedBytes, options: *DecodeOptions) -> Av1YUVResult {
+    error := ValidateOptions(options)
+    if error.code != DecodeOK { return Av1Failure(error) }
+    if options.color_mode != StrictColor { return Av1Failure(Error(UnsupportedCapability)) }
+    error = ValidateInputSize(input.data.count, options.limits)
+    if error.code != DecodeOK { return Av1Failure(error) }
+    error = ValidateDecodedFrames(1, options.limits)
+    if error.code != DecodeOK { return Av1Failure(error) }
+    local_budget := NewWorkerBudget(options.limits)
+    budget := options.workers
+    if budget == null { budget = *local_budget }
+    error = AcquireWorker(budget, options.cancellation)
+    if error.code != DecodeOK { return Av1Failure(error) }
+    defer { unused ReleaseWorker(budget) }
+    error = ReserveWorkingBytes(budget, Av1StillWorkingBytes, options.cancellation)
+    if error.code != DecodeOK { return Av1Failure(error) }
+    defer { unused ReleaseWorkingBytes(budget, Av1StillWorkingBytes) }
+    sequence: SequenceHeader
+    frame: StillFrameHeader
+    // Owned planes and mode records drop on every return path.
+    intra: IntraFrame
+    samples: Vec(u16)
+    // Post-filter frames, allocated only when the filter is not the identity.
+    cdef_samples: Vec(u16)
+    restored: Vec(u16)
+    // Film-grain noise stripes, allocated only when grain applies.
+    grain_scratch: Vec(s16)
+    empty: []u16
+    reserved: s64
+    defer { if reserved > 0 { unused ReleaseWorkingBytes(budget, reserved) } }
+    // As libaom's OBU loop: operating point 0 selects layers, a frame is a
+    // frame header followed by tile groups (an OBU_FRAME carries all tiles),
+    // redundant copies must match and reserved OBUs are skipped.
+    have_sequence := false; have_frame := false; pending := false
+    operating_idc: s32
+    header_begin: s64; header_bytes: s64
+    at: s64
+    count: s32
+    while at < input.data.count {
+        error = CancellationError(options.cancellation)
+        if error.code != DecodeOK { return Av1Failure(error) }
+        if count >= 4096 { return Av1Failure(Error(LimitExceeded, at)) }
+        obu := ReadOBU(input, at, input.data.count)
+        if obu.error.code != DecodeOK { return Av1Failure(obu.error) }
+        item := obu.obu
+        at = item.end; count += 1
+        if item.kind != Av1SequenceHeader && item.kind != Av1TemporalDelimiter && operating_idc != 0 && item.has_extension {
+            if ((operating_idc >> item.temporal_id) & 1) == 0 || ((operating_idc >> (item.spatial_id + 8)) & 1) == 0 { continue }
+        }
+        tiles_begin: s64 = -1
+        if item.kind == Av1SequenceHeader {
+            if have_sequence || have_frame || pending { return Av1Failure(Error(UnsupportedCapability, item.start)) }
+            parsed := ParseSequenceHeader(input, item.payload, item.end, options.limits)
+            if parsed.error.code != DecodeOK { return Av1Failure(parsed.error) }
+            sequence = parsed.header; have_sequence = true
+            operating_idc = sequence.operating_points[0].idc
+        } else if item.kind == Av1RedundantFrameHeader {
+            if !pending { return Av1Failure(Error(MalformedInput, item.start)) }
+            if item.end - item.payload < header_bytes { return Av1Failure(Error(MalformedInput, item.start)) }
+            for i: 0..header_bytes - 1 {
+                if input.data[item.payload + i] != input.data[header_begin + i] { return Av1Failure(Error(MalformedInput, item.payload + i)) }
+            }
+        } else if item.kind == Av1Frame || item.kind == Av1FrameHeader {
+            if pending { return Av1Failure(Error(MalformedInput, item.start)) }
+            if !have_sequence { return Av1Failure(Error(MalformedInput, item.start)) }
+            if have_frame { return Av1Failure(Error(UnsupportedCapability, item.start)) }
+            combined := item.kind == Av1Frame
+            parsed := ParseStillFrameHeader(input, item.payload, item.end, sequence, options.limits, combined)
+            if parsed.error.code != DecodeOK { return Av1Failure(parsed.error) }
+            frame = parsed.header
+            header_begin = item.payload
+            header_bytes = ifx combined then parsed.next - item.payload else item.end - item.payload
+            error = IntraFrameSupported(*sequence, *frame)
+            if error.code != DecodeOK { return Av1Failure(Error(error.code, item.payload)) }
+            error = PrepareIntraFrame(*intra, *sequence, *frame)
+            if error.code != DecodeOK { return Av1Failure(error) }
+            grain_count: s64
+            if frame.grain_parameters.apply_grain { grain_count = GrainScratchCount(frame.width) }
+            error = ReserveWorkingBytes(budget, intra.working_bytes + grain_count * 2, options.cancellation)
+            if error.code != DecodeOK { return Av1Failure(error) }
+            reserved = intra.working_bytes + grain_count * 2
+            if !VecResizeBounded(samples, intra.sample_count, intra.sample_count) { return Av1Failure(Error(AllocationFailed)) }
+            error = AllocateIntraFrame(*intra)
+            if error.code != DecodeOK { return Av1Failure(error) }
+            pending = true
+            if combined { tiles_begin = parsed.next }
+        } else if item.kind == Av1TileGroup {
+            if !pending { return Av1Failure(Error(MalformedInput, item.start)) }
+            tiles_begin = item.payload
+        } else if item.kind == Av1TemporalDelimiter {
+            if pending { return Av1Failure(Error(MalformedInput, item.start)) }
+            if have_frame { return Av1Failure(Error(UnsupportedCapability, item.start)) }
+            if item.payload != item.end { return Av1Failure(Error(MalformedInput, item.payload)) }
+        } else if item.kind == Av1Padding {
+            // A non-empty padding payload ends in a 0x80 trailing byte.
+            if item.end > item.payload {
+                last := item.end - 1
+                while last > item.payload && input.data[last] == 0 { last -= 1 }
+                if input.data[last] != 128 { return Av1Failure(Error(MalformedInput, last)) }
+            }
+        } else if item.kind == Av1Metadata || item.kind == Av1TileList {
+            return Av1Failure(Error(UnsupportedCapability, item.start))
+        } else {
+            // Reserved OBU types are ignored; a payload needs a nonzero byte.
+            if item.end > item.payload {
+                last := item.end - 1
+                while last > item.payload && input.data[last] == 0 { last -= 1 }
+                if input.data[last] == 0 { return Av1Failure(Error(MalformedInput, item.payload)) }
+            }
+        }
+        if tiles_begin < 0 { continue }
+        error = DecodeIntraFrameTiles(*intra, VecSlice(samples, 0, samples.count), *sequence, *frame,
+            input, tiles_begin, item.end, options.cancellation, item.kind == Av1Frame)
+        if error.code != DecodeOK { return Av1Failure(error) }
+        if intra.tiles_decoded < frame.tiles.columns * frame.tiles.rows { continue }
+        pending = false
+        error = ApplyIntraLoopFilter(*intra, VecSlice(samples, 0, samples.count), *frame, options.cancellation)
+        if error.code != DecodeOK { return Av1Failure(error) }
+        if intra.cdef_enabled {
+            if !VecResizeBounded(cdef_samples, intra.sample_count, intra.sample_count) { return Av1Failure(Error(AllocationFailed)) }
+            error = ApplyIntraCdef(*intra, VecSlice(samples, 0, samples.count),
+                VecSlice(cdef_samples, 0, cdef_samples.count), *frame, options.cancellation)
+            if error.code != DecodeOK { return Av1Failure(error) }
+        }
+        if intra.restoration_enabled {
+            if !VecResizeBounded(restored, intra.sample_count, intra.sample_count) { return Av1Failure(Error(AllocationFailed)) }
+            if intra.cdef_enabled {
+                error = ApplyIntraRestoration(*intra, VecSlice(samples, 0, samples.count),
+                    VecSlice(cdef_samples, 0, cdef_samples.count), VecSlice(restored, 0, restored.count), *frame, options.cancellation)
+            } else {
+                error = ApplyIntraRestoration(*intra, VecSlice(samples, 0, samples.count), empty,
+                    VecSlice(restored, 0, restored.count), *frame, options.cancellation)
+            }
+            if error.code != DecodeOK { return Av1Failure(error) }
+            error = CopyIntraSamples(VecSlice(restored, 0, restored.count), VecSlice(samples, 0, samples.count))
+        } else if intra.cdef_enabled {
+            error = CopyIntraSamples(VecSlice(cdef_samples, 0, cdef_samples.count), VecSlice(samples, 0, samples.count))
+        }
+        if error.code != DecodeOK { return Av1Failure(error) }
+        if frame.grain_parameters.apply_grain {
+            grain_count := GrainScratchCount(frame.width)
+            if !VecResizeBounded(grain_scratch, grain_count, grain_count) { return Av1Failure(Error(AllocationFailed)) }
+            error = ApplyIntraFrameGrain(VecSlice(samples, 0, samples.count), VecSlice(grain_scratch, 0, grain_scratch.count),
+                *intra, *sequence, *frame, options.cancellation)
+            if error.code != DecodeOK { return Av1Failure(error) }
+        }
+        have_frame = true
+    }
+    if !have_sequence || !have_frame { return Av1Failure(Error(TruncatedInput, input.data.count)) }
+    sample_bytes: s32 = ifx sequence.bit_depth == 8 then 1 else 2
+    sub_x := sequence.subsampling_x
+    sub_y := sequence.subsampling_y
+    chroma_width := (frame.width + sub_x) / (1 + sub_x)
+    chroma_height := (frame.height + sub_y) / (1 + sub_y)
+    output_bytes := cast(s64)frame.width * frame.height * sample_bytes
+    if !sequence.monochrome { output_bytes += cast(s64)2 * chroma_width * chroma_height * sample_bytes }
+    if options.limits.max_output_bytes < output_bytes { return Av1Failure(Error(LimitExceeded)) }
+    result: Av1YUVResult
+    result.sequence = sequence; result.frame = frame
+    last_plane := ifx sequence.monochrome then 0 else 2
+    for index: 0..last_plane {
+        plane := *result.y
+        offset := intra.plane_offset[index]; source_stride := cast(s64)intra.plane_stride[index]
+        width := frame.width; height := frame.height
+        if index > 0 {
+            width = chroma_width; height = chroma_height
+            if index == 1 { plane = *result.u } else { plane = *result.v }
+        }
+        plane.width = width; plane.height = height; plane.stride = width * sample_bytes; plane.sample_bytes = sample_bytes
+        plane_bytes := cast(s64)width * height * sample_bytes
+        if !VecResizeBounded(plane.storage, plane_bytes, plane_bytes) { return Av1Failure(Error(AllocationFailed)) }
+        for row: 0..height - 1 {
+        error = CancellationError(options.cancellation)
+        if error.code != DecodeOK { return Av1Failure(error) }
+        for column: 0..width - 1 {
+            value := samples[offset + row * source_stride + column]
+            at := row * plane.stride + column * sample_bytes
+            plane.storage[at] = cast(u8)(value & 255)
+            if sample_bytes == 2 { plane.storage[at + 1] = cast(u8)(value >> 8) }
+        }
+        }
+    }
+    result.is_ok = true
+    return result
+}

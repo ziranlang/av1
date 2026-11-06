@@ -1,0 +1,39 @@
+#import, file "../src/entropy/coefficient_neighbors.zi";
+using Codec :: #import "image_codec/api"
+
+CoefficientNeighborBoundaries :: () -> s32 {
+    above: [17]u8; left: [17]u8; ad: [17]u8; ld: [17]u8
+    result := GetTransformCoefficientContexts(above[:0], left[:0], ad[:0], ld[:0], 64, 64, 128, 128, 0)
+    if result.error.code != DecodeOK || result.skip != 1 || result.dc != 0 { return 1 }
+    result = GetTransformCoefficientContexts(above[:1], left[:1], ad[:1], ld[:1], 4, 4, 4, 4, 1)
+    if result.error.code != DecodeOK || result.skip != 7 || result.dc != 0 { return 2 }
+    for i: 0..11 {
+        w: s32 = 4; h: s32 = 4; bw: s32 = 4; bh: s32 = 4; plane: s32
+        na: s64 = 1; nl: s64 = 1; nd: s64 = 1
+        if i == 0 { w = 2147483647 }
+        if i == 1 { w = -2147483647 }
+        if i == 2 { bw = 2147483647 }
+        if i == 3 { bw = 128; bh = 32 }
+        if i == 4 { bw = 32; bh = 128 }
+        if i == 5 { w = 8 }
+        if i == 6 { plane = -1 }
+        if i == 7 { plane = 2 }
+        if i == 8 { na = 2; nd = 2 }
+        if i == 9 { nl = 2 }
+        if i == 10 { nd = 0 }
+        if i == 11 { h = 64 }
+        result = GetTransformCoefficientContexts(above[:na], left[:nl], ad[:nd], ld[:nl], w, h, bw, bh, plane)
+        if result.error.code != InvalidInput || result.skip != 0 || result.dc != 0 { return 3 }
+    }
+    above[0] = 64
+    result = GetTransformCoefficientContexts(above[:1], left[:1], ad[:1], ld[:1], 4, 4, 4, 4, 0)
+    if result.error.code != InvalidInput || result.skip != 0 || result.dc != 0 { return 4 }
+    above[0] = 0; ld[0] = 3
+    result = GetTransformCoefficientContexts(above[:1], left[:1], ad[:1], ld[:1], 4, 4, 4, 4, 0)
+    if result.error.code != InvalidInput || result.skip != 0 || result.dc != 0 { return 5 }
+    token: Cancellation; Cancel(*token)
+    result = GetTransformCoefficientContexts(above[:1], left[:1], ad[:1], ld[:1], 4, 4, 4, 4, 0, *token)
+    if result.error.code != DecodeCancelled || result.skip != 0 || result.dc != 0 { return 6 }
+    if above[0] != 0 || left[0] != 0 || ad[0] != 0 || ld[0] != 3 { return 7 }
+    return 0
+}

@@ -1,0 +1,40 @@
+#import, file "../src/filter/cdef.zi";
+
+CdefBoundaries :: () -> s32 {
+    source: [144]u16
+    for i: 0..143 { source[i] = 128 }
+    if FindCdefDirection(source[:83], 11, 8).error.code != InvalidInput { return 1 }
+    if FindCdefDirection(source[:], 7, 8).error.code != InvalidInput { return 2 }
+    if FindCdefDirection(source[:], 65, 8).error.code != InvalidInput { return 3 }
+    if FindCdefDirection(source[:], 11, 9).error.code != InvalidInput { return 4 }
+    source[7 * 11 + 7] = 256
+    bad_dir := FindCdefDirection(source[:], 11, 8)
+    if bad_dir.error.code != InvalidInput || bad_dir.direction != 0 || bad_dir.variance != 0 { return 5 }
+    source[7 * 11 + 7] = 128
+    if FilterCdefBlock(source[:143], 12, 8, 8, 15, 4, 3, 0, 8).error.code != InvalidInput { return 6 }
+    if FilterCdefBlock(source[:], 11, 8, 8, 15, 4, 3, 0, 8).error.code != InvalidInput { return 7 }
+    if FilterCdefBlock(source[:], 12, 5, 8, 15, 4, 3, 0, 8).error.code != InvalidInput { return 8 }
+    if FilterCdefBlock(source[:], 12, 8, 8, 15, 3, 3, 0, 8).error.code != InvalidInput { return 9 }
+    if FilterCdefBlock(source[:], 12, 8, 8, 17, 4, 3, 0, 8).error.code != InvalidInput { return 10 }
+    if FilterCdefBlock(source[:], 12, 8, 8, 15, 4, 3, 8, 8).error.code != InvalidInput { return 11 }
+    if FilterCdefBlock(source[:], 12, 8, 8, 15, 4, 1, 0, 8).error.code != InvalidInput { return 12 }
+    if FilterCdefBlock(source[:], 12, 8, 8, 15, 4, 7, 0, 8).error.code != InvalidInput { return 13 }
+    if FilterCdefBlock(source[:], 12, 8, 8, 61, 4, 6, 0, 10).error.code != InvalidInput { return 14 }
+    if FilterCdefBlock(source[:], 12, 8, 8, 16, 5, 6, 0, 10).error.code != InvalidInput { return 15 }
+    source[0] = 256
+    if FilterCdefBlock(source[:], 12, 8, 8, 15, 4, 3, 0, 8).error.code != InvalidInput { return 16 }
+    source[0] = CdefMissingSample
+    source[2 * 12 + 2] = CdefMissingSample
+    bad := FilterCdefBlock(source[:], 12, 8, 8, 15, 4, 3, 0, 8)
+    if bad.error.code != InvalidInput || bad.width != 0 || bad.height != 0 { return 17 }
+    for i: 0..63 { if bad.samples[i] != 0 { return 18 } }
+    source[2 * 12 + 2] = 128
+    if FilterCdefBlock(source[:], 12, 8, 8, 15, 4, 3, 0, 8).error.code != DecodeOK { return 19 }
+    token: Cancellation; Cancel(*token)
+    cancelled := FilterCdefBlock(source[:], 12, 8, 8, 15, 4, 3, 0, 8, *token)
+    if cancelled.error.code != DecodeCancelled || cancelled.width != 0 || cancelled.height != 0 { return 20 }
+    for i: 0..63 { if cancelled.samples[i] != 0 { return 21 } }
+    cancelled_dir := FindCdefDirection(source[:], 11, 8, *token)
+    if cancelled_dir.error.code != DecodeCancelled || cancelled_dir.direction != 0 || cancelled_dir.variance != 0 { return 22 }
+    return 0
+}

@@ -1,0 +1,249 @@
+#import, file "../entropy/range.zi";
+#import, file "../syntax/partition.zi";
+#import, file "../syntax/profile.zi";
+#import, file "../syntax/state.zi";
+#import, file "../syntax/tilegroup.zi";
+#import, file "../entropy/intra_frame_cdfs.zi";
+#import, file "../entropy/chroma_modes.zi";
+#import, file "../predict/palette.zi";
+#import, file "../predict/filter_intra.zi";
+#import, file "../predict/intra_predict.zi";
+#import, file "../predict/cfl.zi";
+#import, file "../entropy/coefficient_block.zi";
+#import, file "../entropy/coefficient_neighbors.zi";
+#import, file "../transform/transform_type.zi";
+#import, file "../transform/quantization.zi";
+#import, file "../transform/inverse_transform.zi";
+#import, file "../transform/lossless.zi";
+#import, file "../filter/sgr.zi";
+#import, file "./intra_frame.zi";
+#import, file "./mode_info.zi";
+using Codec :: #import "image_codec/api"
+using IntraVectors :: #import "std/vec"
+
+// Residual syntax, prediction and reconstruction, specification 5.11.34-5.11.39
+// and 7.11-7.13.
+IntraCoefficients :: (tile: *IntraTile, block: *IntraBlock, plane: s32, start_x: s32, start_y: s32,
+    tx_w: s32, tx_h: s32) -> DecodeError {
+    frame := tile.frame; header := tile.header
+    sx := IntraSubX(frame, plane); sy := IntraSubY(frame, plane)
+    x4 := start_x >> 2; y4 := start_y >> 2; w4 := tx_w >> 2; h4 := tx_h >> 2
+    max_x4 := frame.mi_cols >> sx; max_y4 := frame.mi_rows >> sy
+    above_count := IntraMax(0, IntraMin(w4, max_x4 - x4)); left_count := IntraMax(0, IntraMin(h4, max_y4 - y4))
+    base := IntraContextBase(frame, plane)
+    above_level_at := base + x4; above_dc_at := base + frame.context_columns + x4
+    left_level_at := base + 2 * cast(s64)frame.context_columns + y4
+    left_dc_at := left_level_at + frame.context_rows
+    above_levels: [16]u8; above_dc: [16]u8; left_levels: [16]u8; left_dc: [16]u8
+    for i: 0..above_count - 1 { above_levels[i] = frame.contexts[above_level_at + i]; above_dc[i] = frame.contexts[above_dc_at + i] }
+    for i: 0..left_count - 1 { left_levels[i] = frame.contexts[left_level_at + i]; left_dc[i] = frame.contexts[left_dc_at + i] }
+    plane_w := ifx plane == 0 then block.width else IntraMax(4, block.width >> sx)
+    plane_h := ifx plane == 0 then block.height else IntraMax(4, block.height >> sy)
+    plane_type: s32 = ifx plane == 0 then 0 else 1
+    contexts := GetTransformCoefficientContexts(above_levels[:above_count], left_levels[:left_count],
+        above_dc[:above_count], left_dc[:left_count], tx_w, tx_h, plane_w, plane_h, plane_type, tile.cancellation)
+    if contexts.error.code != DecodeOK { return contexts.error }
+    all_zero := ReadCoefficientSkip(*tile.decoder, *tile.cdfs.coefficients, tx_w, tx_h, plane_type,
+        contexts.skip, tile.cancellation)
+    if all_zero.error.code != DecodeOK { return all_zero.error }
+    level: s32; dc: s32
+    if all_zero.value == 0 {
+        tx_type: s32
+        if plane == 0 {
+            syntax_q := header.base_q_idx
+            if header.segmentation_enabled {
+                resolved := ResolveQuantizerIndex(header.base_q_idx, tile.current_q, header.delta_q_present, true,
+                    IntraFeature(tile, block.segment_id, 0), header.features[block.segment_id * 8].value, tile.cancellation)
+                if resolved.error.code != DecodeOK { return resolved.error }
+                syntax_q = resolved.value
+            }
+            typed := ReadTransformType(*tile.decoder, *tile.cdfs.tx_types, tx_w, tx_h, false,
+                header.reduced_tx_set, syntax_q, block.y_mode, block.filter_mode, tile.cancellation)
+            if typed.error.code != DecodeOK { return typed.error }
+            tx_type = ifx block.lossless then 0 else typed.value
+        } else {
+            resolved := ResolveChromaTransformType(tx_w, tx_h, false, header.reduced_tx_set, block.lossless,
+                block.uv_mode, tile.cancellation)
+            if resolved.error.code != DecodeOK { return resolved.error }
+            tx_type = resolved.value
+        }
+        coefficients := ReadNonzeroCoefficients(*tile.decoder, *tile.cdfs.coefficients, tx_w, tx_h,
+            TransformClass(tx_type), plane_type, contexts.dc, tile.cancellation)
+        if coefficients.error.code != DecodeOK { return coefficients.error }
+        level = coefficients.level; dc = coefficients.dc_category
+        stride := frame.plane_stride[plane]
+        plane_end := frame.plane_offset[plane] + cast(s64)stride * frame.plane_rows[plane]
+        at := frame.plane_offset[plane] + cast(s64)start_y * stride + start_x
+        if block.lossless {
+            residual := InverseLossless4x4(coefficients.quant[:16], frame.bit_depth, tile.cancellation)
+            if residual.error.code != DecodeOK { return residual.error }
+            error := AddResidual(tile.samples[at:plane_end], stride, residual.samples[:], 4, 4, 0,
+                frame.bit_depth, tile.cancellation)
+            if error.code != DecodeOK { return error }
+        } else {
+            q := ResolveQuantizerIndex(header.base_q_idx, tile.current_q, header.delta_q_present, false,
+                IntraFeature(tile, block.segment_id, 0), header.features[block.segment_id * 8].value, tile.cancellation)
+            if q.error.code != DecodeOK { return q.error }
+            delta_dc := header.delta_q[0]; delta_ac: s32
+            if plane == 1 { delta_dc = header.delta_q[1]; delta_ac = header.delta_q[2] }
+            if plane == 2 { delta_dc = header.delta_q[3]; delta_ac = header.delta_q[4] }
+            coded := IntraMin(32, tx_w) * IntraMin(32, tx_h)
+            no_weights: [1]u8
+            dequant := DequantizeBlock(coefficients.quant[:coded], tx_w, tx_h, q.value, delta_dc, delta_ac,
+                frame.bit_depth, no_weights[:0], tile.cancellation)
+            if dequant.error.code != DecodeOK { return dequant.error }
+            count := tx_w * tx_h
+            error := InverseTransform2D(dequant.samples[:count], tile.residual[:count], tx_w, tx_h, tx_type,
+                frame.bit_depth, tile.cancellation)
+            if error.code != DecodeOK { return error }
+            error = AddResidual(tile.samples[at:plane_end], stride, tile.residual[:count], tx_w, tx_h, tx_type,
+                frame.bit_depth, tile.cancellation)
+            if error.code != DecodeOK { return error }
+        }
+    }
+    for i: 0..w4 - 1 { frame.contexts[above_level_at + i] = cast(u8)level; frame.contexts[above_dc_at + i] = cast(u8)dc }
+    for i: 0..h4 - 1 { frame.contexts[left_level_at + i] = cast(u8)level; frame.contexts[left_dc_at + i] = cast(u8)dc }
+    return Error(DecodeOK)
+}
+
+IntraTransformBlock :: (tile: *IntraTile, block: *IntraBlock, plane: s32, base_x: s32, base_y: s32,
+    tx_w: s32, tx_h: s32, x: s32, y: s32) -> DecodeError {
+    frame := tile.frame
+    sx := IntraSubX(frame, plane); sy := IntraSubY(frame, plane)
+    start_x := base_x + 4 * x; start_y := base_y + 4 * y
+    row := IntraShift(start_y, sy) >> 2; column := IntraShift(start_x, sx) >> 2
+    mask := frame.superblock4 - 1
+    sub_row := (row & mask) >> sy; sub_column := (column & mask) >> sx
+    step_x := tx_w >> 2; step_y := tx_h >> 2
+    max_x := (frame.mi_cols * 4) >> sx; max_y := (frame.mi_rows * 4) >> sy
+    if start_x >= max_x || start_y >= max_y { return Error(DecodeOK) }
+    stride := frame.plane_stride[plane]; offset := frame.plane_offset[plane]
+    plane_end := offset + cast(s64)stride * frame.plane_rows[plane]
+    at := offset + cast(s64)start_y * stride + start_x
+    if start_x + tx_w > stride || start_y + tx_h > frame.plane_rows[plane] { return Error(InvalidInput) }
+    palette_count := ifx plane == 0 then tile.palette.count else tile.uv_palette.count
+    error: DecodeError
+    if palette_count > 0 {
+        for i: 0..tx_h - 1 {
+            for j: 0..tx_w - 1 {
+                map_at := (y * 4 + cast(s32)i) * 64 + x * 4 + cast(s32)j
+                color: u16
+                if plane == 0 { color = tile.palette.colors[cast(s64)tile.palette.indices[map_at]] }
+                else if plane == 1 { color = tile.uv_palette.colors[cast(s64)tile.uv_palette.indices[map_at]] }
+                else { color = tile.uv_palette.v_colors[cast(s64)tile.uv_palette.indices[map_at]] }
+                tile.samples[at + i * stride + j] = color
+            }
+        }
+    } else {
+        is_cfl := plane > 0 && block.uv_mode == 13
+        mode := ifx plane == 0 then block.y_mode else ifx is_cfl then 0 else block.uv_mode
+        angle := ifx plane == 0 then block.y_angle else block.uv_angle
+        have_left := (ifx plane == 0 then block.avail_l else block.avail_l_chroma) || x > 0
+        have_above := (ifx plane == 0 then block.avail_u else block.avail_u_chroma) || y > 0
+        decoded := plane * IntraDecodedPlane
+        above_right := tile.decoded[decoded + sub_row * IntraDecodedSide + sub_column + step_x + 1] != 0
+        below_left := tile.decoded[decoded + (sub_row + step_y + 1) * IntraDecodedSide + sub_column] != 0
+        error = BuildIntraEdges(*tile.edges, tile.samples[offset:plane_end], stride, start_x, start_y, tx_w, tx_h,
+            max_x - 1, max_y - 1, have_above, have_left, above_right && have_above, below_left && have_left,
+            frame.bit_depth)
+        if error.code != DecodeOK { return error }
+        filter_mode := ifx plane == 0 then block.filter_mode else -1
+        error = PredictIntra(tile.samples[at:plane_end], stride, *tile.edges, mode, angle, filter_mode,
+            tile.sequence.enable_intra_edge_filter, IntraFilterType(tile, block, plane), tile.cancellation)
+        if error.code != DecodeOK { return error }
+        if is_cfl {
+            luma_x := IntraShift(start_x, sx); luma_y := IntraShift(start_y, sy)
+            luma_w := IntraMin(block.max_luma_w - luma_x, IntraShift(tx_w, sx))
+            luma_h := IntraMin(block.max_luma_h - luma_y, IntraShift(tx_h, sy))
+            if luma_w < 1 || luma_h < 1 || luma_w > 64 || luma_h > 64 { return Error(MalformedInput, tile.decoder.bits.byte) }
+            luma_stride := frame.plane_stride[0]
+            for i: 0..luma_h - 1 {
+                source := frame.plane_offset[0] + cast(s64)(luma_y + cast(s32)i) * luma_stride + luma_x
+                for j: 0..luma_w - 1 { tile.cfl_luma[i * 64 + j] = tile.samples[source + j] }
+            }
+            alpha := ifx plane == 1 then block.alpha_u else block.alpha_v
+            error = ApplyCfl(tile.samples[at:plane_end], stride, tile.cfl_luma[:], 64, tx_w, tx_h, sx, sy,
+                luma_w, luma_h, alpha, frame.bit_depth, tile.cancellation)
+            if error.code != DecodeOK { return error }
+        }
+    }
+    if plane == 0 { block.max_luma_w = start_x + step_x * 4; block.max_luma_h = start_y + step_y * 4 }
+    if block.skip == 0 {
+        error = IntraCoefficients(tile, block, plane, start_x, start_y, tx_w, tx_h)
+        if error.code != DecodeOK { return error }
+    }
+    packed := IntraPackSize(tx_w, tx_h)
+    plane_row := row >> sy; plane_column := column >> sx
+    for i: 0..step_y - 1 {
+        for j: 0..step_x - 1 {
+            r := plane_row + cast(s32)i; c := plane_column + cast(s32)j
+            if r < frame.mi_rows && c < frame.mi_cols { frame.mi[IntraMiAt(frame, r, c) + IntraMiLoopTx + plane] = packed }
+            tile.decoded[IntraDecodedAt(plane, sub_row + cast(s32)i, sub_column + cast(s32)j)] = 1
+        }
+    }
+    return Error(DecodeOK)
+}
+
+// Flag index for plane-relative 4x4 position (row, column), each -1..33.
+IntraDecodedAt :: (plane: s32, row: s32, column: s32) -> s32 {
+    return plane * IntraDecodedPlane + (row + 1) * IntraDecodedSide + column + 1
+}
+
+IntraResidual :: (tile: *IntraTile, block: *IntraBlock) -> DecodeError {
+    frame := tile.frame
+    width_chunks := IntraMax(1, block.width >> 6); height_chunks := IntraMax(1, block.height >> 6)
+    chunked := width_chunks > 1 || height_chunks > 1
+    chunk_w := ifx chunked then 64 else block.width; chunk_h := ifx chunked then 64 else block.height
+    planes: s32 = ifx block.has_chroma then 3 else 1
+    for chunk_y: 0..height_chunks - 1 {
+        for chunk_x: 0..width_chunks - 1 {
+            for plane: 0..planes - 1 {
+                sx := IntraSubX(frame, cast(s32)plane); sy := IntraSubY(frame, cast(s32)plane)
+                tx_w := block.tx_width; tx_h := block.tx_height
+                if block.lossless { tx_w = 4; tx_h = 4 }
+                else if plane > 0 {
+                    tx_w = IntraMin(64, IntraMax(4, block.width >> sx))
+                    tx_h = IntraMin(64, IntraMax(4, block.height >> sy))
+                    if tx_w == 64 || tx_h == 64 {
+                        if tx_w == 16 { tx_h = 32 }
+                        else if tx_h == 16 { tx_w = 32 }
+                        else { tx_w = 32; tx_h = 32 }
+                    }
+                }
+                step_x := tx_w >> 2; step_y := tx_h >> 2
+                num_w := IntraMax(4, chunk_w >> sx) >> 2; num_h := IntraMax(4, chunk_h >> sy) >> 2
+                base_x := (block.column >> sx) * 4; base_y := (block.row >> sy) * 4
+                offset_x := IntraShift(cast(s32)chunk_x, 4) >> sx
+                offset_y := IntraShift(cast(s32)chunk_y, 4) >> sy
+                y: s32 = 0
+                while y < num_h {
+                    x: s32 = 0
+                    while x < num_w {
+                        error := IntraTransformBlock(tile, block, cast(s32)plane, base_x, base_y, tx_w, tx_h,
+                            x + offset_x, y + offset_y)
+                        if error.code != DecodeOK { return error }
+                        x += step_x
+                    }
+                    y += step_y
+                }
+            }
+        }
+    }
+    return Error(DecodeOK)
+}
+
+IntraResetBlockContext :: (tile: *IntraTile, block: *IntraBlock) {
+    frame := tile.frame
+    planes: s32 = ifx block.has_chroma then 3 else 1
+    for plane: 0..planes - 1 {
+        sx := IntraSubX(frame, cast(s32)plane); sy := IntraSubY(frame, cast(s32)plane)
+        base := IntraContextBase(frame, cast(s32)plane)
+        for i: (block.column >> sx)..((block.column + block.bw4) >> sx) - 1 {
+            frame.contexts[base + i] = 0; frame.contexts[base + frame.context_columns + i] = 0
+        }
+        left := base + 2 * cast(s64)frame.context_columns
+        for i: (block.row >> sy)..((block.row + block.bh4) >> sy) - 1 {
+            frame.contexts[left + i] = 0; frame.contexts[left + frame.context_rows + i] = 0
+        }
+    }
+}

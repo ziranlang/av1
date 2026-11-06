@@ -1,0 +1,65 @@
+// Internal AV1 sequence/sample description. This is not an RGBA image type.
+OperatingPoint :: struct {
+    idc: s32;
+    level: s32;
+    tier: s32;
+    decoder_model_present: bool;
+    decoder_buffer_delay: u32;
+    encoder_buffer_delay: u32;
+    low_delay_mode: bool;
+    initial_display_delay: s32;
+}
+
+SequenceHeader :: struct {
+    profile: s32;
+    still_picture: bool;
+    reduced_still_picture_header: bool;
+    timing_info_present: bool;
+    num_units_in_display_tick: u32;
+    time_scale: u32;
+    equal_picture_interval: bool;
+    num_ticks_per_picture_minus_1: u32;
+    decoder_model_info_present: bool;
+    buffer_delay_length: s32;
+    num_units_in_decoding_tick: u32;
+    buffer_removal_time_length: s32;
+    frame_presentation_time_length: s32;
+    initial_display_delay_present: bool;
+    operating_points: [32]OperatingPoint;
+    operating_point_count: s32;
+    frame_width_bits: s32;
+    frame_height_bits: s32;
+    max_frame_width: s32;
+    max_frame_height: s32;
+    frame_id_numbers_present: bool;
+    delta_frame_id_length: s32;
+    frame_id_length: s32;
+    use_128x128_superblock: bool;
+    enable_filter_intra: bool;
+    enable_intra_edge_filter: bool;
+    enable_interintra_compound: bool;
+    enable_masked_compound: bool;
+    enable_warped_motion: bool;
+    enable_dual_filter: bool;
+    enable_order_hint: bool;
+    enable_jnt_comp: bool;
+    enable_ref_frame_mvs: bool;
+    force_screen_content_tools: s32;
+    force_integer_mv: s32;
+    order_hint_bits: s32;
+    enable_superres: bool;
+    enable_cdef: bool;
+    enable_restoration: bool;
+    bit_depth: s32;
+    monochrome: bool;
+    color_description_present: bool;
+    color_primaries: s32;
+    transfer_characteristics: s32;
+    matrix_coefficients: s32;
+    full_range: bool;
+    subsampling_x: s32;
+    subsampling_y: s32;
+    chroma_sample_position: s32;
+    separate_uv_delta_q: bool;
+    film_grain_params_present: bool;
+}

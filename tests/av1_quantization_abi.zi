@@ -1,0 +1,32 @@
+#import, file "../src/transform/quantization.zi";
+
+ProbeQuantCount :: (input: []s32) -> s32 {
+    weights: [1]u8
+    got := DequantizeBlock(input, 4, 4, 0, 0, 0, 8, weights[:0])
+    if got.error.code != InvalidInput || got.width != 0 || got.height != 0 { return 1 }
+    for i: 0..4095 { if got.samples[i] != 0 { return 2 } }
+    return 0
+}
+
+ProbeWeightCount :: (input: []u8) -> s32 {
+    quant: [16]s32
+    got := DequantizeBlock(quant[:], 4, 4, 0, 0, 0, 8, input)
+    if got.error.code != InvalidInput || got.width != 0 || got.height != 0 { return 1 }
+    for i: 0..4095 { if got.samples[i] != 0 { return 2 } }
+    return 0
+}
+
+ProbeEmptyWeights :: (input: []u8) -> s32 {
+    quant: [16]s32
+    got := DequantizeBlock(quant[:], 4, 4, 0, 0, 0, 8, input)
+    if got.error.code != DecodeOK || got.width != 4 || got.height != 4 { return 1 }
+    for i: 0..4095 { if got.samples[i] != 0 { return 2 } }
+    return 0
+}
+
+ProbeQuantizationDescriptors :: (input: []s32, weights: []u8, kind: s32) -> s32 {
+    if kind == 0 { return ProbeQuantCount(input) }
+    if kind == 1 { return ProbeWeightCount(weights) }
+    if kind == 2 { return ProbeEmptyWeights(weights) }
+    return 1
+}

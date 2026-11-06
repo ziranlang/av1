@@ -1,0 +1,39 @@
+#import, file "../src/syntax/frame.zi";
+#import, file "../src/syntax/profile.zi";
+using Codec :: #import "image_codec/api"
+
+// Malformed/unsupported header prefixes and caller-descriptor bounds only.
+// Valid syntax and plane conformance use the pinned native whole-frame oracle.
+KeyHeaderBoundaries :: () -> s32 {
+    seq: SequenceHeader
+    seq.max_frame_width = 8; seq.max_frame_height = 8
+    seq.frame_width_bits = 3; seq.frame_height_bits = 3
+    data: [1]u8 = .[0x80]
+    old_reference := ParseStillFrameHeader(BorrowBytes(data[:]), 0, 1, seq, DefaultLimits())
+    if old_reference.error.code != UnsupportedCapability || old_reference.error.offset != 0 { return 1 }
+    data[0] = 0x20
+    inter := ParseStillFrameHeader(BorrowBytes(data[:]), 0, 1, seq, DefaultLimits())
+    if inter.error.code != UnsupportedCapability || inter.error.offset != 0 { return 2 }
+    data[0] = 0
+    hidden := ParseStillFrameHeader(BorrowBytes(data[:]), 0, 1, seq, DefaultLimits())
+    if hidden.error.code != UnsupportedCapability || hidden.error.offset != 0 { return 3 }
+    empty := ParseStillFrameHeader(BorrowBytes(data[:]), 0, 0, seq, DefaultLimits())
+    if empty.error.code != TruncatedInput || empty.error.offset != 0 { return 4 }
+    data[0] = 0x10; seq.force_screen_content_tools = 3
+    selector := ParseStillFrameHeader(BorrowBytes(data[:]), 0, 1, seq, DefaultLimits())
+    if selector.error.code != InvalidInput { return 5 }
+    seq.force_screen_content_tools = 0; seq.frame_id_numbers_present = true; seq.frame_id_length = 33
+    identifier := ParseStillFrameHeader(BorrowBytes(data[:]), 0, 1, seq, DefaultLimits())
+    if identifier.error.code != InvalidInput { return 6 }
+    seq.frame_id_numbers_present = false; seq.decoder_model_info_present = true
+    seq.frame_presentation_time_length = 33
+    timing := ParseStillFrameHeader(BorrowBytes(data[:]), 0, 1, seq, DefaultLimits())
+    if timing.error.code != InvalidInput { return 7 }
+    seq.equal_picture_interval = true; seq.operating_point_count = 33; seq.buffer_removal_time_length = 1
+    operations := ParseStillFrameHeader(BorrowBytes(data[:]), 0, 1, seq, DefaultLimits())
+    if operations.error.code != InvalidInput { return 8 }
+    seq.decoder_model_info_present = false; seq.frame_width_bits = 17; data[0] = 0x14
+    dimensions := ParseStillFrameHeader(BorrowBytes(data[:]), 0, 1, seq, DefaultLimits())
+    if dimensions.error.code != InvalidInput { return 9 }
+    return 0
+}
