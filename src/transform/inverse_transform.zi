@@ -31,10 +31,14 @@ Cos128 :: (table: []s32, angle: s64) -> s64 {
     return cast(s64)table[256 - a]
 }
 
+// Reverses the low `bits` (at most 8) bits of x: an 8-bit swap network,
+// then the reversed byte shifted down to `bits` bits.
 Brev :: (bits: s64, x: s64) -> s64 {
-    value: s64
-    for i: 0..bits - 1 { value |= ((x >> cast(u32)i) & 1) << cast(u32)(bits - 1 - i) }
-    return value
+    value := x & 255
+    value = ((value & 240) >> 4) | ((value & 15) << 4)
+    value = ((value & 204) >> 2) | ((value & 51) << 2)
+    value = ((value & 170) >> 1) | ((value & 85) << 1)
+    return value >> cast(u32)(8 - bits)
 }
 
 // B(a,b,angle,flip): rotation, rounded by 12 bits, optionally exchanged.

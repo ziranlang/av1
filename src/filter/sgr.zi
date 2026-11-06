@@ -16,10 +16,12 @@ SgrParameters :: (set: s32, pass: s32) -> s32 {
 
 #scope_file
 SgrPass :: struct { samples: [64]s64; error: DecodeError; }
+// Floor((value + 2^shift/2) / 2^shift) for any sign: the arithmetic shift
+// floors, so this is Round2 for non-negative values and the spec's rounding
+// of signed sums.
 SgrRound :: (value: s64, shift: s32) -> s64 {
-    divisor := cast(s64)(cast(u64)1 << cast(u64)shift)
-    biased := value + divisor / 2
-    return ifx biased < 0 then -((-biased + divisor - 1) / divisor) else biased / divisor
+    if shift == 0 { return value }
+    return (value + (cast(s64)1 << cast(u32)(shift - 1))) >> cast(u32)shift
 }
 SgrBox :: (input: []u16, stride: s32, width: s32, height: s32,
     set: s32, pass: s32, bit_depth: s32, cancellation: *Cancellation) -> SgrPass {
@@ -32,17 +34,29 @@ SgrBox :: (input: []u16, stride: s32, width: s32, height: s32,
     scale: s64 = (1048576 + n2e / 2) / n2e
     reciprocal: s64 = (4096 + n / 2) / n
     a_values: [100]s64; b_values: [100]s64
+    // Window sums from per-column sums: column j covers input column
+    // j + 2 - radius over the 2*radius+1 rows centred on row iy + 2.
+    column_sums: [16]s64; column_squares: [16]s64
+    columns := width + 2 + 2 * radius
     for iy: 0..height + 1 {
         result.error = CancellationError(cancellation)
         if result.error.code != DecodeOK { return result }
-        y := cast(s32)iy - 1
+        // The radius-2 pass is combined from even rows of A and B only.
+        if radius == 2 && pass == 0 && (iy & 1) != 0 { continue }
+        top := (cast(s32)iy + 2 - radius) * stride + 2 - radius
+        for j: 0..columns - 1 {
+            sum: s64; squares: s64
+            at := top + cast(s32)j
+            for k: 0..2 * radius {
+                value := cast(s64)input[at]
+                sum += value; squares += value * value
+                at += stride
+            }
+            column_sums[j] = sum; column_squares[j] = squares
+        }
         for ix: 0..width + 1 {
-            x := cast(s32)ix - 1
             a: s64; b: s64
-            for dy: 0..2 * radius { for dx: 0..2 * radius {
-                value := cast(s64)input[(y + 3 + dy - radius) * stride + x + 3 + dx - radius]
-                a += value * value; b += value
-            } }
+            for dx: 0..2 * radius { a += column_squares[ix + dx]; b += column_sums[ix + dx] }
             a = SgrRound(a, 2 * (bit_depth - 8))
             d := SgrRound(b, bit_depth - 8)
             p := a * n - d * d; if p < 0 { p = 0 }

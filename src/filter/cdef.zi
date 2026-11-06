@@ -65,16 +65,12 @@ FindCdefDirection :: (input: []u16, stride: s32, bit_depth: s32,
 }
 
 #scope_file
-CdefConstrain :: (difference: s32, threshold: s32, damping: s32) -> s32 {
-    if threshold == 0 { return 0 }
+// Damping shift of the constrain function for a non-zero threshold.
+CdefDampingShift :: (threshold: s32, damping: s32) -> u32 {
     log: s32; remaining := threshold
     while remaining > 1 { log += 1; remaining /= 2 }
     shift := damping - log; if shift < 0 { shift = 0 }
-    magnitude := ifx difference < 0 then -difference else difference
-    constrained := threshold - cast(s32)(cast(u32)magnitude >> cast(u32)shift)
-    if constrained < 0 { constrained = 0 }
-    if constrained > magnitude { constrained = magnitude }
-    return ifx difference < 0 then -constrained else constrained
+    return cast(u32)shift
 }
 CdefFloor16 :: (value: s32) -> s32 {
     return ifx value < 0 then -((-value + 15) / 16) else value / 16
@@ -118,34 +114,52 @@ FilterCdefBlock :: (input: []u16, stride: s32, width: s32, height: s32,
     // Pairs are (dy,dx), two distances for each of eight directions.
     directions: [32]s32 = .[-1,1,-2,2,0,1,-1,2,0,1,0,2,0,1,1,2,1,1,2,2,1,0,2,1,1,0,2,0,1,0,2,-1]
     primary_taps: [4]s32 = .[4,2,3,3]
+    // The twelve taps of this block: offset from the centre sample, weight,
+    // threshold and damping shift, resolved once instead of per sample.
+    tap_offsets: [12]s32; tap_weights: [12]s32; tap_thresholds: [12]s32; tap_shifts: [12]u32
+    taps: s32 = 0
+    for tap: 0..1 {
+        for family: 0..2 {
+            filter_direction := direction; strength := primary_strength
+            weight := primary_taps[(primary_strength / scale & 1) * 2 + tap]
+            if family > 0 {
+                offset: s32 = ifx family == 1 then 6 else 2
+                filter_direction = (direction + offset) % 8
+                strength = secondary_strength
+                weight = ifx tap == 0 then 2 else 1
+            }
+            for side: 0..1 {
+                sign: s32 = ifx side == 0 then -1 else 1
+                tap_offsets[taps] = sign * (directions[(filter_direction * 2 + tap) * 2] * stride +
+                    directions[(filter_direction * 2 + tap) * 2 + 1])
+                tap_weights[taps] = weight; tap_thresholds[taps] = strength
+                tap_shifts[taps] = CdefDampingShift(strength, damping)
+                taps += 1
+            }
+        }
+    }
     samples: [64]u16
     for row: 0..height - 1 {
         result.error = CancellationError(cancellation)
         if result.error.code != DecodeOK { return result }
         for column: 0..width - 1 {
-            current := cast(s32)input[(row + 2) * stride + column + 2]
+            centre := (row + 2) * stride + column + 2
+            current := cast(s32)input[centre]
             minimum := current; maximum_sample := current; sum: s32
-            for tap: 0..1 {
-                for family: 0..2 {
-                    filter_direction := direction; strength := primary_strength
-                    weight := primary_taps[(primary_strength / scale & 1) * 2 + tap]
-                    if family > 0 {
-                        offset: s32 = ifx family == 1 then 6 else 2
-                        filter_direction = (direction + offset) % 8
-                        strength = secondary_strength
-                        weight = ifx tap == 0 then 2 else 1
-                    }
-                    for side: 0..1 {
-                        sign: s32 = ifx side == 0 then -1 else 1
-                        y := row + 2 + sign * directions[(filter_direction * 2 + tap) * 2]
-                        x := column + 2 + sign * directions[(filter_direction * 2 + tap) * 2 + 1]
-                        sample := input[y * stride + x]
-                        if sample == CdefMissingSample { continue }
-                        value := cast(s32)sample
-                        sum += weight * CdefConstrain(value - current, strength, damping)
-                        if value < minimum { minimum = value }; if value > maximum_sample { maximum_sample = value }
-                    }
+            for tap: 0..11 {
+                sample := input[centre + tap_offsets[tap]]
+                if sample == CdefMissingSample { continue }
+                value := cast(s32)sample
+                threshold := tap_thresholds[tap]
+                if threshold != 0 {
+                    difference := value - current
+                    magnitude := ifx difference < 0 then -difference else difference
+                    constrained := threshold - cast(s32)(cast(u32)magnitude >> tap_shifts[tap])
+                    if constrained < 0 { constrained = 0 }
+                    if constrained > magnitude { constrained = magnitude }
+                    sum += tap_weights[tap] * (ifx difference < 0 then -constrained else constrained)
                 }
+                if value < minimum { minimum = value }; if value > maximum_sample { maximum_sample = value }
             }
             negative: s32 = ifx sum < 0 then 1 else 0
             value := current + CdefFloor16(8 + sum - negative)

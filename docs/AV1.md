@@ -16,7 +16,8 @@ inter, intra-only or hidden frames reject with
 `UnsupportedCapability`. Output matches pinned libaom bit-exactly on the local
 corpus described below, including 275 of the 279 KEY temporal units in
 libaom's pinned decoder test vectors. That is not a full AV1 conformance
-claim, and no speed has been measured. The avif package imports this package as a dependency; its
+claim. The scalar decoder is still several times slower than libaom and dav1d
+(see Performance baseline below). The avif package imports this package as a dependency; its
 facade still uses the bridge by default.
 
 Product codec code is handwritten `.zi`. Generated C/Go and portable `.zx`
@@ -785,8 +786,29 @@ the descriptor regression run under ASan/UBSan. Test artifacts and generated
 oracle source stay under ignored `build/scratch/av1`.
 
 Random entropy bytes exercise symbol primitives; they are not conforming frame
-vectors. Replacing the bridge still needs real AVIF fixtures and inter frames;
-no benchmark has been run.
+vectors. Replacing the bridge still needs real AVIF fixtures and inter frames.
+
+## Performance baseline
+
+`build-queue -- sh tests/av1_benchmark.sh` encodes six KEY frames with the
+pinned libaom encoder, from 352x288 to 1080p, 8 and 10 bits, 4:2:0 and 4:4:4,
+natural and screen content. It decodes each one in one process with the
+authored decoder (generated C, `-O3`), libaom and dav1d, all on one thread
+and one pinned core. libaom and dav1d use their own SIMD. Each iteration is a
+one-shot decode from memory: setup, decode and release. A row counts only when
+the three sample hashes agree. The receipt
+`build/scratch/av1-benchmark/receipt.json` records the medians, iteration
+counts and allocation calls per decode for one machine.
+
+On 2026-11-06, on a Ryzen 9 9950X, the authored decoder took 21 to 428 ms per
+frame. That is 3 to 12 times libaom and 6 to 24 times dav1d. It makes 9 to 11
+allocation calls per decode at every frame size, so no allocation happens per
+block. A gprof profile showed self-guided restoration, CDEF and coefficient
+context derivation on top. Column box sums and shift rounding in
+`filter/sgr.zi`, per-block CDEF taps in `filter/cdef.zi` and a swap-network
+bit reversal in `transform/inverse_transform.zi` cut 16 to 29 percent from
+the first baseline, with identical output. No SIMD path, thread, other
+machine, cold start or energy figure has been measured.
 
 ## Specification and provenance
 

@@ -1,0 +1,34 @@
+#import, file "../src/decoder.zi";
+
+// FNV-1a over the visible samples of one plane, row by row, in the plane's
+// sample size (one byte, or two little-endian bytes above 8 bits).
+HashPlane :: (plane: *Plane, value: u64) -> u64 {
+    hash := value
+    row_bytes := cast(s64)plane.width * cast(s64)plane.sample_bytes
+    y: s64 = 0
+    while y < cast(s64)plane.height {
+        at := y * plane.stride
+        x: s64 = 0
+        while x < row_bytes {
+            hash = (hash ^ cast(u64)plane.storage[at + x]) * 1099511628211
+            x += 1
+        }
+        y += 1
+    }
+    return hash
+}
+
+// Decodes one temporal unit with the default options. Returns 0 and the
+// Y, U, V sample hash, or the decoder's error code.
+#program_export
+Av1BenchDecode :: (data: []u8, hash: *u64) -> s32 {
+    options := DefaultOptions()
+    result := DecodeAv1YUV(BorrowBytes(data), *options)
+    if !result.is_ok { return result.error.code }
+    value: u64 = 14695981039346656037
+    value = HashPlane(*result.y, value)
+    value = HashPlane(*result.u, value)
+    value = HashPlane(*result.v, value)
+    hash[0] = value
+    return 0
+}
