@@ -18,3 +18,4 @@
 - Inverse transforms on SIMD vectors.
 - Deblocking on SIMD vectors.
 - The critical path queues a ticket the queue failed to run again and can resume a stopped run.
+- Faster palette index maps.

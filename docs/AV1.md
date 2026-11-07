@@ -285,7 +285,8 @@ IR and ASan/UBSan run separately.
 `predict/palette.zi` owns luma/chroma palette parsing and fixed index-map storage.
 `BuildPaletteCache` sorts and deduplicates the bounded above/left palette union.
 `PaletteColorContext` derives the stable color order and context from the left,
-diagonal and above indices. `ReadPaletteColors` reads sizes two through eight,
+diagonal and above indices; `ReadPaletteMap` ranks the same three neighbours
+and decodes each token straight to its color. `ReadPaletteColors` reads sizes two through eight,
 cache selection and source-depth colors. Luma deltas are positive; U permits
 duplicate colors, while V uses literals or signed modular deltas. Metadata
 for both palettes precedes `ReadPaletteMap`, which reads the non-symmetric first
@@ -901,6 +902,12 @@ Then, on Ziran's `std/simd` vectors, with SSE2 to AVX2 chosen at run time:
   columns as `s32x4` vectors and skips all-zero groups.
 - `filter/deblock.zi`: each edge segment filters its four lines as `s32x4`
   vectors, validated once per segment.
+
+And in scalar code:
+
+- `predict/palette.zi`: each index ranks its three neighbours once and maps
+  the token straight to its color, and a map checks its five CDFs once
+  instead of on every token.
 
 It now takes 8 to 166 ms per frame, the medians of one benchmark run: 2 to 4
 times libaom and 3 to 7 times dav1d. Entropy decoding is the largest remaining cost. The

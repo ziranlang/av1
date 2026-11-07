@@ -30,20 +30,27 @@ NewRange :: (input: BorrowedBytes, begin: s64, end: s64, disable_cdf_update: boo
     return decoder
 }
 
-// cdf has N probabilities followed by the adaptation counter, 2 <= N <= 16.
-// Each value lies in [0,32768], is nondecreasing, and cdf[N-1] is 32768.
-ReadSymbol :: (decoder: *RangeDecoder, cdf: []u16) -> s32 {
-    if decoder.error.code != DecodeOK { return 0 }
-    if cdf.count < 3 || cdf.count > 17 { decoder.error = Error(InvalidInput, decoder.bits.byte); return 0 }
-    if !RangeReady(decoder) { return 0 }
+// Whether cdf has N probabilities followed by the adaptation counter,
+// 2 <= N <= 16: each value lies in [0,32768], is nondecreasing, cdf[N-1] is
+// 32768 and the counter is at most 32.
+ValidCdf :: (cdf: []u16) -> bool {
+    if cdf.count < 3 || cdf.count > 17 { return false }
     n := cast(s32)cdf.count - 1
     previous: u16
     i: s32
     while i < n {
-        if cdf[i] < previous || cdf[i] > 32768 { decoder.error = Error(InvalidInput, decoder.bits.byte); return 0 }
+        if cdf[i] < previous || cdf[i] > 32768 { return false }
         previous = cdf[i]; i += 1
     }
-    if previous != 32768 || cdf[n] > 32 { decoder.error = Error(InvalidInput, decoder.bits.byte); return 0 }
+    return previous == 32768 && cdf[n] <= 32
+}
+
+// A symbol from a caller's cdf, which must be valid.
+ReadSymbol :: (decoder: *RangeDecoder, cdf: []u16) -> s32 {
+    if decoder.error.code != DecodeOK { return 0 }
+    if cdf.count < 3 || cdf.count > 17 { decoder.error = Error(InvalidInput, decoder.bits.byte); return 0 }
+    if !RangeReady(decoder) { return 0 }
+    if !ValidCdf(cdf) { decoder.error = Error(InvalidInput, decoder.bits.byte); return 0 }
     return DecodeSymbol(decoder, cdf)
 }
 

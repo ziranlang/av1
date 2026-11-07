@@ -27,42 +27,67 @@ BuildPaletteCache :: (above: []u16, left: []u16) -> PaletteCache {
     return result
 }
 
+#scope_file
+// AV1 get_palette_color_context. The left, top-left and top indices score
+// 2, 1 and 2. The colors they name lead the order, by score and then by
+// index, the other colors follow in index order, and the scores alone pick
+// the context.
+PaletteRanking :: struct { colors: [3]u8; count: s32; context: s32; }
+
+// A missing neighbour is -1; the left or the top one is present.
+PaletteRank :: (left: s32, top_left: s32, top: s32) -> PaletteRanking #inline {
+    result: PaletteRanking
+    if left < 0 || top < 0 {
+        result.colors[0] = cast(u8)(ifx left < 0 then top else left); result.count = 1
+    } else if left == top {
+        result.colors[0] = cast(u8)left; result.colors[1] = cast(u8)top_left
+        result.count = ifx top_left == left then 1 else 2
+        result.context = ifx top_left == left then 4 else 3
+    } else if top_left == left || top_left == top {
+        // The color top-left repeats scores 3, the other 2.
+        result.colors[0] = cast(u8)top_left; result.colors[1] = cast(u8)(ifx top_left == left then top else left)
+        result.count = 2; result.context = 2
+    } else {
+        result.colors[0] = cast(u8)(ifx left < top then left else top)
+        result.colors[1] = cast(u8)(ifx left < top then top else left)
+        result.colors[2] = cast(u8)top_left
+        result.count = 3; result.context = 1
+    }
+    return result
+}
+
+// The color at a position of the order, below 8.
+PaletteOrderColor :: (ranking: PaletteRanking, position: s32) -> u8 #inline {
+    if position < ranking.count { return ranking.colors[position] }
+    named: u32
+    for i: 0..ranking.count - 1 { named |= cast(u32)1 << cast(u32)ranking.colors[i] }
+    remaining := position - ranking.count
+    for color: 0..7 {
+        if ((named >> cast(u32)color) & 1) == 0 {
+            if remaining == 0 { return cast(u8)color }
+            remaining -= 1
+        }
+    }
+    return 7
+}
+
+#scope_export
 PaletteColorContext :: (indices: []u8, stride: s32, row: s32, column: s32, colors: s32) -> PaletteIndexContext {
     result: PaletteIndexContext
     if indices.count < 1 || indices.count > 4096 || stride < 1 || stride > 64 || row < 0 || row >= 64 ||
         column < 0 || column >= stride || (row == 0 && column == 0) || colors < 2 || colors > 8 {
         result.error = Error(InvalidInput); return result
     }
-    if cast(s64)row * stride + column >= indices.count { result.error = Error(InvalidInput); return result }
-    scores: [8]s32
-    for i: 0..7 { result.order[i] = cast(u8)i }
-    if column > 0 {
-        neighbor := cast(s32)indices[row * stride + column - 1]
-        if neighbor >= colors { result.error = Error(InvalidInput); return result }
-        scores[neighbor] += 2
-    }
-    if row > 0 && column > 0 {
-        neighbor := cast(s32)indices[(row - 1) * stride + column - 1]
-        if neighbor >= colors { result.error = Error(InvalidInput); return result }
-        scores[neighbor] += 1
-    }
-    if row > 0 {
-        neighbor := cast(s32)indices[(row - 1) * stride + column]
-        if neighbor >= colors { result.error = Error(InvalidInput); return result }
-        scores[neighbor] += 2
-    }
-    for i: 0..2 {
-        maximum := i
-        for j: i + 1..colors - 1 { if scores[j] > scores[maximum] { maximum = j } }
-        score := scores[maximum]; order := result.order[maximum]; at := maximum
-        while at > i { scores[at] = scores[at - 1]; result.order[at] = result.order[at - 1]; at -= 1 }
-        scores[i] = score; result.order[i] = order
-    }
-    hash := scores[0] + 2 * scores[1] + 2 * scores[2]
-    contexts: [9]s32 = .[-1,-1,0,-1,-1,4,3,2,1]
-    if hash < 0 || hash > 8 { result.error = Error(MalformedInput); return result }
-    result.context = contexts[hash]
-    if result.context < 0 { result.error = Error(MalformedInput) }
+    at := cast(s64)row * stride + column
+    if at >= indices.count { result.error = Error(InvalidInput); return result }
+    left: s32 = -1; top_left: s32 = -1; top: s32 = -1
+    if column > 0 { left = cast(s32)indices[at - 1] }
+    if row > 0 && column > 0 { top_left = cast(s32)indices[at - stride - 1] }
+    if row > 0 { top = cast(s32)indices[at - stride] }
+    if left >= colors || top_left >= colors || top >= colors { result.error = Error(InvalidInput); return result }
+    ranking := PaletteRank(left, top_left, top)
+    result.context = ranking.context
+    for i: 0..7 { result.order[i] = PaletteOrderColor(ranking, cast(s32)i) }
     return result
 }
 
@@ -162,6 +187,12 @@ ReadPaletteMap :: (decoder: *RangeDecoder, color_cdf: []u16, width: s32, height:
     if error.code != DecodeOK { return error }
     if color_cdf.count != 315 || count < 2 || count > 8 || width < 4 || width > 64 || height < 4 || height > 64 ||
         onscreen_width < 1 || onscreen_width > width || onscreen_height < 1 || onscreen_height > height { return Error(InvalidInput, decoder.bits.byte) }
+    // Adaptation keeps a valid CDF valid, so the five this size reads are
+    // checked once.
+    for context: 0..4 {
+        at := (count - 2) * 45 + cast(s32)context * 9
+        if !ValidCdf(color_cdf[at:at + count + 1]) { return Error(InvalidInput, decoder.bits.byte) }
+    }
     output.indices[0] = cast(u8)ReadPaletteUniform(decoder, count)
     if decoder.error.code != DecodeOK { return decoder.error }
     for diagonal: 1..onscreen_height + onscreen_width - 2 {
@@ -169,14 +200,19 @@ ReadPaletteMap :: (decoder: *RangeDecoder, color_cdf: []u16, width: s32, height:
         if error.code != DecodeOK { return error }
         column := ifx diagonal < onscreen_width then diagonal else onscreen_width - 1
         last := ifx diagonal - onscreen_height + 1 > 0 then diagonal - onscreen_height + 1 else 0
+        // Every index this map holds is below count, so its neighbours need
+        // no check.
         while column >= last {
             row := diagonal - column
-            context := PaletteColorContext(output.indices[:], 64, cast(s32)row, cast(s32)column, count)
-            if context.error.code != DecodeOK { return Error(context.error.code, decoder.bits.byte) }
-            at := (count - 2) * 45 + context.context * 9
-            symbol := ReadSymbol(decoder, color_cdf[at:at + count + 1])
+            at := row * 64 + column
+            left: s32 = ifx column > 0 then cast(s32)output.indices[at - 1] else -1
+            top_left: s32 = ifx row > 0 && column > 0 then cast(s32)output.indices[at - 65] else -1
+            top: s32 = ifx row > 0 then cast(s32)output.indices[at - 64] else -1
+            ranking := PaletteRank(left, top_left, top)
+            cdf := (count - 2) * 45 + ranking.context * 9
+            symbol := DecodeSymbol(decoder, color_cdf[cdf:cdf + count + 1])
             if decoder.error.code != DecodeOK { return decoder.error }
-            output.indices[row * 64 + column] = context.order[symbol]
+            output.indices[at] = PaletteOrderColor(ranking, symbol)
             column -= 1
         }
     }
