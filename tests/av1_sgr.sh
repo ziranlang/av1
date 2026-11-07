@@ -15,7 +15,7 @@ for form in source saved; do
     "$ziran" bundle --entry "$module:main" "$@" -o "$out/$form.zx" "$input"
     test "$("$bin/zi2zx" run --vm "$out/$form.zx")" = 0
     "$ziran" build --target=go --pkg main --entry "$module:main" "$@" -o "$out/$form-go" "$input"
-    printf 'package main\nfunc main() { if Av1SgrVectors_Main() != 0 { panic("AV1 scalar self-guided restoration") } }\n' > "$out/$form-go/main.go"
+    printf 'package main\nfunc main() { if Av1SgrVectors_Main() != 0 { panic("AV1 self-guided restoration") } }\n' > "$out/$form-go/main.go"
     (cd "$out/$form-go" && GO111MODULE=off go build -o run . && ./run)
 done
 CFLAGS='-O0 -g -fsanitize=address,undefined -fno-omit-frame-pointer' LDFLAGS='-fsanitize=address,undefined' \
@@ -29,4 +29,4 @@ receipt.update(command='build-queue -- sh tests/av1_sgr.sh',exit_code=0,
     forms=['source','saved IR'],targets=['C','Go','zi2zx run --vm'],sanitizers=['ASan','UBSan'],sanitizer_optimization='-O0')
 (out/'receipt.json').write_text(json.dumps(receipt,indent=2)+'\n')
 PY
-printf '%s\n' 'AV1 scalar self-guided restoration: pinned vectors, source/saved C/Go/VM + ASan/UBSan passed'
+printf '%s\n' 'AV1 self-guided restoration: pinned vectors, source/saved C/Go/VM + ASan/UBSan passed'

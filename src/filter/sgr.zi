@@ -1,8 +1,10 @@
 using Codec :: #import "image_codec/api"
+Simd :: #import "std/simd"
 
-// AV1 7.17.2/3 self-guided restoration scalar semantic reference. No allocation,
-// native codec calls or frame scheduling. Caller supplies the resolved 3-pixel
-// restoration halo, including pre-CDEF samples outside the restoration stripe.
+// AV1 7.17.2/3 self-guided restoration, four columns at a time on s32x4
+// vectors. No allocation, native codec calls or frame scheduling. Caller
+// supplies the resolved 3-pixel restoration halo, including pre-CDEF samples
+// outside the restoration stripe.
 SgrBlock :: struct { samples: [64]u16; width: s32; height: s32; error: DecodeError; }
 
 // Sgr_Params row set: [r0, e0, r1, e1]; index 0/2 are the pass radii.
@@ -19,16 +21,12 @@ SgrParameters :: (set: s32, pass: s32) -> s32 {
 #scope_file
 // Kernel blocks are up to SgrMaximumWidth columns and 8 rows.
 SgrMaximumWidth :: 64
-// Floor((value + 2^shift/2) / 2^shift) for any sign: the arithmetic shift
-// floors, so this is Round2 for non-negative values and the spec's rounding
-// of signed sums.
-SgrRound :: (value: s64, shift: s32) -> s64 {
-    if shift == 0 { return value }
-    return (value + (cast(s64)1 << cast(u32)(shift - 1))) >> cast(u32)shift
-}
+// A and B rows: the block plus one sample on each side, padded to whole
+// vectors.
+SgrRow :: SgrMaximumWidth + 4
 // A2 of each z, the reciprocal step of AV1 7.17.3: 1 at z 0,
 // (z * 256 + z / 2) / (z + 1) below 255 and 256 from 255 on.
-SgrXByXPlus1 :: u16.[
+SgrXByXPlus1 :: s32.[
     1,128,171,192,205,213,219,224,228,230,233,235,236,238,239,240,
     241,242,243,243,244,244,245,245,246,246,247,247,247,247,248,248,
     248,248,249,249,249,249,249,250,250,250,250,250,250,250,251,251,
@@ -45,10 +43,49 @@ SgrXByXPlus1 :: u16.[
     255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,
     255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,
     255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,256]
-// One pass of 7.17.3 into output rows SgrMaximumWidth apart. A and B cover
-// the block plus one sample on each side, in rows of SgrMaximumWidth + 2.
+
+// Round2 of each lane: the shift plus the last bit shifted out.
+SgrRoundLanes :: (v: s32x4, shift: s32) -> s32x4 #inline {
+    if shift == 0 { return v }
+    return Simd.ShiftRightRound(v, cast(u32)shift)
+}
+
+SgrLoadLanes :: (input: []u16, at: s64) -> s32x4 #inline {
+    return Simd.Reinterpret(s32x4, Simd.WidenLow(Simd.LoadLow(u16x8, input, at)))
+}
+
+// The 3x3 weights of 7.17.3. Pass 0 has A and B on alternate rows only: an
+// even output row weighs the rows above and below it, an odd row its own
+// row, 5 at the sides and 6 in the middle. Pass 1 weighs the cross 4 and the
+// corners 3.
+SgrWeigh56 :: (values: []s32, at: s64, down: s64) -> s32x4 #inline {
+    sides := Simd.Add(Simd.Add(Simd.Load(s32x4, values, at), Simd.Load(s32x4, values, at + 2)),
+        Simd.Add(Simd.Load(s32x4, values, at + down), Simd.Load(s32x4, values, at + down + 2)))
+    middles := Simd.Add(Simd.Load(s32x4, values, at + 1), Simd.Load(s32x4, values, at + down + 1))
+    return Simd.Add(Simd.Add(Simd.ShiftLeft(sides, 2), sides), Simd.Add(Simd.ShiftLeft(middles, 2), Simd.ShiftLeft(middles, 1)))
+}
+
+SgrWeigh56Row :: (values: []s32, at: s64) -> s32x4 #inline {
+    sides := Simd.Add(Simd.Load(s32x4, values, at), Simd.Load(s32x4, values, at + 2))
+    middle := Simd.Load(s32x4, values, at + 1)
+    return Simd.Add(Simd.Add(Simd.ShiftLeft(sides, 2), sides), Simd.Add(Simd.ShiftLeft(middle, 2), Simd.ShiftLeft(middle, 1)))
+}
+
+SgrWeigh34 :: (values: []s32, at: s64, up: s64) -> s32x4 #inline {
+    corners := Simd.Add(Simd.Add(Simd.Load(s32x4, values, at), Simd.Load(s32x4, values, at + 2)),
+        Simd.Add(Simd.Load(s32x4, values, at + 2 * up), Simd.Load(s32x4, values, at + 2 * up + 2)))
+    cross := Simd.Add(Simd.Add(Simd.Load(s32x4, values, at + 1), Simd.Load(s32x4, values, at + up)),
+        Simd.Add(Simd.Add(Simd.Load(s32x4, values, at + up + 1), Simd.Load(s32x4, values, at + up + 2)),
+        Simd.Load(s32x4, values, at + 2 * up + 1)))
+    return Simd.Add(Simd.Add(Simd.ShiftLeft(corners, 1), corners), Simd.ShiftLeft(cross, 2))
+}
+
+// One pass of 7.17.3 into output rows SgrMaximumWidth apart. Every value
+// fits s32 lanes: box sums of squares stay below 2^29 at 12 bits, p is
+// clamped where z already reaches 255, and (256 - A) * B * reciprocal stays
+// below 2^32, so it is formed in u32 lanes.
 SgrBox :: (input: []u16, stride: s32, width: s32, height: s32,
-    set: s32, pass: s32, bit_depth: s32, output: []s32) {
+    set: s32, pass: s32, bit_depth: s32, output: []s32) #target {
     radius := SgrParameters(set, pass * 2)
     // The caller validated these; as comparisons they prove the indexes
     // below. Short guards keep each proof's fact set small.
@@ -60,66 +97,114 @@ SgrBox :: (input: []u16, stride: s32, width: s32, height: s32,
     n2e := n * n * epsilon
     scale: s64 = (1048576 + n2e / 2) / n2e
     reciprocal: s64 = (4096 + n / 2) / n
-    // A is at most 256 and B below 2^21 at 12 bits, so both fit s32.
-    a_values: [660]s32; b_values: [660]s32
-    // Window sums slide along per-column sums: column j covers input column
-    // j + 2 - radius over the 2*radius+1 rows centred on row iy + 2.
-    column_sums: [72]s64; column_squares: [72]s64
-    columns := width + 2 + 2 * radius
+    // From p_limit on, p * scale + 2^19 >= 255 * 2^20, so z is 255.
+    p_limit := (255 * 1048576 - 524288 + scale - 1) / scale
+    a_values: [680]s32; b_values: [680]s32
+    // Column j sums input column j + 2 - radius over the 2 * radius + 1
+    // rows centred on row iy + 2.
+    sums: [80]s32; squares: [80]s32
+    columns := cast(s64)(width + 2 + 2 * radius)
+    shift_a := 2 * (bit_depth - 8); shift_b := bit_depth - 8
+    zero := Simd.Zero(s32x4)
+    lanes_n := Simd.Splat(s32x4, cast(s32)n); lanes_scale := Simd.Splat(s32x4, cast(s32)scale)
+    lanes_limit := Simd.Splat(s32x4, cast(s32)p_limit)
+    lanes_255 := Simd.Splat(s32x4, 255); lanes_256 := Simd.Splat(s32x4, 256)
+    lanes_reciprocal := Simd.Splat(u32x4, cast(u32)reciprocal)
     for iy: 0..height + 1 {
         // The radius-2 pass is combined from even rows of A and B only.
         if pass == 0 && (iy & 1) != 0 { continue }
-        top := (cast(s32)iy + 2 - radius) * stride + 2 - radius
-        for j: 0..columns - 1 { column_sums[j] = 0; column_squares[j] = 0 }
-        for k: 0..2 * radius {
-            line := top + cast(s32)k * stride
-            for j: 0..columns - 1 {
-                value := cast(s64)input[line + cast(s32)j]
-                column_sums[j] += value; column_squares[j] += value * value
+        top := (cast(s64)iy + 2 - radius) * stride + 2 - radius
+        j: s64 = 0
+        while j + 4 <= columns {
+            s := zero; q := zero
+            for k: 0..2 * radius {
+                v := SgrLoadLanes(input, top + k * stride + j)
+                s = Simd.Add(s, v); q = Simd.Add(q, Simd.Mul(v, v))
             }
+            Simd.Store(sums[:], j, s); Simd.Store(squares[:], j, q)
+            j += 4
         }
-        a: s64; b: s64
-        for dx: 0..2 * radius - 1 { a += column_squares[dx]; b += column_sums[dx] }
-        row := iy * (SgrMaximumWidth + 2)
-        for ix: 0..width + 1 {
-            a += column_squares[ix + 2 * radius]; b += column_sums[ix + 2 * radius]
-            p := SgrRound(a, 2 * (bit_depth - 8)) * n
-            d := SgrRound(b, bit_depth - 8)
-            p -= d * d; if p < 0 { p = 0 }
-            z := SgrRound(p * scale, 20)
-            a2 := cast(s64)SgrXByXPlus1[ifx z < 255 then z else 255]
-            a_values[row + ix] = cast(s32)a2
-            b_values[row + ix] = cast(s32)SgrRound((256 - a2) * b * reciprocal, 12)
-            a -= column_squares[ix]; b -= column_sums[ix]
+        while j < columns {
+            s: s32; q: s32
+            for k: 0..2 * radius { v := cast(s32)input[top + k * stride + j]; s += v; q += v * v }
+            sums[j] = s; squares[j] = q
+            j += 1
+        }
+        // Lanes past the block read columns that stay zero and are never used.
+        row := cast(s64)iy * SgrRow
+        ix: s64 = 0
+        while ix < cast(s64)width + 2 {
+            a := zero; b := zero
+            for dx: 0..2 * radius {
+                a = Simd.Add(a, Simd.Load(s32x4, squares[:], ix + dx)); b = Simd.Add(b, Simd.Load(s32x4, sums[:], ix + dx))
+            }
+            d := SgrRoundLanes(b, shift_b)
+            p := Simd.Sub(Simd.Mul(SgrRoundLanes(a, shift_a), lanes_n), Simd.Mul(d, d))
+            p = Simd.Min(Simd.Max(p, zero), lanes_limit)
+            z := Simd.Min(Simd.ShiftRightRound(Simd.Mul(p, lanes_scale), 20), lanes_255)
+            a2 := Simd.Gather(SgrXByXPlus1, z)
+            t := Simd.Reinterpret(u32x4, Simd.Mul(Simd.Sub(lanes_256, a2), b))
+            b2 := Simd.Reinterpret(s32x4, Simd.ShiftRightRound(Simd.Mul(t, lanes_reciprocal), 12))
+            Simd.Store(a_values[:], row + ix, a2); Simd.Store(b_values[:], row + ix, b2)
+            ix += 4
         }
     }
-    up := SgrMaximumWidth + 2; down := 2 * up
-    for y: 0..height - 1 {
-        shift: s32 = 5
-        if pass == 0 && (y & 1) != 0 { shift = 4 }
-        for x: 0..width - 1 {
-            // 3x3 weights: pass 0 uses only the even rows, 5 at the sides and
-            // 6 in the middle; pass 1 uses 4 on the cross and 3 at corners.
+    up: s64 = SgrRow; down: s64 = 2 * SgrRow
+    for y: 0..cast(s64)height - 1 {
+        shift: u32 = 9
+        if pass == 0 && (y & 1) != 0 { shift = 8 }
+        x: s64 = 0
+        while x < cast(s64)width {
             at := y * up + x
-            a: s64; b: s64
+            a: s32x4; b: s32x4
             if pass == 0 && (y & 1) == 0 {
-                a = 5 * cast(s64)(a_values[at] + a_values[at + 2] + a_values[at + down] + a_values[at + down + 2]) +
-                    6 * cast(s64)(a_values[at + 1] + a_values[at + down + 1])
-                b = 5 * cast(s64)(b_values[at] + b_values[at + 2] + b_values[at + down] + b_values[at + down + 2]) +
-                    6 * cast(s64)(b_values[at + 1] + b_values[at + down + 1])
+                a = SgrWeigh56(a_values[:], at, down); b = SgrWeigh56(b_values[:], at, down)
             } else if pass == 0 {
-                a = 5 * cast(s64)(a_values[at + up] + a_values[at + up + 2]) + 6 * cast(s64)a_values[at + up + 1]
-                b = 5 * cast(s64)(b_values[at + up] + b_values[at + up + 2]) + 6 * cast(s64)b_values[at + up + 1]
+                a = SgrWeigh56Row(a_values[:], at + up); b = SgrWeigh56Row(b_values[:], at + up)
             } else {
-                a = 3 * cast(s64)(a_values[at] + a_values[at + 2] + a_values[at + down] + a_values[at + down + 2]) +
-                    4 * cast(s64)(a_values[at + 1] + a_values[at + up] + a_values[at + up + 1] + a_values[at + up + 2] +
-                    a_values[at + down + 1])
-                b = 3 * cast(s64)(b_values[at] + b_values[at + 2] + b_values[at + down] + b_values[at + down + 2]) +
-                    4 * cast(s64)(b_values[at + 1] + b_values[at + up] + b_values[at + up + 1] + b_values[at + up + 2] +
-                    b_values[at + down + 1])
+                a = SgrWeigh34(a_values[:], at, up); b = SgrWeigh34(b_values[:], at, up)
             }
-            source := cast(s64)input[(y + 3) * stride + x + 3]
-            output[y * SgrMaximumWidth + x] = cast(s32)SgrRound(a * source + b, 8 + shift - 4)
+            source := SgrLoadLanes(input, (y + 3) * stride + x + 3)
+            Simd.Store(output, y * SgrMaximumWidth + x, Simd.ShiftRightRound(Simd.Add(Simd.Mul(a, source), b), shift))
+            x += 4
+        }
+    }
+}
+
+// The projection of 7.17.3 over both passes, a pass without a radius
+// standing in with the scaled source.
+SgrProject :: (input: []u16, stride: s32, width: s32, height: s32, set: s32,
+    projection0: s32, projection1: s32, bit_depth: s32, pass0: []s32, pass1: []s32, output: []u16, output_stride: s32) #target {
+    if width < 1 || width > SgrMaximumWidth || height < 1 || height > 8 || stride < width + 6 || stride > 72 { return }
+    if input.count < cast(s64)(height + 5) * stride + width + 6 || pass0.count < cast(s64)height * SgrMaximumWidth ||
+        pass1.count < cast(s64)height * SgrMaximumWidth || output_stride < width ||
+        output.count < (cast(s64)height - 1) * output_stride + width {
+        return
+    }
+    radius0 := SgrParameters(set, 0); radius1 := SgrParameters(set, 2)
+    zero := Simd.Zero(s32x4)
+    maximum := Simd.Splat(s32x4, cast(s32)((cast(u32)1 << cast(u32)bit_depth) - 1))
+    half := Simd.Splat(s32x4, 1024)
+    w0 := Simd.Splat(s32x4, projection0); w1 := Simd.Splat(s32x4, projection1)
+    w2 := Simd.Splat(s32x4, 128 - projection0 - projection1)
+    for y: 0..cast(s64)height - 1 {
+        x: s64 = 0
+        while x < cast(s64)width {
+            u := Simd.ShiftLeft(SgrLoadLanes(input, (y + 3) * stride + x + 3), 4)
+            first := ifx radius0 != 0 then Simd.Load(s32x4, pass0, y * SgrMaximumWidth + x) else u
+            second := ifx radius1 != 0 then Simd.Load(s32x4, pass1, y * SgrMaximumWidth + x) else u
+            v := Simd.Add(Simd.Mul(w1, u), Simd.Add(Simd.Mul(w0, first), Simd.Mul(w2, second)))
+            // Round2 of a signed sum floors: the arithmetic shift does.
+            value := Simd.Min(Simd.Max(Simd.ShiftRight(Simd.Add(v, half), 11), zero), maximum)
+            at := y * output_stride + x
+            if x + 4 <= cast(s64)width {
+                Simd.StoreLow(output, at, Simd.Narrow(u16x8, value, value))
+            } else {
+                output[at] = cast(u16)Simd.Lane(value, 0)
+                if x + 1 < cast(s64)width { output[at + 1] = cast(u16)Simd.Lane(value, 1) }
+                if x + 2 < cast(s64)width { output[at + 2] = cast(u16)Simd.Lane(value, 2) }
+            }
+            x += 4
         }
     }
 }
@@ -163,26 +248,8 @@ FilterSgrBlock :: (input: []u16, stride: s32, width: s32, height: s32,
 // output rows output_stride apart.
 SgrFilterInto :: (input: []u16, stride: s32, width: s32, height: s32,
     set: s32, projection0: s32, projection1: s32, bit_depth: s32, output: []u16, output_stride: s32) {
-    if width < 1 || width > SgrMaximumWidth || height < 1 || height > 8 || stride < width + 6 || stride > 72 { return }
-    if input.count < cast(s64)(height + 5) * stride + width + 6 || output_stride < width || output_stride > 4096 ||
-        output.count < (cast(s64)height - 1) * output_stride + width {
-        return
-    }
-    maximum := cast(s64)((cast(u64)1 << cast(u64)bit_depth) - 1)
     pass0: [512]s32; pass1: [512]s32
     SgrBox(input, stride, width, height, set, 0, bit_depth, pass0[:])
     SgrBox(input, stride, width, height, set, 1, bit_depth, pass1[:])
-    radius0 := SgrParameters(set, 0); radius1 := SgrParameters(set, 2)
-    w0 := cast(s64)projection0; w1 := cast(s64)projection1; w2 := 128 - w0 - w1
-    for y: 0..height - 1 {
-        for x: 0..width - 1 {
-            u := cast(s64)input[(y + 3) * stride + x + 3] * 16
-            v := w1 * u
-            v += w0 * (ifx radius0 != 0 then cast(s64)pass0[y * SgrMaximumWidth + x] else u)
-            v += w2 * (ifx radius1 != 0 then cast(s64)pass1[y * SgrMaximumWidth + x] else u)
-            value := SgrRound(v, 11)
-            if value < 0 { value = 0 }; if value > maximum { value = maximum }
-            output[y * output_stride + x] = cast(u16)value
-        }
-    }
+    SgrProject(input, stride, width, height, set, projection0, projection1, bit_depth, pass0[:], pass1[:], output, output_stride)
 }

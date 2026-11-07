@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
-"""AV1 self-guided restoration scalar vectors; not encoded stream conformance."""
+"""AV1 self-guided restoration vectors; not encoded stream conformance.
+
+Blocks up to 8x8 go through FilterSgrBlock; wide blocks up to 64x8 go
+straight to SgrFilterInto, with sentinels around the output, so every
+vector tail and the flat-maximum and checkerboard extremes are checked."""
 import argparse
 import hashlib
 import json
@@ -19,17 +23,18 @@ int main(void) {
   int depth,w,h,set,projection[2];
   static int32_t scratch[SGRPROJ_TMPBUF_SIZE/sizeof(int32_t)];
   while(scanf("%d%d%d%d%d%d",&depth,&w,&h,&set,&projection[0],&projection[1])==6) {
-    uint16_t input[16*16]={0},output[8*11];
+    uint16_t input[14*70]={0},output[8*67];
+    if(w<1||w>64||h<1||h>8)return 1;
     for(int y=0;y<h+6;y++)for(int x=0;x<w+6;x++) {
       unsigned value;if(scanf("%u",&value)!=1||value>=(1u<<depth))return 1;
-      input[y*16+x]=value;
+      input[y*70+x]=value;
     }
-    for(int i=0;i<8*11;i++)output[i]=65535;
-    if(av1_apply_selfguided_restoration_c(CONVERT_TO_BYTEPTR(input+3*16+3),w,h,16,set,
-       projection,CONVERT_TO_BYTEPTR(output),11,scratch,depth,1)!=0)return 2;
-    for(int y=0;y<8;y++)for(int x=0;x<11;x++) {
-      if(y<h&&x<w)printf("%u ",output[y*11+x]);
-      else if(output[y*11+x]!=65535)return 3;
+    for(int i=0;i<8*67;i++)output[i]=65535;
+    if(av1_apply_selfguided_restoration_c(CONVERT_TO_BYTEPTR(input+3*70+3),w,h,70,set,
+       projection,CONVERT_TO_BYTEPTR(output),67,scratch,depth,1)!=0)return 2;
+    for(int y=0;y<8;y++)for(int x=0;x<67;x++) {
+      if(y<h&&x<w)printf("%u ",output[y*67+x]);
+      else if(output[y*67+x]!=65535)return 3;
     }
     printf("\n");
   }
@@ -99,6 +104,16 @@ def reference(pixels,w,h,set,projection0,projection1,depth):
     return output,clips,changed
 
 
+# Wide blocks: full vectors, every tail length and single rows. Seeds that
+# are 8 mod 9 hold the maximum everywhere, where (256 - A) * B * reciprocal
+# is largest.
+WIDE_SHAPES = ((64,8),(61,8),(34,7),(13,8),(9,3),(64,1))
+
+
+def wide_sample(seed,y,x,depth):
+    return (1 << depth)-1 if seed%9 == 8 else sample(seed,y,x,depth)
+
+
 def main():
     parser = argparse.ArgumentParser()
     for name in ('root','out','aom'):
@@ -125,7 +140,23 @@ def main():
                     pixels = [[sample(seed,y,x,depth) for x in range(w+6)] for y in range(h+6)]
                     expected,nclips,nchanged = reference(pixels,w,h,set,p0,p1,depth)
                     clips += nclips;changed += nchanged
-                    cases.append(dict(depth=depth,w=w,h=h,set=set,seed=seed,p0=p0,p1=p1,pixels=pixels,expected=expected))
+                    cases.append(dict(depth=depth,w=w,h=h,set=set,seed=seed,p0=p0,p1=p1,pixels=pixels,expected=expected,wide=False))
+        for shape,(w,h) in enumerate(WIDE_SHAPES):
+            for set in range(16):
+                p0,p1 = projections[(shape*16+set+depth)%8]
+                if PARAMETERS[set][0] == 0:
+                    p0 = 0
+                if PARAMETERS[set][2] == 0:
+                    p1 = 95
+                seed = 1000+shape*16+set
+                pixels = [[wide_sample(seed,y,x,depth) for x in range(w+6)] for y in range(h+6)]
+                expected,nclips,nchanged = reference(pixels,w,h,set,p0,p1,depth)
+                clips += nclips;changed += nchanged
+                cases.append(dict(depth=depth,w=w,h=h,set=set,seed=seed,p0=p0,p1=p1,pixels=pixels,expected=expected,wide=True))
+    wide = sum(c['wide'] for c in cases)
+    flat = sum(c['wide'] and c['seed']%9 == 8 for c in cases)
+    if not flat:
+        raise SystemExit('self-guided flat-maximum coverage missing')
     data = []
     for c in cases:
         params = [c[k] for k in ('depth','w','h','set','p0','p1')]
@@ -150,6 +181,15 @@ SgrInput :: (seed: s32, depth: s32, width: s32, height: s32) -> [196]u16 {
     } }
     return result
 }
+SgrWideInput :: (seed: s32, depth: s32, width: s32, height: s32) -> [980]u16 {
+    result: [980]u16
+    for i: 0..979 { result[i] = 65535 }
+    maximum := cast(u16)((cast(u32)1 << cast(u32)depth) - 1)
+    for y: 0..height+5 { for x: 0..width+5 {
+        result[y*70+x] = ifx seed%9 == 8 then maximum else Sample(seed,cast(s32)y,cast(s32)x,depth)
+    } }
+    return result
+}
 '''
     lines = ['#import, file "'+module+'";','#import, file "'+bounds+'";','using Codec :: #import "image_codec/api"',generator,
              '#program_export','main :: () -> s32 {','    if SgrBoundaries() != 0 { return 99 }']
@@ -160,6 +200,15 @@ SgrInput :: (seed: s32, depth: s32, width: s32, height: s32) -> [196]u16 {
     for group in range(groups):
         lines.append(f'Group{group} :: () -> s32 {{')
         for c in cases[group*16:(group+1)*16]:
+            if c['wide']:
+                lines += ['    {',f'        input := SgrWideInput({c["seed"]}, {c["depth"]}, {c["w"]}, {c["h"]})',
+                          '        output: [536]u16',
+                          '        for i: 0..535 { output[i] = 65535 }',
+                          f'        SgrFilterInto(input[:], 70, {c["w"]}, {c["h"]}, {c["set"]}, {c["p0"]}, {c["p1"]}, {c["depth"]}, output[:], 67)',
+                          '        expected: ['+str(c['w']*c['h'])+']u16 = .['+','.join(map(str,c['expected']))+']',
+                          f'        for y: 0..{c["h"]-1} {{ for x: 0..{c["w"]-1} {{ if output[y*67+x] != expected[y*{c["w"]}+x] {{ return 4 }} }} }}',
+                          f'        for j: 0..535 {{ if (j/67 >= {c["h"]} || j%67 >= {c["w"]}) && output[j] != 65535 {{ return 5 }} }}','    }']
+                continue
             lines += ['    {',f'        input := SgrInput({c["seed"]}, {c["depth"]}, {c["w"]}, {c["h"]})',
                       f'        result := FilterSgrBlock(input[:], 14, {c["w"]}, {c["h"]}, {c["set"]}, {c["p0"]}, {c["p1"]}, {c["depth"]})',
                       '        expected: ['+str(c['w']*c['h'])+']u16 = .['+','.join(map(str,c['expected']))+']',
@@ -170,8 +219,9 @@ SgrInput :: (seed: s32, depth: s32, width: s32, height: s32) -> [196]u16 {
     (a.out/'av1_sgr_vectors.zi').write_text('\n'.join(lines)+'\n')
     (a.out/'oracle.json').write_text(json.dumps(dict(revision=PIN,library_sha256=digest(library),host_sha256=hashlib.sha256(HOST.encode()).hexdigest(),
         vectors=len(cases),depths=[8,10,12],parameter_sets=list(range(16)),projections=projections,changed_samples=changed,output_clips=clips,
-        block_shapes=[[1,1],[4,4],[8,8],[3,7]],scope='standalone scalar self-guided restoration with caller-resolved 3-pixel halo; not encoded frame conformance'),indent=2)+'\n')
-    print(f'Pinned self-guided oracle: {len(cases)} vectors, {changed} changed samples, {clips} output clips')
+        block_shapes=[[1,1],[4,4],[8,8],[3,7]],wide_block_shapes=[list(s) for s in WIDE_SHAPES],wide_vectors=wide,flat_maximum_vectors=flat,
+        scope='standalone self-guided restoration with caller-resolved 3-pixel halo; not encoded frame conformance'),indent=2)+'\n')
+    print(f'Pinned self-guided oracle: {len(cases)} vectors ({wide} wide, {flat} flat maximum), {changed} changed samples, {clips} output clips')
 
 
 if __name__ == '__main__':

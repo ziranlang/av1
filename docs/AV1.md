@@ -463,21 +463,26 @@ taps, identity and chroma five-tap filters. The corpus exercises three
 intermediate clips and 1,586 final clips, including 1x1 and rectangular blocks.
 
 `filter/sgr.zi` provides allocation-free `FilterSgrBlock` for self-guided restoration
-up to 8x8 with the same three-pixel halo contract. It directly computes the
-two normative box-filter passes and signed projection with bounded 64-bit
-intermediates. All 16 parameter sets are supported. Projection coefficients
-use `LrSgrXqd` semantics, including the implicit values for disabled passes.
-The frame post-filter calls the unchecked kernel `SgrFilterInto` the same way.
+up to 8x8 with the same three-pixel halo contract. It computes the two
+normative box-filter passes and the signed projection four columns at a time
+in 32-bit lanes. The variance term is capped where the normative strength
+already saturates at 255, so every product fits 32 bits. All 16 parameter
+sets are supported. Projection coefficients use `LrSgrXqd` semantics,
+including the implicit values for disabled passes. The frame post-filter
+calls the unchecked kernel `SgrFilterInto` the same way, on blocks up to
+64x8.
 
-`build-queue -- sh tests/av1_sgr.sh` passed 1,536 vectors against the pinned
+`build-queue -- sh tests/av1_sgr.sh` passed 1,824 vectors against the pinned
 libaom scalar function and an independent normative reference. It covers
 all parameter sets, 8/10/12-bit samples, signed projection boundaries, both
-single-radius cases, 1x1 and rectangular blocks, 12,240 changed samples and
-694 clipped outputs. Invalid implicit coefficients reject explicitly.
+single-radius cases, 1x1 and rectangular blocks, 288 wide blocks up to 64x8
+with every vector tail (30 of them at the maximum sample everywhere),
+29,794 changed samples and 1,273 clipped outputs. Invalid implicit
+coefficients reject explicitly.
 
 These tests pass source and saved IR in C, Go and the direct portable VM, with
 ASan/UBSan on generated C. Receipts are saved under ignored
-`build/scratch/av1-{deblock,cdef,wiener,sgr}`. These are scalar math tests;
+`build/scratch/av1-{deblock,cdef,wiener,sgr}`. These are kernel math tests;
 frame scheduling in `filter/post_filter.zi` is covered by the intra frame suite.
 
 `build-queue -- sh tests/av1_filter_kernels.sh` combines the four scalar test
@@ -904,6 +909,9 @@ Then, on Ziran's `std/simd` vectors, with SSE2 to AVX2 chosen at run time:
   vectors, validated once per segment.
 - `filter/post_filter.zi`: CDEF copies its luma direction block and, away
   from the frame edges, each padded row as `u16x8` vectors.
+- `filter/sgr.zi`: both box-filter passes and the projection run four
+  columns at a time as `s32x4` vectors, with one gather per reciprocal
+  lookup.
 
 And in scalar code:
 
@@ -911,12 +919,14 @@ And in scalar code:
   the token straight to its color, and a map checks its five CDFs once
   instead of on every token.
 
-It now takes 8 to 166 ms per frame, the medians of one benchmark run: 2 to 4
-times libaom and 3 to 7 times dav1d. Entropy decoding is the largest remaining cost. The
-generated C still bounds-checks indices it cannot prove, such as row times
-stride, and calls the symbol decoder out of line. CDEF filtering, the inverse
-transforms and deblocking are the only hand-written SIMD paths; no thread, other machine, cold start or energy figure
-has been measured.
+It now takes 7 to 162 ms per frame, the medians of the fastest of three
+benchmark runs on a busy machine: 0.9 to 3.7 times libaom and 1.7 to 6.9 times
+dav1d. The screen-content clip decodes faster than libaom. Entropy decoding is
+the largest remaining cost. The generated C still bounds-checks indices it
+cannot prove, such as row times stride, and calls the symbol decoder out of
+line. CDEF, the inverse transforms, deblocking and self-guided restoration are
+the only hand-written SIMD paths; no thread, other machine, cold start or
+energy figure has been measured.
 
 ## Specification and provenance
 

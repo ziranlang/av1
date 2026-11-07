@@ -1,6 +1,6 @@
 #!/bin/sh
-# Baseline timing of the authored scalar decoder against pinned libaom and
-# dav1d on one core. Run through build-queue. Records numbers, not claims.
+# Baseline timing of the authored decoder against pinned libaom and dav1d on
+# one core. Run through build-queue. Records numbers, not claims.
 set -eu
 . "$(dirname -- "$0")/common.sh"
 out="$root/build/scratch/av1-benchmark"
