@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Scalar AV1 edge masks/narrow/wide samples, differential pinned libaom oracle."""
+"""AV1 edge masks/narrow/wide samples, one line and four-line segments, differential pinned libaom oracle."""
 import argparse
 import hashlib
 import json
@@ -37,6 +37,46 @@ int main(void) {
     for(int i=0;i<16;i++) {
       for(int lane=0;lane<4;lane++)if(horizontal[i*20+lane+3]!=horizontal[i*20+3]||vertical[(lane+3)*20+i]!=horizontal[i*20+3])return 3;
       printf("%u ",horizontal[i*20+3]);
+    }
+    for(int y=0;y<16;y++)for(int x=0;x<20;x++) {
+      if((x<3||x>=7)&&horizontal[y*20+x]!=65535)return 4;
+      if((y<3||y>=7||x>=16)&&vertical[y*20+x]!=65535)return 5;
+    }
+    printf("\n");
+  }
+  return 0;
+}
+'''
+
+# Four different lines per segment, as the frame filter applies them.
+LINES_HOST = r'''
+#include <stdint.h>
+#include <stddef.h>
+#include <stdio.h>
+#include "config/aom_dsp_rtcd.h"
+typedef void (*filter_fn)(uint16_t *,int,const uint8_t *,const uint8_t *,const uint8_t *,int);
+int main(void) {
+  int depth,length,blimit,limit,threshold;
+  while(scanf("%d%d%d%d%d",&depth,&length,&blimit,&limit,&threshold)==5) {
+    uint16_t horizontal[16*20],vertical[16*20];
+    uint8_t b=blimit,l=limit,t=threshold;
+    for(int i=0;i<16*20;i++)horizontal[i]=vertical[i]=65535;
+    for(int lane=0;lane<4;lane++)for(int i=0;i<16;i++){
+      unsigned value;if(scanf("%u",&value)!=1||value>=(1u<<depth))return 1;
+      horizontal[i*20+lane+3]=value;vertical[(lane+3)*20+i]=value;
+    }
+    filter_fn hf,vf;
+    switch(length){
+      case 4:hf=aom_highbd_lpf_horizontal_4_c;vf=aom_highbd_lpf_vertical_4_c;break;
+      case 6:hf=aom_highbd_lpf_horizontal_6_c;vf=aom_highbd_lpf_vertical_6_c;break;
+      case 8:hf=aom_highbd_lpf_horizontal_8_c;vf=aom_highbd_lpf_vertical_8_c;break;
+      case 14:hf=aom_highbd_lpf_horizontal_14_c;vf=aom_highbd_lpf_vertical_14_c;break;
+      default:return 2;
+    }
+    hf(horizontal+8*20+3,20,&b,&l,&t,depth);vf(vertical+3*20+8,20,&b,&l,&t,depth);
+    for(int lane=0;lane<4;lane++)for(int i=0;i<16;i++) {
+      if(vertical[(lane+3)*20+i]!=horizontal[i*20+lane+3])return 3;
+      printf("%u ",horizontal[i*20+lane+3]);
     }
     for(int y=0;y<16;y++)for(int x=0;x<20;x++) {
       if((x<3||x>=7)&&horizontal[y*20+x]!=65535)return 4;
@@ -133,13 +173,41 @@ def main():
             raise SystemExit(f'native/spec deblock disagreement at {i}: {actual} vs {c["expected"]}')
     if not all(counts.values()):
         raise SystemExit('deblock branch coverage missing')
+    # Four-line segments: every third case's parameters over four lines drawn
+    # from different cases of the same depth.
+    lines_source = a.out/'oracle_lines.c';lines_source.write_text(LINES_HOST);lines_host = a.out/'oracle_lines'
+    run(shlex.split(os.environ.get('CC','cc'))+['-std=c11','-O2','-I'+str(a.aom),'-I'+str(config),str(lines_source),str(library),'-lm','-o',str(lines_host)])
+    segments = [];mixed = 0
+    for c in range(0,len(cases),3):
+        base = c//1024*1024;case = cases[c]
+        lines = [cases[base+(c-base+d*257)%1024]['source'] for d in range(4)]
+        expected = []
+        flags = []
+        for line in lines:
+            output,line_flags = reference(line,case['length'],case['blimit'],case['limit'],case['threshold'],case['depth'])
+            expected += output;flags.append(tuple(line_flags))
+        mixed += len(set(flags)) > 1
+        segments.append(dict(case,lines=lines,expected=expected))
+    data = [' '.join(map(str,[c[k] for k in ('depth','length','blimit','limit','threshold')]+sum(c['lines'],[]))) for c in segments]
+    outputs = run([str(lines_host)],input='\n'.join(data)+'\n',text=True,capture_output=True).stdout.splitlines()
+    if len(outputs) != len(segments):
+        raise SystemExit('native four-line deblock count mismatch')
+    for i,(c,line) in enumerate(zip(segments,outputs)):
+        if list(map(int,line.split())) != c['expected']:
+            raise SystemExit(f'native/spec four-line deblock disagreement at {i}')
+    if mixed == 0:
+        raise SystemExit('four-line deblock segments never mix line decisions')
     module = os.path.relpath(a.root/'src/filter/deblock.zi',a.out)
     bounds = os.path.relpath(a.root/'tests/av1_deblock.zi',a.out)
     lines = ['#import, file "'+module+'";','#import, file "'+bounds+'";','using Codec :: #import "image_codec/api"',
-             '#program_export','main :: () -> s32 {','    if DeblockBoundaries() != 0 { return 99 }']
+             '#program_export','main :: () -> s32 {','    if DeblockBoundaries() != 0 { return 99 }',
+             '    if DeblockLinesBoundaries() != 0 { return 98 }']
     groups = (len(cases)+15)//16
     for group in range(groups):
         lines.append(f'    if Group{group}() != 0 {{ return {group+1} }}')
+    line_groups = (len(segments)+15)//16
+    for group in range(line_groups):
+        lines.append(f'    if Lines{group}() != 0 {{ return {groups+group+1} }}')
     lines += ['    return 0','}']
     for group in range(groups):
         lines.append(f'Group{group} :: () -> s32 {{')
@@ -151,11 +219,21 @@ def main():
                       f'        if result.error.code != DecodeOK || {checks} {{ return 1 }}',
                       '        for j: 0..15 { if result.samples[j] != expected[j] { return 2 } }','    }']
         lines += ['    return 0','}']
+    for group in range(line_groups):
+        lines.append(f'Lines{group} :: () -> s32 {{')
+        for c in segments[group*16:(group+1)*16]:
+            lines += ['    {','        lines: [64]u16 = .['+','.join(map(str,sum(c['lines'],[])))+']',
+                      '        expected: [64]u16 = .['+','.join(map(str,c['expected']))+']',
+                      f'        if DeblockLinesCase(lines[:], expected[:], {c["length"]}, {c["blimit"]}, {c["limit"]}, {c["threshold"]}, {c["depth"]}) != 0 {{ return 1 }}',
+                      '    }']
+        lines += ['    return 0','}']
     (a.out/'av1_deblock_vectors.zi').write_text('\n'.join(lines)+'\n')
     (a.out/'oracle.json').write_text(json.dumps(dict(revision=PIN,library_sha256=digest(library),host_sha256=hashlib.sha256(HOST.encode()).hexdigest(),
-        vectors=len(cases),depths=[8,10,12],filter_lengths=[4,6,8,14],native_orientations=['horizontal','vertical'],coverage=counts,
-        scope='standalone scalar edge masks/narrow/wide math; no frame boundary/threshold scheduling or encoded-frame conformance'),indent=2)+'\n')
-    print(f'Pinned deblock oracle: {len(cases)} vectors, horizontal/vertical parity, {counts["changed_samples"]} changed samples')
+        lines_host_sha256=hashlib.sha256(LINES_HOST.encode()).hexdigest(),
+        vectors=len(cases),line_segments=len(segments),mixed_decision_segments=mixed,depths=[8,10,12],filter_lengths=[4,6,8,14],native_orientations=['horizontal','vertical'],coverage=counts,
+        scope='standalone edge masks/narrow/wide math, one line and four-line segments; no frame boundary/threshold scheduling or encoded-frame conformance'),indent=2)+'\n')
+    print(f'Pinned deblock oracle: {len(cases)} vectors, {len(segments)} four-line segments ({mixed} with mixed line decisions), '
+          f'horizontal/vertical parity, {counts["changed_samples"]} changed samples')
 
 
 if __name__ == '__main__':

@@ -16,3 +16,5 @@
 - Tests run bundles on the portable VM with `zi2zx run --vm`.
 - The critical path runs each stage and conformance shard in its own build-queue ticket.
 - Inverse transforms on SIMD vectors.
+- Deblocking on SIMD vectors.
+- The critical path queues a ticket the queue failed to run again and can resume a stopped run.

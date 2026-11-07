@@ -408,13 +408,21 @@ under ignored `build/scratch/av1{,-headers}/receipt.json` after complete runs.
 thresholds, then applies the narrow or 6/8/14-sample wide filter. Scheduling and
 adaptive threshold selection remain caller responsibilities. Input and threshold
 bounds are validated before filtering; failure returns no committed samples.
+`FilterDeblockLines` filters the four lines of an edge segment in place, one
+line per `std/simd` `s32x4` lane, with the same masks as lane masks. It is a
+`#target` procedure, reads only the samples the filter length covers and writes
+only those it can change. A sample above the depth, or any tap outside the
+buffer, rejects the whole segment unwritten. The frame loop filter uses it for
+every edge.
 
 `build-queue -- sh tests/av1_deblock.sh` passed 3,072 vectors against both
 horizontal and vertical pinned libaom scalar functions and an independent
 normative reference. It covers 8/10/12-bit samples, enabled/disabled edges,
 high variance, flat and wider-flat cases, signed rounding boundaries and 5,136
 changed samples. Native oracle guard cells and every inactive product sample
-are checked.
+are checked. 1,024 four-line segments, each with four different lines and 363
+with differing decisions between lines, must match the pinned libaom functions
+across horizontal and vertical edges, leaving every guard cell unchanged.
 
 `filter/cdef.zi` provides allocation-free `FindCdefDirection` and `FilterCdefBlock`.
 The filter consumes a caller-resolved two-pixel halo, uses 30000 only for
@@ -766,7 +774,9 @@ build-queue -- sh tests/av1_obu_range.sh
 
 `sh tests/av1_critical_path.sh` runs 26 combined owned stages, each stage and
 each conformance shard in its own build-queue ticket so other projects build
-between them. They include the transform, prediction, filter and grain kernels, encoded-grain
+between them. A ticket the queue fails to run (exit 78) is queued again, at
+most three times. `sh tests/av1_critical_path.sh resume` continues a stopped
+run from its first stage or conformance shard that has not passed. They include the transform, prediction, filter and grain kernels, encoded-grain
 frames, the 46 libaom intra frames, OBU framing and the conformance corpus.
 `tests/av1_obu_framing.sh` checks 96 framing variants (split headers, tile
 groups, redundant/padding/reserved OBUs, layer dropping and malformed orders);
@@ -889,12 +899,14 @@ Then, on Ziran's `std/simd` vectors, with SSE2 to AVX2 chosen at run time:
   `s16x8` vector.
 - `transform/inverse_transform.zi`: each transform pass runs four rows or
   columns as `s32x4` vectors and skips all-zero groups.
+- `filter/deblock.zi`: each edge segment filters its four lines as `s32x4`
+  vectors, validated once per segment.
 
-It now takes 8 to 169 ms per frame, the medians of one benchmark run: 2 to 4
-times libaom and 3 to 9 times dav1d. Entropy decoding is the largest remaining cost. The
+It now takes 8 to 166 ms per frame, the medians of one benchmark run: 2 to 4
+times libaom and 3 to 7 times dav1d. Entropy decoding is the largest remaining cost. The
 generated C still bounds-checks indices it cannot prove, such as row times
-stride, and calls the symbol decoder out of line. CDEF filtering and the inverse
-transforms are the only hand-written SIMD paths; no thread, other machine, cold start or energy figure
+stride, and calls the symbol decoder out of line. CDEF filtering, the inverse
+transforms and deblocking are the only hand-written SIMD paths; no thread, other machine, cold start or energy figure
 has been measured.
 
 ## Specification and provenance

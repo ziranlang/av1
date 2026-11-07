@@ -1,8 +1,11 @@
 #!/bin/sh
 # Run directly, not under build-queue: the setup, every stage and each
 # conformance shard take their own build-queue ticket, so other projects
-# build between them. This suite reports the current authored scope
-# explicitly; no full-AV1 claim is implied and the AVIF facade default is unchanged.
+# build between them. `sh tests/av1_critical_path.sh resume` continues a
+# stopped run from its first stage or conformance shard that has not passed,
+# on the same toolchain snapshot; the finish step still checks every source.
+# This suite reports the current authored scope explicitly; no full-AV1 claim
+# is implied and the AVIF facade default is unchanged.
 set -eu
 root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd -P)
 # Every stage runs on one private copy of the Ziran binaries, so peers may
@@ -11,28 +14,52 @@ snapshot="$root/build/toolchain"
 queue=
 if command -v build-queue >/dev/null 2>&1; then queue='build-queue --'; fi
 step=${1:-}
+# One build-queue ticket. The queue exits 78 when it fails around the
+# command (admission, its registry or the fork) and passes the command's own
+# status through, so a 78 ticket is queued again, at most three times.
+ticket() {
+    attempt=1
+    while :; do
+        status=0
+        $queue "$@" || status=$?
+        if test "$status" -ne 78 || test -z "$queue" || test "$attempt" -ge 3; then return "$status"; fi
+        printf 'build-queue did not run the ticket (exit 78); queueing it again\n' >&2
+        attempt=$((attempt + 1))
+    done
+}
 case "$step" in
-'')
+''|resume)
     cd "$root"
-    $queue sh tests/av1_critical_path.sh setup
+    passed=build/scratch/av1/stages-passed.txt
+    conformance=build/scratch/av1-conformance
+    if test "$step" = resume && { test ! -f "$passed" || test ! -x "$snapshot/ziran"; }; then
+        printf 'no stopped run to resume\n' >&2; exit 1
+    fi
+    if test "$step" != resume; then ticket sh tests/av1_critical_path.sh setup; fi
     for stage in obu_range headers entropy_tiles coefficient_cdf_data scalar_kernels transform_type inverse_transform intra_predict filter_intra directional palette chroma color_palette color_palette_boundaries key_frames key_controls coefficients still_partitions boundaries filter_kernels grain_kernels grain_frames intra_frames engine_parity obu_framing conformance; do
+        if test "$step" = resume && grep -qx "$stage" "$passed"; then continue; fi
         if test "$stage" = conformance; then
-            $queue env ZIRAN_BIN_DIR="$snapshot" ZIRAN_BIN="$snapshot/ziran" AV1_CONFORMANCE_SHARDS=prepare sh tests/av1_conformance.sh
-            shards=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["shards"])' build/scratch/av1-conformance/oracle.json)
+            # A resumed run keeps the shards that passed after this run's prepare.
+            if test "$step" != resume || ! ls "$conformance"/shard*/passed >/dev/null 2>&1; then
+                ticket env ZIRAN_BIN_DIR="$snapshot" ZIRAN_BIN="$snapshot/ziran" AV1_CONFORMANCE_SHARDS=prepare sh tests/av1_conformance.sh
+            fi
+            shards=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["shards"])' "$conformance/oracle.json")
             shard=0
             while test "$shard" -lt "$shards"; do
-                $queue env ZIRAN_BIN_DIR="$snapshot" ZIRAN_BIN="$snapshot/ziran" AV1_CONFORMANCE_SHARDS="$shard" sh tests/av1_conformance.sh
+                if test "$step" != resume || test ! -f "$conformance/shard$shard/passed"; then
+                    ticket env ZIRAN_BIN_DIR="$snapshot" ZIRAN_BIN="$snapshot/ziran" AV1_CONFORMANCE_SHARDS="$shard" sh tests/av1_conformance.sh
+                fi
                 shard=$((shard + 1))
             done
         else
-            $queue env ZIRAN_BIN_DIR="$snapshot" ZIRAN_BIN="$snapshot/ziran" sh "tests/av1_$stage.sh"
+            ticket env ZIRAN_BIN_DIR="$snapshot" ZIRAN_BIN="$snapshot/ziran" sh "tests/av1_$stage.sh"
         fi
-        printf '%s\n' "$stage" >> build/scratch/av1/stages-passed.txt
+        printf '%s\n' "$stage" >> "$passed"
     done
-    $queue sh tests/av1_critical_path.sh finish
+    ticket sh tests/av1_critical_path.sh finish
     exit 0;;
 setup|finish) ;;
-*) printf 'usage: sh tests/av1_critical_path.sh\n' >&2; exit 1;;
+*) printf 'usage: sh tests/av1_critical_path.sh [resume]\n' >&2; exit 1;;
 esac
 . "$root/tests/common.sh"
 if test "$step" = setup; then
@@ -61,6 +88,8 @@ git=lambda *args:subprocess.run(['git','-C',str(toolchain),*args],check=True,tex
 files=sorted((root/'src').rglob('*'))+sorted((root/'tests').glob('av1_*'))+[root/'tests/common.sh',root/'docs/AV1.md']
 (out/'sources-start.json').write_text(json.dumps({str(path.relative_to(root)):digest(path) for path in files if path.is_file()},indent=2)+'\n')
 (out/'stages-passed.txt').write_text('')
+# A new run never resumes an earlier run's conformance shards.
+for marker in (root/'build/scratch/av1-conformance').glob('shard*/passed'):marker.unlink()
 PY
 exit 0
 fi

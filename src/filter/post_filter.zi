@@ -47,10 +47,11 @@ PostFilterStrength :: (frame: *IntraFrame, header: *StillFrameHeader,
     return result
 }
 
-// 7.14.2 edge process at luma 4x4 position (row, column). Intra blocks filter
-// every transform edge, so the prediction-block edge test is not needed.
+// 7.14.2 edge process at luma 4x4 position (row, column), its four lines
+// filtered together. Intra blocks filter every transform edge, so the
+// prediction-block edge test is not needed.
 PostDeblockEdge :: (frame: *IntraFrame, samples: []u16, header: *StillFrameHeader,
-    plane: s32, pass: s32, luma_row: s32, luma_column: s32, cancellation: *Cancellation) -> DecodeError {
+    plane: s32, pass: s32, luma_row: s32, luma_column: s32) -> DecodeError {
     sx := IntraSubX(frame, plane); sy := IntraSubY(frame, plane)
     x := luma_column * 4; y := luma_row * 4
     if x >= frame.width || y >= frame.height || (pass == 0 && x == 0) || (pass == 1 && y == 0) {
@@ -74,18 +75,13 @@ PostDeblockEdge :: (frame: *IntraFrame, samples: []u16, header: *StillFrameHeade
     length: s32 = 4
     if filter_size == 8 { length = ifx plane == 0 then 8 else 6 }
     if filter_size == 16 { length = 14 }
-    half := length / 2
-    step: s64 = ifx pass == 0 then 1 else cast(s64)frame.plane_stride[plane]
-    for i: 0..3 {
-        center := PostIndex(frame, plane, xp + dy * cast(s32)i, yp + dx * cast(s32)i)
-        input: [16]u16
-        for k: 8 - half..7 + half { input[k] = samples[center + (k - 8) * step] }
-        edge := FilterDeblockEdge(input[:], length, strength.block_limit, strength.limit,
-            strength.threshold, frame.bit_depth, cancellation)
-        if edge.error.code != DecodeOK { return edge.error }
-        for k: 8 - half..7 + half { samples[center + (k - 8) * step] = edge.samples[k] }
-    }
-    return Error(DecodeOK)
+    // Vertical edges (pass 0) filter four rows across the edge, horizontal
+    // edges four columns.
+    stride := cast(s64)frame.plane_stride[plane]
+    line_step: s64 = ifx pass == 0 then stride else 1
+    tap_step: s64 = ifx pass == 0 then 1 else stride
+    return FilterDeblockLines(samples, PostIndex(frame, plane, xp, yp), line_step, tap_step, length,
+        strength.block_limit, strength.limit, strength.threshold, frame.bit_depth)
 }
 
 PostFloorLog2 :: (value: u32) -> s32 {
@@ -152,7 +148,7 @@ ApplyIntraLoopFilter :: (frame: *IntraFrame, samples: []u16, header: *StillFrame
                 if error.code != DecodeOK { return error }
                 column: s32 = 0
                 while column < frame.mi_cols {
-                    error = PostDeblockEdge(frame, samples, header, plane, pass, row, column, cancellation)
+                    error = PostDeblockEdge(frame, samples, header, plane, pass, row, column)
                     if error.code != DecodeOK { return error }
                     column += column_step
                 }
