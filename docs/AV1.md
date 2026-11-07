@@ -902,6 +902,8 @@ Then, on Ziran's `std/simd` vectors, with SSE2 to AVX2 chosen at run time:
   columns as `s32x4` vectors and skips all-zero groups.
 - `filter/deblock.zi`: each edge segment filters its four lines as `s32x4`
   vectors, validated once per segment.
+- `filter/post_filter.zi`: CDEF copies its luma direction block and, away
+  from the frame edges, each padded row as `u16x8` vectors.
 
 And in scalar code:
 

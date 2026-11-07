@@ -5,6 +5,7 @@
 #import, file "./wiener.zi";
 #import, file "./sgr.zi";
 using Codec :: #import "image_codec/api"
+Simd :: #import "std/simd"
 
 // AV1 7.14-7.17 frame post filters for intra frames, scalar reference order:
 // deblocking in place (7.14), CDEF into a second frame (7.15) and loop
@@ -93,35 +94,41 @@ PostFloorLog2 :: (value: u32) -> s32 {
 // 7.15.3 for one plane of the 8x8 luma block at (row, column). Availability
 // is the whole mode-info grid; unavailable taps take CdefMissingSample.
 PostCdefPlane :: (frame: *IntraFrame, source: []u16, destination: []u16, plane: s32,
-    row: s32, column: s32, primary: s32, secondary: s32, damping: s32, direction: s32,
-    cancellation: *Cancellation) -> DecodeError {
-    error := CancellationError(cancellation)
-    if error.code != DecodeOK { return error }
+    row: s32, column: s32, primary: s32, secondary: s32, damping: s32, direction: s32) {
     // Zero strengths leave the block as copied into destination.
-    if primary == 0 && secondary == 0 { return Error(DecodeOK) }
+    if primary == 0 && secondary == 0 { return }
     sx := IntraSubX(frame, plane); sy := IntraSubY(frame, plane)
     x0 := (column * 4) >> sx; y0 := (row * 4) >> sy
     w := 8 >> sx; h := 8 >> sy
-    columns: [12]bool
-    for j: 0..w + 3 {
-        x := x0 + cast(s32)j - 2
-        columns[j] = x >= 0 && ((x << sx) >> 2) < frame.mi_cols
-    }
     block: CdefPadded
-    for i: 0..h + 3 {
-        y := y0 + cast(s32)i - 2
-        if y >= 0 && ((y << sy) >> 2) < frame.mi_rows {
-            line := PostIndex(frame, plane, x0 - 2, y)
-            for j: 0..w + 3 {
-                block.samples[i * 16 + j] = ifx columns[j] then source[line + j] else cast(u16)CdefMissingSample
+    // Away from the frame edges each padded row is w + 4 frame samples:
+    // eight, or eight and four.
+    if x0 >= 2 && y0 >= 2 && (((x0 + w + 1) << sx) >> 2) < frame.mi_cols && (((y0 + h + 1) << sy) >> 2) < frame.mi_rows {
+        for i: 0..h + 3 {
+            line := PostIndex(frame, plane, x0 - 2, y0 + cast(s32)i - 2)
+            Simd.Store(block.samples[:], i * 16, Simd.Load(u16x8, source, line))
+            if w == 8 { Simd.StoreLow(block.samples[:], i * 16 + 8, Simd.LoadLow(u16x8, source, line + 8)) }
+        }
+    } else {
+        columns: [12]bool
+        for j: 0..w + 3 {
+            x := x0 + cast(s32)j - 2
+            columns[j] = x >= 0 && ((x << sx) >> 2) < frame.mi_cols
+        }
+        for i: 0..h + 3 {
+            y := y0 + cast(s32)i - 2
+            if y >= 0 && ((y << sy) >> 2) < frame.mi_rows {
+                line := PostIndex(frame, plane, x0 - 2, y)
+                for j: 0..w + 3 {
+                    block.samples[i * 16 + j] = ifx columns[j] then source[line + j] else cast(u16)CdefMissingSample
+                }
+            } else {
+                for j: 0..w + 3 { block.samples[i * 16 + j] = cast(u16)CdefMissingSample }
             }
-        } else {
-            for j: 0..w + 3 { block.samples[i * 16 + j] = cast(u16)CdefMissingSample }
         }
     }
     CdefFilterPadded(*block, w, h, primary, secondary, damping, direction, frame.bit_depth,
         destination[PostIndex(frame, plane, x0, y0):], frame.plane_stride[plane])
-    return Error(DecodeOK)
 }
 
 PostRestorationInput :: struct {
@@ -184,7 +191,7 @@ ApplyIntraCdef :: (frame: *IntraFrame, source: []u16, destination: []u16, header
                 index := cast(s32)stored - 1
                 luma: CdefLumaBlock
                 base := PostIndex(frame, 0, column * 4, row * 4)
-                for i: 0..7 { for j: 0..7 { luma.samples[i * 8 + j] = source[base + i * stride0 + j] } }
+                for i: 0..7 { Simd.Store(luma.samples[:], i * 8, Simd.Load(u16x8, source, base + i * stride0)) }
                 found := CdefDirectionOf(*luma, frame.bit_depth)
                 primary := header.cdef_y_primary[index] << shift
                 secondary := header.cdef_y_secondary[index] << shift
@@ -192,18 +199,16 @@ ApplyIntraCdef :: (frame: *IntraFrame, source: []u16, destination: []u16, header
                 variance := found.variance
                 variance_strength: s32 = ifx (variance >> 6) != 0 then PostMin(PostFloorLog2(variance >> 6), 12) else 0
                 primary = ifx variance != 0 then (primary * (4 + variance_strength) + 8) >> 4 else 0
-                error = PostCdefPlane(frame, source, destination, 0, row, column, primary, secondary,
-                    header.cdef_damping + shift, direction, cancellation)
-                if error.code != DecodeOK { return error }
+                PostCdefPlane(frame, source, destination, 0, row, column, primary, secondary,
+                    header.cdef_damping + shift, direction)
                 if frame.planes > 1 {
                     primary = header.cdef_uv_primary[index] << shift
                     secondary = header.cdef_uv_secondary[index] << shift
                     table := (frame.subsampling_x * 2 + frame.subsampling_y) * 8 + found.direction
                     direction = ifx primary == 0 then 0 else uv_directions[table]
                     for plane: 1..2 {
-                        error = PostCdefPlane(frame, source, destination, cast(s32)plane, row, column, primary,
-                            secondary, header.cdef_damping + shift - 1, direction, cancellation)
-                        if error.code != DecodeOK { return error }
+                        PostCdefPlane(frame, source, destination, cast(s32)plane, row, column, primary,
+                            secondary, header.cdef_damping + shift - 1, direction)
                     }
                 }
             }
