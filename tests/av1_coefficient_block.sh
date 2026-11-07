@@ -6,7 +6,7 @@ mkdir -p "$out"
 python3 - "$root" "$toolchain" "$out" <<'PY'
 import hashlib,json,pathlib,sys
 root,toolchain,out=map(pathlib.Path,sys.argv[1:])
-files=[root/'src'/name for name in ('entropy/coefficient_block.zi','entropy/coefficient_geometry.zi','entropy/coefficient_cdfs.zi','entropy/coefficient_cdf_data.zi','entropy/coefficient_cdf_symbols.zi','entropy/coefficient_context.zi','entropy/coefficient_scan.zi','entropy/range.zi',)]
+files=[root/'src'/name for name in ('entropy/coefficient_block.zi','entropy/coefficient_geometry.zi','entropy/coefficient_cdfs.zi','entropy/coefficient_cdf_data.zi','entropy/coefficient_cdf_symbols.zi','entropy/coefficient_context.zi','entropy/coefficient_scan.zi','entropy/range.zi','transform/quantization.zi','transform/quant_tables.zi',)]
 files += [root/'tests'/name for name in ('av1_coefficient_block.zi','av1_coefficient_block.sh',
     'av1_coefficient_block_oracle.py','av1_coefficient_scan_oracle.py','av1_quantization_oracle.py','common.sh')]
 import os

@@ -119,39 +119,3 @@ DequantizeInto :: (quant: []s32, width: s32, height: s32, qindex: s32,
     }
     return CancellationError(cancellation)
 }
-
-// DequantizeInto with flat weights for coefficients that are zero outside the
-// first count coded positions of nonzero: only those are read, and the rest of
-// samples is zeroed.
-DequantizeSparseInto :: (quant: []s32, nonzero: []u16, count: s32, width: s32, height: s32, qindex: s32,
-    delta_dc: s32, delta_ac: s32, depth: s32, samples: []s32, cancellation: *Cancellation = null) -> DecodeError {
-    error := CancellationError(cancellation)
-    if error.code != DecodeOK { return error }
-    if (width != 4 && width != 8 && width != 16 && width != 32 && width != 64) ||
-        (height != 4 && height != 8 && height != 16 && height != 32 && height != 64) {
-        return Error(InvalidInput)
-    }
-    if width > height * 4 || height > width * 4 || samples.count < cast(s64)width * height { return Error(InvalidInput) }
-    cw := ifx width < 32 then width else 32; ch := ifx height < 32 then height else 32
-    if count < 0 || count > cw * ch || nonzero.count < cast(s64)count || quant.count != cast(s64)cw * ch { return Error(InvalidInput) }
-    steps := GetQuantizationSteps(qindex, delta_dc, delta_ac, depth, cancellation)
-    if steps.error.code != DecodeOK { return steps.error }
-    log_width: s32 = 2
-    while (cast(s32)1 << log_width) < cw { log_width += 1 }
-    // The masked product is never negative, so dividing by 1, 2 or 4 shifts.
-    shift: u32 = ifx width * height > 1024 then 2 else ifx width * height > 256 then 1 else 0
-    limit := cast(s64)1 << cast(u32)(depth + 7)
-    for i: 0..width * height - 1 { samples[i] = 0 }
-    for i: 0..count - 1 {
-        at := cast(s32)nonzero[i]
-        if at >= cw * ch || quant[at] < -1048575 || quant[at] > 1048575 { return Error(InvalidInput) }
-        level := cast(s64)quant[at]; negative := level < 0
-        // Signs are as good as random, so they select rather than branch.
-        magnitude := ifx negative then -level else level
-        value := ((magnitude * cast(s64)(ifx at == 0 then steps.dc else steps.ac)) & 16777215) >> shift
-        bound := ifx negative then limit else limit - 1
-        value = ifx value > bound then bound else value
-        samples[(at >> log_width) * width + (at & (cw - 1))] = cast(s32)(ifx negative then -value else value)
-    }
-    return CancellationError(cancellation)
-}

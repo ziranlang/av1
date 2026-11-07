@@ -390,12 +390,13 @@ VTranspose :: (r0: s32x4, r1: s32x4, r2: s32x4, r3: s32x4, out: *Quad) #inline {
     out.v[2] = Simd.Reinterpret(s32x4, Simd.InterleaveLow(t1, t3)); out.v[3] = Simd.Reinterpret(s32x4, Simd.InterleaveHigh(t1, t3))
 }
 
-// One row of the scalar reference pass, for a group that left the range.
+// One row of the scalar reference pass, for a group that left the range;
+// inputs from column `columns` on are zero.
 ScalarRow :: (dequant: []s32, residual: []s32, width: s32, i: s64, row_kind: s32, log2w: s64, rect: bool,
-    row_range: u32, row_shift: u32, column_low: s64, column_high: s64) {
+    row_range: u32, row_shift: u32, column_low: s64, column_high: s64, columns: s64) {
     lane: TransformLane
     for j: 0..cast(s64)width - 1 {
-        value := ifx j < 32 then cast(s64)dequant[i * width + j] else 0
+        value := ifx j < columns then cast(s64)dequant[i * width + j] else 0
         if rect { value = Round2Signed(value * 2896, 12) }
         lane.values[j & 63] = value
     }
@@ -407,37 +408,42 @@ ScalarRow :: (dequant: []s32, residual: []s32, width: s32, i: s64, row_kind: s32
     }
 }
 
-ScalarColumn :: (residual: []s32, width: s32, height: s32, j: s64, column_kind: s32, log2h: s64, column_range: u32) {
+// One column of the scalar reference pass; inputs from row `rows` on are zero.
+ScalarColumn :: (residual: []s32, width: s32, height: s32, j: s64, column_kind: s32, log2h: s64, column_range: u32,
+    rows: s64) {
     lane: TransformLane
-    for i: 0..cast(s64)height - 1 { lane.values[i & 63] = cast(s64)residual[i * width + j] }
+    for i: 0..cast(s64)height - 1 { lane.values[i & 63] = ifx i < rows then cast(s64)residual[i * width + j] else 0 }
     Inverse1D(*lane, column_kind, log2h, column_range)
     for i: 0..cast(s64)height - 1 { residual[i * width + j] = cast(s32)Round2Signed(lane.values[i & 63], 4) }
 }
 
 
-// The row pass of a validated transform: rows below 32, four at a time, as
-// columns of the lane; 12-bit rows (20-bit range) always take the s64 lane.
+// Lanes a transform pass works in, kept by its caller so no pass clears one.
+TransformScratch :: struct { lane: VectorLane; }
+
+// The row pass of a validated transform: the first `rows` rows (a multiple
+// of 4, at most 32), four at a time, as columns of the lane, reading the
+// first `columns` (a multiple of 4, at most 32) of each, the rest being
+// zero. 12-bit rows (20-bit range) always take the s64 lane. Later rows of
+// residual are left as they were: they are zero, which the column pass
+// knows.
 InverseRowPass :: (dequant: []s32, residual: []s32, width: s32, height: s32, row_kind: s32, log2w: s64,
-    rect: bool, row_range: u32, row_shift: u32, column_low: s64, column_high: s64, vector: bool) #target {
-    if width < 4 || width > 64 || height < 4 || height > 64 ||
-        dequant.count < cast(s64)height * width || residual.count < cast(s64)height * width {
+    rect: bool, row_range: u32, row_shift: u32, column_low: s64, column_high: s64, vector: bool,
+    rows: s64, columns: s64, lane: *VectorLane) #target {
+    if width < 4 || width > 64 || height < 4 || height > 64 || rows > cast(s64)height || columns > cast(s64)width ||
+        columns > 32 || dequant.count < cast(s64)height * width || residual.count < cast(s64)height * width {
         return
     }
     vector_high := Simd.Splat(s32x4, cast(s32)column_high); vector_low := Simd.Splat(s32x4, cast(s32)column_low)
-    lane: VectorLane
     block: Quad
     zero := Simd.Zero(s32x4)
-    columns := ifx width > 32 then 32 else cast(s64)width
-    for group: 0..15 {
+    for group: 0..7 {
         i0 := group * 4
-        if i0 >= cast(s64)height { break }
-        if i0 >= 32 {
-            for k: 0..3 { for j: 0..cast(s64)width - 1 { residual[(i0 + k) * width + j] = 0 } }
-            continue
-        }
+        if i0 >= rows { break }
         if !vector {
             for k: 0..3 {
-                ScalarRow(dequant, residual, width, i0 + k, row_kind, log2w, rect, row_range, row_shift, column_low, column_high)
+                ScalarRow(dequant, residual, width, i0 + k, row_kind, log2w, rect, row_range, row_shift, column_low,
+                    column_high, columns)
             }
             continue
         }
@@ -466,9 +472,10 @@ InverseRowPass :: (dequant: []s32, residual: []s32, width: s32, height: s32, row
             peak = Simd.Max(peak, Simd.Abs(v))
         }
         lane.peak = peak
-        if !VInverse1D(*lane, row_kind, log2w, row_range) {
+        if !VInverse1D(lane, row_kind, log2w, row_range) {
             for k: 0..3 {
-                ScalarRow(dequant, residual, width, i0 + k, row_kind, log2w, rect, row_range, row_shift, column_low, column_high)
+                ScalarRow(dequant, residual, width, i0 + k, row_kind, log2w, rect, row_range, row_shift, column_low,
+                    column_high, columns)
             }
             continue
         }
@@ -487,24 +494,32 @@ InverseRowPass :: (dequant: []s32, residual: []s32, width: s32, height: s32, row
     }
 }
 
-// The column pass, four columns per lane, in place in residual.
-InverseColumnPass :: (residual: []s32, width: s32, height: s32, column_kind: s32, log2h: s64, column_range: u32) #target {
-    if width < 4 || width > 64 || height < 4 || height > 64 || residual.count < cast(s64)height * width { return }
-    lane: VectorLane
+// The column pass, four columns per lane, in place in residual, whose rows
+// from `rows` on are zero whatever they hold.
+InverseColumnPass :: (residual: []s32, width: s32, height: s32, column_kind: s32, log2h: s64, column_range: u32,
+    rows: s64, lane: *VectorLane) #target {
+    if width < 4 || width > 64 || height < 4 || height > 64 || rows > cast(s64)height ||
+        residual.count < cast(s64)height * width {
+        return
+    }
     zero := Simd.Zero(s32x4)
     for group: 0..15 {
         j := group * 4
         if j >= cast(s64)width { break }
         any := zero; peak := zero
-        for i: 0..cast(s64)height - 1 {
+        for i: 0..rows - 1 {
             v := Simd.Load(s32x4, residual, i * width + j)
             lane.values[i & 63] = v
             any = Simd.Or(any, v); peak = Simd.Max(peak, Simd.Abs(v))
         }
-        if Simd.AllZero(any) { continue }
+        if Simd.AllZero(any) {
+            for i: 0..cast(s64)height - 1 { Simd.Store(residual, i * width + j, zero) }
+            continue
+        }
+        for i: rows..cast(s64)height - 1 { lane.values[i & 63] = zero }
         lane.peak = peak
-        if !VInverse1D(*lane, column_kind, log2h, column_range) {
-            for k: 0..3 { ScalarColumn(residual, width, height, j + k, column_kind, log2h, column_range) }
+        if !VInverse1D(lane, column_kind, log2h, column_range) {
+            for k: 0..3 { ScalarColumn(residual, width, height, j + k, column_kind, log2h, column_range, rows) }
             continue
         }
         for i: 0..cast(s64)height - 1 {
@@ -514,6 +529,26 @@ InverseColumnPass :: (residual: []s32, width: s32, height: s32, column_kind: s32
 }
 
 ClearResidual :: (residual: []s32) { for i: 0..residual.count - 1 { residual[i] = 0 } }
+
+// The parameters 7.13.3 derives from a validated size, type and bit depth.
+TransformShape :: struct {
+    log2w: s64; log2h: s64; row_kind: s32; column_kind: s32; rect: bool
+    row_shift: u32; row_range: u32; column_range: u32; column_low: s64; column_high: s64
+}
+
+TransformShapeOf :: (width: s32, height: s32, tx_type: s32, bit_depth: s32) -> TransformShape {
+    shape: TransformShape
+    shape.log2w = cast(s64)TransformLog2(width); shape.log2h = cast(s64)TransformLog2(height)
+    shape.row_kind = TransformRowKind(tx_type); shape.column_kind = TransformColumnKind(tx_type)
+    shape.rect = shape.log2w - shape.log2h == 1 || shape.log2h - shape.log2w == 1
+    // Transform_Row_Shift indexed by (log2W-2)*5 + log2H-2; illegal shapes are rejected by validation.
+    shifts: [25]u32 = .[0,0,1,0,0, 0,1,1,2,0, 1,1,2,1,2, 0,2,1,2,1, 0,0,2,1,2]
+    shape.row_shift = shifts[(shape.log2w - 2) * 5 + shape.log2h - 2]
+    shape.row_range = cast(u32)(bit_depth + 8)
+    shape.column_range = cast(u32)(ifx bit_depth + 6 > 16 then bit_depth + 6 else 16)
+    shape.column_high = (cast(s64)1 << (shape.column_range - 1)) - 1; shape.column_low = -shape.column_high - 1
+    return shape
+}
 
 // dequant is the row-major width x height Dequant array; cells outside the
 // upper-left 32x32 are ignored as the specification requires. Values must be
@@ -528,34 +563,199 @@ InverseTransform2D :: (dequant: []s32, residual: []s32, width: s32, height: s32,
     count := cast(s64)width * height
     if error.code == DecodeOK && (dequant.count != count || residual.count != count) { error = Error(InvalidInput) }
     if error.code != DecodeOK { ClearResidual(residual); return error }
-    // Validation implies these; stated as comparisons, they let the compiler
-    // prove every i * width + j and lane index in range.
-    if width < 4 || width > 64 || height < 4 || height > 64 ||
-        dequant.count < cast(s64)height * width || residual.count < cast(s64)height * width {
-        ClearResidual(residual); return Error(InvalidInput)
-    }
     input_limit := cast(s64)1 << cast(u32)(bit_depth + 7)
     for i: 0..count - 1 {
         value := cast(s64)dequant[i]
         if value < -input_limit || value >= input_limit { ClearResidual(residual); return Error(InvalidInput) }
     }
-    log2w := cast(s64)TransformLog2(width); log2h := cast(s64)TransformLog2(height)
-    row_kind := TransformRowKind(tx_type); column_kind := TransformColumnKind(tx_type)
-    rect := log2w - log2h == 1 || log2h - log2w == 1
-    // Transform_Row_Shift indexed by (log2W-2)*5 + log2H-2; illegal shapes are rejected above.
-    shifts: [25]u32 = .[0,0,1,0,0, 0,1,1,2,0, 1,1,2,1,2, 0,2,1,2,1, 0,0,2,1,2]
-    row_shift := shifts[(log2w - 2) * 5 + log2h - 2]
-    row_range := cast(u32)(bit_depth + 8)
-    column_range := cast(u32)(ifx bit_depth + 6 > 16 then bit_depth + 6 else 16)
-    column_high := (cast(s64)1 << (column_range - 1)) - 1; column_low := -column_high - 1
-    InverseRowPass(dequant, residual, width, height, row_kind, log2w, rect, row_range, row_shift,
-        column_low, column_high, bit_depth <= 10)
+    shape := TransformShapeOf(width, height, tx_type, bit_depth)
+    scratch: TransformScratch
+    rows := ifx height > 32 then 32 else cast(s64)height; columns := ifx width > 32 then 32 else cast(s64)width
+    InverseRowPass(dequant, residual, width, height, shape.row_kind, shape.log2w, shape.rect, shape.row_range,
+        shape.row_shift, shape.column_low, shape.column_high, bit_depth <= 10, rows, columns, *scratch.lane)
     error = CancellationError(cancellation)
     if error.code != DecodeOK { ClearResidual(residual); return error }
-    InverseColumnPass(residual, width, height, column_kind, log2h, column_range)
+    InverseColumnPass(residual, width, height, shape.column_kind, shape.log2h, shape.column_range, rows, *scratch.lane)
     error = CancellationError(cancellation)
     if error.code != DecodeOK { ClearResidual(residual); return error }
     return Error(DecodeOK)
+}
+
+// The value every Residual cell of a DCT_DCT block takes when only its DC
+// coefficient dc is nonzero: each 1D DCT then gives all its outputs one
+// rotation of dc by 2896/4096, and every Hadamard clamp keeps them equal.
+DCOnlyResidual :: (dc: s64, shape: TransformShape) -> s64 {
+    value := dc
+    if shape.rect { value = Round2Signed(value * 2896, 12) }
+    row_high := (cast(s64)1 << (shape.row_range - 1)) - 1
+    value = Round2Signed(value * 2896, 12)
+    if value < -row_high - 1 { value = -row_high - 1 }; if value > row_high { value = row_high }
+    value = Round2Signed(value, shape.row_shift)
+    if value < shape.column_low { value = shape.column_low }; if value > shape.column_high { value = shape.column_high }
+    value = Round2Signed(value * 2896, 12)
+    if value < shape.column_low { value = shape.column_low }; if value > shape.column_high { value = shape.column_high }
+    return Round2Signed(value, 4)
+}
+
+// Adds value to each sample of a width x height block, clipped to
+// [0, maximum], for samples already at most maximum.
+AddConstantRows :: (samples: []u16, stride: s32, width: s32, height: s32, value: s64, maximum: s32) #target {
+    w := cast(s64)width; h := cast(s64)height; line := cast(s64)stride
+    if w < 1 || h < 1 || w > 64 || h > 64 || line < w || samples.count < (h - 1) * line + w ||
+        maximum < 0 || maximum > 65535 {
+        return
+    }
+    amount := ifx value < 0 then -value else value
+    if amount > 65535 { amount = 65535 }
+    // A saturating add of up and subtraction of down is the clipped sum.
+    up := cast(u16)(ifx value > 0 then amount else 0); down := cast(u16)(ifx value < 0 then amount else 0)
+    add := Simd.Splat(u16xN, up); subtract := Simd.Splat(u16xN, down); top := Simd.Splat(u16xN, cast(u16)maximum)
+    add8 := Simd.Splat(u16x8, up); subtract8 := Simd.Splat(u16x8, down); top8 := Simd.Splat(u16x8, cast(u16)maximum)
+    wide := Simd.Lanes(u16xN)
+    for i: 0..h - 1 {
+        row := samples[i * line:i * line + w]
+        j: s64 = 0
+        while j + wide <= w {
+            Simd.Store(row, j, Simd.Min(Simd.SubSat(Simd.AddSat(Simd.Load(u16xN, row, j), add), subtract), top))
+            j += wide
+        }
+        while j + 8 <= w {
+            Simd.Store(row, j, Simd.Min(Simd.SubSat(Simd.AddSat(Simd.Load(u16x8, row, j), add8), subtract8), top8))
+            j += 8
+        }
+        while j + 4 <= w {
+            Simd.StoreLow(row, j, Simd.Min(Simd.SubSat(Simd.AddSat(Simd.LoadLow(u16x8, row, j), add8), subtract8), top8))
+            j += 4
+        }
+        while j < w {
+            sum := cast(s64)row[j] + value
+            if sum < 0 { sum = 0 }; if sum > maximum { sum = maximum }
+            row[j] = cast(u16)sum; j += 1
+        }
+    }
+}
+
+// AV1 7.12.3's reconstruction of one lossy block, as InverseTransform2D and
+// then AddResidual would make it. dequant is read only in its upper-left
+// rows x columns rounded up to multiples of 4 and is zero elsewhere, the
+// cells of that rounded box outside rows x columns included (as
+// DecodeDequantizedCoefficients leaves them); it may alias residual, which
+// is width x height scratch. samples are the decoder's own, never above the
+// bit depth's maximum, so unlike AddResidual this does not check them.
+// Nothing is written on failure.
+ReconstructTransformBlock :: (samples: []u16, stride: s32, dequant: []s32, residual: []s32, width: s32, height: s32,
+    tx_type: s32, bit_depth: s32, rows: s32, columns: s32, scratch: *TransformScratch,
+    cancellation: *Cancellation = null) -> DecodeError {
+    error := CancellationError(cancellation)
+    if error.code != DecodeOK { return error }
+    error = ValidateInverseTransform(width, height, tx_type, bit_depth)
+    if error.code != DecodeOK { return error }
+    count := cast(s64)width * height
+    if stride < width || dequant.count != count || residual.count != count ||
+        samples.count < cast(s64)(height - 1) * stride + width || rows < 0 || columns < 0 ||
+        rows > height || rows > 32 || columns > width || columns > 32 {
+        return Error(InvalidInput)
+    }
+    if rows == 0 || columns == 0 { return Error(DecodeOK) }
+    box_rows := (cast(s64)rows + 3) & -4; box_columns := (cast(s64)columns + 3) & -4
+    input_limit := cast(s64)1 << cast(u32)(bit_depth + 7)
+    for i: 0..box_rows - 1 {
+        for j: 0..box_columns - 1 {
+            value := cast(s64)dequant[i * width + j]
+            if value < -input_limit || value >= input_limit { return Error(InvalidInput) }
+        }
+    }
+    shape := TransformShapeOf(width, height, tx_type, bit_depth)
+    maximum := cast(s32)((cast(s64)1 << cast(u32)bit_depth) - 1)
+    if tx_type == 0 && rows == 1 && columns == 1 {
+        AddConstantRows(samples, stride, width, height, DCOnlyResidual(cast(s64)dequant[0], shape), maximum)
+        return Error(DecodeOK)
+    }
+    InverseRowPass(dequant, residual, width, height, shape.row_kind, shape.log2w, shape.rect, shape.row_range,
+        shape.row_shift, shape.column_low, shape.column_high, bit_depth <= 10, box_rows, box_columns, *scratch.lane)
+    InverseColumnPass(residual, width, height, shape.column_kind, shape.log2h, shape.column_range, box_rows,
+        *scratch.lane)
+    AddResidualSamples(samples, stride, residual, width, height, tx_type, maximum)
+    return Error(DecodeOK)
+}
+
+// Whether every sample of a width x height block is at most maximum; false
+// too when the block does not fit in samples.
+SamplesAtMost :: (samples: []u16, stride: s32, width: s32, height: s32, maximum: s32) -> bool #target {
+    w := cast(s64)width; h := cast(s64)height; line := cast(s64)stride
+    if w < 1 || h < 1 || line < w || samples.count < (h - 1) * line + w { return false }
+    wide := Simd.Lanes(u16xN)
+    peak := Simd.Zero(u16xN); highest: u16
+    for i: 0..h - 1 {
+        row := samples[i * line:i * line + w]
+        j: s64 = 0
+        while j + wide <= w { peak = Simd.Max(peak, Simd.Load(u16xN, row, j)); j += wide }
+        while j < w { if row[j] > highest { highest = row[j] }; j += 1 }
+    }
+    return cast(s32)Simd.ReduceMax(peak) <= maximum && cast(s32)highest <= maximum
+}
+
+// AddResidual without flips, on native vectors, with nothing written when
+// the shape does not fit. Residuals are clamped to +-65536 first, which
+// leaves every clipped sum as it was and keeps the sums in s32.
+AddResidualRows :: (samples: []u16, stride: s32, residual: []s32, width: s32, height: s32, maximum: s32) #target {
+    w := cast(s64)width; h := cast(s64)height; line := cast(s64)stride
+    if w < 1 || h < 1 || w > 64 || h > 64 || line < w || residual.count != w * h ||
+        samples.count < (h - 1) * line + w || maximum < 0 || maximum > 65535 {
+        return
+    }
+    wide := Simd.Lanes(u16xN); half := Simd.Lanes(s32xN)
+    zero := Simd.Zero(s32xN); top := Simd.Splat(s32xN, maximum)
+    low_limit := Simd.Splat(s32xN, -65536); high_limit := Simd.Splat(s32xN, 65536)
+    for i: 0..h - 1 {
+        row := samples[i * line:i * line + w]
+        values := residual[i * w:i * w + w]
+        j: s64 = 0
+        while j + wide <= w {
+            pixels := Simd.Load(u16xN, row, j)
+            first := Simd.Min(Simd.Max(Simd.Load(s32xN, values, j), low_limit), high_limit)
+            second := Simd.Min(Simd.Max(Simd.Load(s32xN, values, j + half), low_limit), high_limit)
+            first = Simd.Add(Simd.Reinterpret(s32xN, Simd.WidenLow(pixels)), first)
+            second = Simd.Add(Simd.Reinterpret(s32xN, Simd.WidenHigh(pixels)), second)
+            first = Simd.Min(Simd.Max(first, zero), top); second = Simd.Min(Simd.Max(second, zero), top)
+            Simd.Store(row, j, Simd.Narrow(u16xN, first, second))
+            j += wide
+        }
+        while j + half <= w {
+            pixels := Simd.LoadLow(u16xN, row, j)
+            sum := Simd.Min(Simd.Max(Simd.Load(s32xN, values, j), low_limit), high_limit)
+            sum = Simd.Min(Simd.Max(Simd.Add(Simd.Reinterpret(s32xN, Simd.WidenLow(pixels)), sum), zero), top)
+            Simd.StoreLow(row, j, Simd.Narrow(u16xN, sum, sum))
+            j += half
+        }
+        while j < w {
+            value := cast(s64)row[j] + cast(s64)values[j]
+            if value < 0 { value = 0 }; if value > maximum { value = maximum }
+            row[j] = cast(u16)value; j += 1
+        }
+    }
+}
+
+// Adds a validated block's Residual to samples with the type's flips and
+// Clip1.
+AddResidualSamples :: (samples: []u16, stride: s32, residual: []s32, width: s32, height: s32, tx_type: s32,
+    maximum: s32) {
+    flip_rows := TransformFlipRows(tx_type); flip_columns := TransformFlipColumns(tx_type)
+    if !flip_rows && !flip_columns { AddResidualRows(samples, stride, residual, width, height, maximum); return }
+    if stride < width || width < 1 || height < 1 || residual.count != cast(s64)width * height ||
+        samples.count < cast(s64)(height - 1) * stride + width {
+        return
+    }
+    for i: 0..cast(s64)height - 1 {
+        yy := ifx flip_rows then cast(s64)height - 1 - i else i
+        for j: 0..cast(s64)width - 1 {
+            xx := ifx flip_columns then cast(s64)width - 1 - j else j
+            at := yy * stride + xx
+            value := cast(s64)samples[at] + cast(s64)residual[i * width + j]
+            if value < 0 { value = 0 }; if value > maximum { value = maximum }
+            samples[at] = cast(u16)value
+        }
+    }
 }
 
 // AV1 7.12.3 step 3: add the Residual with the type's flips and Clip1. samples
@@ -571,22 +771,8 @@ AddResidual :: (samples: []u16, stride: s32, residual: []s32, width: s32, height
         samples.count < cast(s64)(height - 1) * stride + width {
         return Error(InvalidInput)
     }
-    maximum := (cast(s64)1 << cast(u32)bit_depth) - 1
-    for i: 0..cast(s64)height - 1 {
-        for j: 0..cast(s64)width - 1 {
-            if cast(s64)samples[i * stride + j] > maximum { return Error(InvalidInput) }
-        }
-    }
-    flip_rows := TransformFlipRows(tx_type); flip_columns := TransformFlipColumns(tx_type)
-    for i: 0..cast(s64)height - 1 {
-        yy := ifx flip_rows then cast(s64)height - 1 - i else i
-        for j: 0..cast(s64)width - 1 {
-            xx := ifx flip_columns then cast(s64)width - 1 - j else j
-            at := yy * stride + xx
-            value := cast(s64)samples[at] + cast(s64)residual[i * width + j]
-            if value < 0 { value = 0 }; if value > maximum { value = maximum }
-            samples[at] = cast(u16)value
-        }
-    }
+    maximum := cast(s32)((cast(s64)1 << cast(u32)bit_depth) - 1)
+    if !SamplesAtMost(samples, stride, width, height, maximum) { return Error(InvalidInput) }
+    AddResidualSamples(samples, stride, residual, width, height, tx_type, maximum)
     return Error(DecodeOK)
 }

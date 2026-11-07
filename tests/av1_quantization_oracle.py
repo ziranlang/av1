@@ -86,7 +86,7 @@ def main():
             '        if ac < 0 { ac = 0 }; if ac > 255 { ac = 255 }',
             '        if got.error.code != DecodeOK || got.dc != expected[dc] || got.ac != expected[256 + ac] { return 1 }',
             '    } }; return 0','}']
-    lines += ['main :: () -> s32 {','    if QuantizationBoundaries() != 0 { return 1 }','    if SparseDequantization() != 0 { return 3 }',
+    lines += ['main :: () -> s32 {','    if QuantizationBoundaries() != 0 { return 1 }',
               '    if Lookup8() != 0 || Lookup10() != 0 || Lookup12() != 0 { return 2 }; return 0','}']
     modules=['av1_quant_lookup'];(a.out/f'{modules[0]}.zi').write_text('\n'.join(lines)+'\n')
     rng=random.Random(0x41563171);cases=[];masked=clipped=0;matrix_levels=set();matrix_planes=set()

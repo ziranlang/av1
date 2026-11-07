@@ -1,4 +1,5 @@
 #import, file "../src/filter/deblock.zi";
+Simd :: #import "std/simd"
 
 DeblockBoundaries :: () -> s32 {
     source: [17]u16
@@ -25,6 +26,16 @@ DeblockBoundaries :: () -> s32 {
     return 0
 }
 
+// Fills a scratch with taps that no case's lines hold.
+DirtyDeblockScratch :: (scratch: *DeblockScratch) {
+    seed: u32 = 2463534242
+    for k: 0..15 {
+        seed = seed * 1664525 + 1013904223; scratch.x.v[k] = Simd.Splat(s32x4, cast(s32)(seed >> 1))
+        seed = seed * 1664525 + 1013904223; scratch.y.v[k] = Simd.Splat(s32x4, 0 - cast(s32)(seed >> 1))
+        seed = seed * 1664525 + 1013904223; scratch.flat.v[k] = Simd.Splat(s32x4, cast(s32)(seed >> 4))
+    }
+}
+
 // Filters lines (four lines of p7..q7, line-major) across a horizontal and a
 // vertical edge inside 16x20 blocks of sentinels and checks both against
 // expected, with every sentinel left unchanged.
@@ -37,13 +48,33 @@ DeblockLinesCase :: (lines: []u16, expected: []u16, length: s32, block_limit: s3
         horizontal[k * 20 + lane + 3] = lines[lane * 16 + k]
         vertical[(lane + 3) * 20 + k] = lines[lane * 16 + k]
     } }
-    // A horizontal edge filters adjacent columns, a vertical edge adjacent rows.
-    if FilterDeblockLines(horizontal[:], 8 * 20 + 3, 1, 20, length, block_limit, limit, threshold, depth).code != DecodeOK { return 2 }
-    if FilterDeblockLines(vertical[:], 3 * 20 + 8, 20, 1, length, block_limit, limit, threshold, depth).code != DecodeOK { return 3 }
-    for lane: 0..3 { for k: 0..15 {
-        value := expected[lane * 16 + k]
-        if horizontal[k * 20 + lane + 3] != value || vertical[(lane + 3) * 20 + k] != value { return 4 }
-    } }
+    // A horizontal edge filters adjacent columns, a vertical edge adjacent
+    // rows; each runs once in a fresh scratch and once in one full of other
+    // taps.
+    dirty: DeblockScratch
+    for form: 0..1 {
+        if form == 1 { DirtyDeblockScratch(*dirty); for i: 0..319 { horizontal[i] = 65535; vertical[i] = 65535 }
+            for lane: 0..3 { for k: 0..15 {
+                horizontal[k * 20 + lane + 3] = lines[lane * 16 + k]
+                vertical[(lane + 3) * 20 + k] = lines[lane * 16 + k]
+            } }
+            if FilterDeblockLinesIn(*dirty, horizontal[:], 8 * 20 + 3, 1, 20, length, block_limit, limit, threshold,
+                depth).code != DecodeOK {
+                return 7
+            }
+            if FilterDeblockLinesIn(*dirty, vertical[:], 3 * 20 + 8, 20, 1, length, block_limit, limit, threshold,
+                depth).code != DecodeOK {
+                return 8
+            }
+        } else {
+            if FilterDeblockLines(horizontal[:], 8 * 20 + 3, 1, 20, length, block_limit, limit, threshold, depth).code != DecodeOK { return 2 }
+            if FilterDeblockLines(vertical[:], 3 * 20 + 8, 20, 1, length, block_limit, limit, threshold, depth).code != DecodeOK { return 3 }
+        }
+        for lane: 0..3 { for k: 0..15 {
+            value := expected[lane * 16 + k]
+            if horizontal[k * 20 + lane + 3] != value || vertical[(lane + 3) * 20 + k] != value { return 4 }
+        } }
+    }
     for y: 0..15 { for x: 0..19 {
         if (x < 3 || x >= 7) && horizontal[y * 20 + x] != 65535 { return 5 }
         if (y < 3 || y >= 7 || x >= 16) && vertical[y * 20 + x] != 65535 { return 6 }

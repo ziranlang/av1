@@ -101,6 +101,11 @@ FilterDeblockEdge :: (input: []u16, filter_length: s32, block_limit: s32,
 // Sixteen taps p7..q7 of four lines, one line per lane.
 DeblockTaps :: struct { v: [16]s32x4; }
 
+// The taps FilterDeblockLinesIn works in, kept by its caller so that no call
+// clears them: a call loads only the taps its filter length reads and sets
+// only those it writes, so what earlier calls left is never read.
+DeblockScratch :: struct { x: DeblockTaps; y: DeblockTaps; flat: DeblockTaps; }
+
 #scope_file
 DeblockLoad :: (samples: []u16, at: s64, line_step: s64) -> s32x4 #inline {
     if line_step == 1 { return Simd.Reinterpret(s32x4, Simd.WidenLow(Simd.LoadLow(u16x8, samples, at))) }
@@ -146,7 +151,17 @@ DeblockFlat :: (x: *DeblockTaps, out: *DeblockTaps, n: s64, double_extent: s64, 
 // any invalid argument or sample above the depth returns InvalidInput with
 // nothing written.
 FilterDeblockLines :: (samples: []u16, at: s64, line_step: s64, tap_step: s64, filter_length: s32,
-    block_limit: s32, limit: s32, hev_threshold: s32, bit_depth: s32) -> DecodeError #target {
+    block_limit: s32, limit: s32, hev_threshold: s32, bit_depth: s32) -> DecodeError {
+    scratch: DeblockScratch
+    return FilterDeblockLinesIn(*scratch, samples, at, line_step, tap_step, filter_length, block_limit, limit,
+        hev_threshold, bit_depth)
+}
+
+// FilterDeblockLines in the caller's scratch, which a frame's filter loop
+// reuses for every edge.
+FilterDeblockLinesIn :: (scratch: *DeblockScratch, samples: []u16, at: s64, line_step: s64, tap_step: s64,
+    filter_length: s32, block_limit: s32, limit: s32, hev_threshold: s32, bit_depth: s32) -> DecodeError #target {
+    if scratch == null { return Error(InvalidInput) }
     if (filter_length != 4 && filter_length != 6 && filter_length != 8 && filter_length != 14) ||
         block_limit < 0 || block_limit > 255 || limit < 0 || limit > 255 || hev_threshold < 0 || hev_threshold > 255 ||
         (bit_depth != 8 && bit_depth != 10 && bit_depth != 12) || line_step < 1 || tap_step < 1 || line_step > samples.count ||
@@ -157,7 +172,7 @@ FilterDeblockLines :: (samples: []u16, at: s64, line_step: s64, tap_step: s64, f
     if at < half * tap_step || at + 3 * line_step + (half - 1) * tap_step >= samples.count { return Error(InvalidInput) }
     maximum := cast(s32)((cast(u32)1 << cast(u32)bit_depth) - 1)
     top := Simd.Splat(s32x4, maximum)
-    x: DeblockTaps
+    x := *scratch.x; y := *scratch.y
     above := Simd.Zero(s32x4)
     for k: 8 - half..7 + half {
         v := DeblockLoad(samples, at + (k - 8) * tap_step, line_step)
@@ -191,32 +206,31 @@ FilterDeblockLines :: (samples: []u16, at: s64, line_step: s64, tap_step: s64, f
     filter1 := Simd.ShiftRight(DeblockClampLanes(Simd.Add(filter, Simd.Splat(s32x4, 4)), low, high), 3)
     filter2 := Simd.ShiftRight(DeblockClampLanes(Simd.Add(filter, Simd.Splat(s32x4, 3)), low, high), 3)
     outer := Simd.ShiftRight(Simd.Add(filter1, Simd.Splat(s32x4, 1)), 1)
-    y := x
+    // The taps the filter length can change, from x unless filtered below.
+    changed: s64 = ifx filter_length == 14 then 6 else ifx filter_length == 8 then 3 else 2
+    for k: 8 - changed..7 + changed { y.v[k & 15] = x.v[k & 15] }
     y.v[8] = Simd.Add(DeblockClampLanes(Simd.Sub(qs0, filter1), low, high), middle)
     y.v[7] = Simd.Add(DeblockClampLanes(Simd.Add(ps0, filter2), low, high), middle)
     y.v[9] = Simd.Select(high_variance, q1, Simd.Add(DeblockClampLanes(Simd.Sub(qs1, outer), low, high), middle))
     y.v[6] = Simd.Select(high_variance, p1, Simd.Add(DeblockClampLanes(Simd.Add(ps1, outer), low, high), middle))
-    changed: s64 = 2
     if filter_length != 4 {
         flat := Simd.Not(rough)
         n: s64 = ifx filter_length == 6 then 2 else 3
         if !Simd.AllZero(flat) {
-            short: DeblockTaps
-            DeblockFlat(*x, *short, n, ifx filter_length == 6 then 1 else 0, 3)
+            short := *scratch.flat
+            DeblockFlat(x, short, n, ifx filter_length == 6 then 1 else 0, 3)
             for k: 8 - n..7 + n { y.v[k & 15] = Simd.Select(flat, short.v[k & 15], y.v[k & 15]) }
         }
-        changed = n
         if filter_length == 14 {
             wide := flat
             for i: 4..6 {
                 wide = Simd.AndNot(wide, Simd.Or(DeblockApart(x.v[(7 - i) & 15], p0, flat_bound), DeblockApart(x.v[(8 + i) & 15], q0, flat_bound)))
             }
             if !Simd.AllZero(wide) {
-                long: DeblockTaps
-                DeblockFlat(*x, *long, 6, 1, 4)
+                long := *scratch.flat
+                DeblockFlat(x, long, 6, 1, 4)
                 for k: 2..13 { y.v[k & 15] = Simd.Select(wide, long.v[k & 15], y.v[k & 15]) }
             }
-            changed = 6
         }
     }
     for k: 8 - changed..7 + changed {

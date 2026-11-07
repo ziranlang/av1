@@ -133,7 +133,10 @@ def main():
                 '    block: CoefficientBlock']
             if case['eob']:
                 lines += [f'    block = ReadNonzeroCoefficients(*decoder, *cdfs, {case["w"]}, {case["h"]}, {case["cls"]}, {case["plane"]}, {case["dc"]})',
-                    f'    if block.coded_width != {min(case["w"],32)} || block.coded_height != {min(case["h"],32)} {{ return 2 }}']
+                    f'    if block.coded_width != {min(case["w"],32)} || block.coded_height != {min(case["h"],32)} {{ return 2 }}',
+                    # The same stream through the dequantizing reader, at a spread of quantizers and depths.
+                    f'    if DequantizedMatches(bytes[:], {str(case["disable"]).lower()}, {case["q"]}, {case["skip"]}, {case["w"]}, {case["h"]}, '
+                    f'{case["cls"]}, {case["plane"]}, {case["dc"]}, {(0,37,128,255)[local%4]}, {(8,10,12)[shard%3]}) != 0 {{ return 7 }}']
             lines += [f'    if block.error.code != DecodeOK || block.eob != {case["eob"]} || block.level != {case["level"]} || block.dc_category != {case["dc_category"]} {{ return 3 }}',
                 '    for i: 0..1023 {',f'        value := ifx i < {count} then expected[i] else 0',
                 '        if block.quant[i] != value { return 4 }','    }',

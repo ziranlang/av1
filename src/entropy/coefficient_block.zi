@@ -29,8 +29,17 @@ CoefficientSummary :: struct {
     // How many coefficients are nonzero; their coded positions lead the
     // scratch's nonzero list.
     nonzero: s32;
+    // The upper-left rows x columns of the coded block that hold them.
+    rows: s32;
+    columns: s32;
     error: DecodeError;
 }
+
+// Flat-weight dequantization (AV1 7.12.3) that DecodeDequantizedCoefficients
+// applies to each coefficient as it reads it, as libaom does: samples is the
+// row-major width x height Dequant array, dc and ac the quantizer steps of
+// GetQuantizationSteps and depth the bit depth.
+CoefficientDequant :: struct { samples: []s32; dc: s32; ac: s32; depth: s32; }
 
 // Working buffers of DecodeNonzeroCoefficients that a tile keeps, so a block
 // clears only the levels it reads instead of zeroing both arrays.
@@ -85,6 +94,26 @@ ReadNonzeroCoefficients :: (decoder: *RangeDecoder, cdfs: *CoefficientCDFs,
 DecodeNonzeroCoefficients :: (decoder: *RangeDecoder, cdfs: *CoefficientCDFs,
     width: s32, height: s32, tx_class: s32, plane: s32, dc_context: s32, quant: []s32,
     scratch: *CoefficientScratch, cancellation: *Cancellation = null) -> CoefficientSummary {
+    return DecodeCoefficients(decoder, cdfs, width, height, tx_class, plane, dc_context, quant, null, scratch, cancellation)
+}
+
+// DecodeNonzeroCoefficients that writes the dequantized coefficients to
+// dequant.samples instead: only the summary's rows x columns rounded up to
+// multiples of 4, zero where no coefficient lies, so the rest of samples
+// keeps whatever it held. On failure samples holds partial values.
+DecodeDequantizedCoefficients :: (decoder: *RangeDecoder, cdfs: *CoefficientCDFs,
+    width: s32, height: s32, tx_class: s32, plane: s32, dc_context: s32, dequant: *CoefficientDequant,
+    scratch: *CoefficientScratch, cancellation: *Cancellation = null) -> CoefficientSummary {
+    if dequant == null { return CoefficientSummaryFailure(Error(InvalidInput)) }
+    none: [0]s32
+    return DecodeCoefficients(decoder, cdfs, width, height, tx_class, plane, dc_context, none[:], dequant, scratch,
+        cancellation)
+}
+
+// Both of the above: coefficients go to quant when dequant is null.
+DecodeCoefficients :: (decoder: *RangeDecoder, cdfs: *CoefficientCDFs,
+    width: s32, height: s32, tx_class: s32, plane: s32, dc_context: s32, quant: []s32, dequant: *CoefficientDequant,
+    scratch: *CoefficientScratch, cancellation: *Cancellation) -> CoefficientSummary {
     error := CancellationError(cancellation)
     if error.code != DecodeOK { return CoefficientSummaryFailure(error) }
     if decoder == null || cdfs == null || scratch == null || plane < 0 || plane > 1 || dc_context < 0 || dc_context > 2 ||
@@ -93,8 +122,19 @@ DecodeNonzeroCoefficients :: (decoder: *RangeDecoder, cdfs: *CoefficientCDFs,
     }
     shape := GetCoefficientShape(width, height)
     if shape.error.code != DecodeOK { return CoefficientSummaryFailure(shape.error) }
-    if (tx_class != CoefficientClass2D && (width > 16 || height > 16)) || quant.count < cast(s64)shape.count {
+    if (tx_class != CoefficientClass2D && (width > 16 || height > 16)) ||
+        (dequant == null && quant.count < cast(s64)shape.count) {
         return CoefficientSummaryFailure(Error(InvalidInput))
+    }
+    // The divisor's shift and the clamp of 7.12.3's dequantization.
+    dq_shift: u32 = ifx width * height > 1024 then 2 else ifx width * height > 256 then 1 else 0
+    dq_limit: s64 = 0; dq_dc: s64 = 0; dq_ac: s64 = 0
+    if dequant != null {
+        if dequant.samples.count < cast(s64)width * height || dequant.dc < 0 || dequant.ac < 0 ||
+            (dequant.depth != 8 && dequant.depth != 10 && dequant.depth != 12) {
+            return CoefficientSummaryFailure(Error(InvalidInput))
+        }
+        dq_limit = cast(s64)1 << cast(u32)(dequant.depth + 7); dq_dc = cast(s64)dequant.dc; dq_ac = cast(s64)dequant.ac
     }
     mode: s32 = ScanDefault
     if tx_class == CoefficientClassHorizontal { mode = ScanColumns }
@@ -127,7 +167,7 @@ DecodeNonzeroCoefficients :: (decoder: *RangeDecoder, cdfs: *CoefficientCDFs,
     eob_cdfs := 3153 + row_plane * 4 * 4
     br_cdfs := 2313 + ((ifx shape.size_context > 3 then 3 else shape.size_context) * 2 + plane) * 21 * 5
     stride := CoefficientLevelStride(cw)
-    for i: 0..shape.count - 1 { quant[i] = 0 }
+    if dequant == null { for i: 0..shape.count - 1 { quant[i] = 0 } }
     // Contexts read at most four rows and columns past the coded block.
     levels := scratch.levels[:cast(s64)(ch + 4) * stride]
     for i: 0..levels.count - 1 { levels[i] = 0 }
@@ -135,6 +175,7 @@ DecodeNonzeroCoefficients :: (decoder: *RangeDecoder, cdfs: *CoefficientCDFs,
     // The scan indices of nonzero levels, last first.
     nonzero := scratch.nonzero[:]
     nonzero_count: s32
+    rows: s32 = 0; columns: s32 = 0
     index := eob - 1
     while index >= 0 {
         position := cast(s32)positions[index]
@@ -160,7 +201,14 @@ DecodeNonzeroCoefficients :: (decoder: *RangeDecoder, cdfs: *CoefficientCDFs,
         levels[row * stride + column] = cast(u8)level
         // Written for every level, kept only for a nonzero one.
         nonzero[nonzero_count] = cast(u16)index; nonzero_count += ifx level != 0 then 1 else 0
+        if level != 0 {
+            rows = ifx row >= rows then row + 1 else rows; columns = ifx column >= columns then column + 1 else columns
+        }
         index -= 1
+    }
+    if dequant != null {
+        fill_rows := (cast(s64)rows + 3) & -4; fill_columns := (cast(s64)columns + 3) & -4
+        for i: 0..fill_rows - 1 { for j: 0..fill_columns - 1 { dequant.samples[i * width + j] = 0 } }
     }
     // Signs and the larger levels follow in scan order, for nonzero levels only.
     k := nonzero_count - 1
@@ -187,11 +235,20 @@ DecodeNonzeroCoefficients :: (decoder: *RangeDecoder, cdfs: *CoefficientCDFs,
         if decoder.error.code != DecodeOK { return CoefficientSummaryFailure(decoder.error) }
         if position == 0 { result.dc_category = ifx sign == 1 then 1 else 2 }
         level &= 1048575; result.level += level
-        quant[position] = ifx sign == 1 then -level else level
+        // Signs are as good as random, so they enter as arithmetic, never as
+        // a branch: (v ^ -1) + 1 is -v.
+        negative := sign & 1
+        if dequant == null { quant[position] = (level ^ -negative) + negative; continue }
+        // The masked product is never negative, so dividing by 1, 2 or 4 shifts.
+        value := ((cast(s64)level * (ifx position == 0 then dq_dc else dq_ac)) & 16777215) >> dq_shift
+        bound := dq_limit - 1 + cast(s64)negative
+        value = ifx value > bound then bound else value
+        dequant.samples[(position >> log_width) * width + (position & (cw - 1))] = (cast(s32)value ^ -negative) + negative
     }
     error = CancellationError(cancellation)
     if error.code != DecodeOK { return CoefficientSummaryFailure(error) }
     if result.level > 63 { result.level = 63 }
     result.eob = eob; result.coded_width = cw; result.coded_height = ch; result.nonzero = nonzero_count
+    result.rows = rows; result.columns = columns
     return result
 }

@@ -35,55 +35,108 @@ FindCdefDirection :: (input: []u16, stride: s32, bit_depth: s32,
 CdefLumaBlock :: struct { samples: [64]u16; }
 
 // The direction search alone, for an 8x8 block of real samples at bit_depth
-// 8, 10 or 12, row r column c at samples[r * 8 + c]. Centred on zero, a line
-// of n samples sums to at most 128 * n in magnitude, and its cost weight is
+// 8, 10 or 12, row r column c at samples[r * 8 + c], on s16x8 vectors. Each
+// sample, shifted to 8 bits and centred on zero, takes 16 bits, and so does a
+// line of n samples, at most 128 * n in magnitude. A line's cost weight is
 // 840 / n, so every direction costs at most 128 * 128 * 840 * 64 and all
 // arithmetic fits 32 bits.
-CdefDirectionOf :: (block: *CdefLumaBlock, bit_depth: s32) -> CdefDirection {
+//
+// Direction d sums samples along lines numbered k, and partial k of d is the
+// sum along line k, as in the specification's cdef_direction:
+//   d0: row + column            d4: 7 + row - column
+//   d1: row + column / 2        d5: 3 - row / 2 + column
+//   d2: row                     d6: column
+//   d3: 3 + row - column / 2    d7: row / 2 + column
+// With the rows as vectors (lanes are columns), d4..d7 shift each row, or
+// each pair of rows, across lanes by its line offset; partials 0..7 land in
+// one vector and 8..14 in another. d0..d3 do the same on the transposed
+// block, where d1 and d3 take the forms of d7 and d5 and d2 that of d6.
+CdefDirectionOf :: (block: *CdefLumaBlock, bit_depth: s32) -> CdefDirection #target {
     result: CdefDirection
     shift := cast(u32)(bit_depth - 8) & 7
-    partial: [120]s32
-    for row: 0..7 {
-        for column: 0..7 {
-            value := cast(s32)(block.samples[row * 8 + column] >> shift) - 128
-            partial[row + column] += value
-            partial[15 + row + column / 2] += value
-            partial[30 + row] += value
-            partial[45 + 3 + row - column / 2] += value
-            partial[60 + 7 + row - column] += value
-            partial[75 + 3 - row / 2 + column] += value
-            partial[90 + column] += value
-            partial[105 + row / 2 + column] += value
-        }
-    }
-    divisors: [9]s32 = .[0,840,420,280,210,168,140,120,105]
+    samples := block.samples[:]
+    l0 := CdefCentredRow(samples, 0, shift); l1 := CdefCentredRow(samples, 8, shift)
+    l2 := CdefCentredRow(samples, 16, shift); l3 := CdefCentredRow(samples, 24, shift)
+    l4 := CdefCentredRow(samples, 32, shift); l5 := CdefCentredRow(samples, 40, shift)
+    l6 := CdefCentredRow(samples, 48, shift); l7 := CdefCentredRow(samples, 56, shift)
+    // The transpose: c holds column c, its lanes the rows.
+    a0 := Simd.InterleaveLow(l0, l1); a1 := Simd.InterleaveHigh(l0, l1)
+    a2 := Simd.InterleaveLow(l2, l3); a3 := Simd.InterleaveHigh(l2, l3)
+    a4 := Simd.InterleaveLow(l4, l5); a5 := Simd.InterleaveHigh(l4, l5)
+    a6 := Simd.InterleaveLow(l6, l7); a7 := Simd.InterleaveHigh(l6, l7)
+    b0 := CdefInterleave32(a0, a2, false); b1 := CdefInterleave32(a0, a2, true)
+    b2 := CdefInterleave32(a1, a3, false); b3 := CdefInterleave32(a1, a3, true)
+    b4 := CdefInterleave32(a4, a6, false); b5 := CdefInterleave32(a4, a6, true)
+    b6 := CdefInterleave32(a5, a7, false); b7 := CdefInterleave32(a5, a7, true)
+    c0 := CdefInterleave64(b0, b4, false); c1 := CdefInterleave64(b0, b4, true)
+    c2 := CdefInterleave64(b1, b5, false); c3 := CdefInterleave64(b1, b5, true)
+    c4 := CdefInterleave64(b2, b6, false); c5 := CdefInterleave64(b2, b6, true)
+    c6 := CdefInterleave64(b3, b7, false); c7 := CdefInterleave64(b3, b7, true)
     cost: [8]s32
-    for i: 0..7 {
-        cost[2] += partial[30 + i] * partial[30 + i]
-        cost[6] += partial[90 + i] * partial[90 + i]
-    }
-    cost[2] *= divisors[8]; cost[6] *= divisors[8]
-    for i: 0..6 {
-        cost[0] += (partial[i] * partial[i] + partial[14 - i] * partial[14 - i]) * divisors[i + 1]
-        cost[4] += (partial[60 + i] * partial[60 + i] + partial[74 - i] * partial[74 - i]) * divisors[i + 1]
-    }
-    cost[0] += partial[7] * partial[7] * divisors[8]
-    cost[4] += partial[67] * partial[67] * divisors[8]
-    for direction: 1..7 {
-        if direction % 2 == 0 { continue }
-        for j: 0..4 { cost[direction] += partial[direction * 15 + 3 + j] * partial[direction * 15 + 3 + j] }
-        cost[direction] *= divisors[8]
-        for j: 0..2 {
-            a := partial[direction * 15 + j]; b := partial[direction * 15 + 10 - j]
-            cost[direction] += (a * a + b * b) * divisors[2 * j + 2]
-        }
-    }
+    full_low := Simd.Make(s32x4, 840, 420, 280, 210); full_high := Simd.Make(s32x4, 168, 140, 120, 105)
+    half_low := Simd.Make(s32x4, 420, 210, 140, 105); half_high := Simd.Splat(s32x4, 105)
+    // d0, on rows: partial r + c.
+    low := Simd.Add(Simd.Add(Simd.Add(l0, Simd.ShiftBytesLeft(l1, 2)), Simd.Add(Simd.ShiftBytesLeft(l2, 4), Simd.ShiftBytesLeft(l3, 6))),
+        Simd.Add(Simd.Add(Simd.ShiftBytesLeft(l4, 8), Simd.ShiftBytesLeft(l5, 10)), Simd.Add(Simd.ShiftBytesLeft(l6, 12), Simd.ShiftBytesLeft(l7, 14))))
+    high := Simd.Add(Simd.Add(Simd.Add(Simd.ShiftBytesRight(l1, 14), Simd.ShiftBytesRight(l2, 12)), Simd.Add(Simd.ShiftBytesRight(l3, 10), Simd.ShiftBytesRight(l4, 8))),
+        Simd.Add(Simd.Add(Simd.ShiftBytesRight(l5, 6), Simd.ShiftBytesRight(l6, 4)), Simd.ShiftBytesRight(l7, 2)))
+    cost[0] = CdefFoldCost(low, Simd.Shuffle(high, 6, 5, 4, 3, 2, 1, 0, 7), full_low, full_high)
+    // d4, on rows: lane c - r holds partial 7 - (c - r), lane 8 + c - r
+    // partial 15 - (8 + c - r).
+    low = Simd.Add(Simd.Add(Simd.Add(l0, Simd.ShiftBytesRight(l1, 2)), Simd.Add(Simd.ShiftBytesRight(l2, 4), Simd.ShiftBytesRight(l3, 6))),
+        Simd.Add(Simd.Add(Simd.ShiftBytesRight(l4, 8), Simd.ShiftBytesRight(l5, 10)), Simd.Add(Simd.ShiftBytesRight(l6, 12), Simd.ShiftBytesRight(l7, 14))))
+    high = Simd.Add(Simd.Add(Simd.Add(Simd.ShiftBytesLeft(l1, 14), Simd.ShiftBytesLeft(l2, 12)), Simd.Add(Simd.ShiftBytesLeft(l3, 10), Simd.ShiftBytesLeft(l4, 8))),
+        Simd.Add(Simd.Add(Simd.ShiftBytesLeft(l5, 6), Simd.ShiftBytesLeft(l6, 4)), Simd.ShiftBytesLeft(l7, 2)))
+    cost[4] = CdefFoldCost(Simd.Shuffle(low, 7, 6, 5, 4, 3, 2, 1, 0), Simd.ShiftBytesRight(high, 2), full_low, full_high)
+    // d6 and d2: column sums of the rows, and of the columns.
+    sum := Simd.Add(Simd.Add(Simd.Add(l0, l1), Simd.Add(l2, l3)), Simd.Add(Simd.Add(l4, l5), Simd.Add(l6, l7)))
+    cost[6] = Simd.ReduceAdd(Simd.MulAddPairs(sum, sum)) * 105
+    sum = Simd.Add(Simd.Add(Simd.Add(c0, c1), Simd.Add(c2, c3)), Simd.Add(Simd.Add(c4, c5), Simd.Add(c6, c7)))
+    cost[2] = Simd.ReduceAdd(Simd.MulAddPairs(sum, sum)) * 105
+    // d7 and d5 on row pairs, d1 and d3 the same on column pairs.
+    t0 := Simd.Add(l0, l1); t1 := Simd.Add(l2, l3); t2 := Simd.Add(l4, l5); t3 := Simd.Add(l6, l7)
+    cost[7] = CdefHalfCost(t0, t1, t2, t3, half_low, half_high)
+    cost[5] = CdefHalfCost(t3, t2, t1, t0, half_low, half_high)
+    t0 = Simd.Add(c0, c1); t1 = Simd.Add(c2, c3); t2 = Simd.Add(c4, c5); t3 = Simd.Add(c6, c7)
+    cost[1] = CdefHalfCost(t0, t1, t2, t3, half_low, half_high)
+    cost[3] = CdefHalfCost(t3, t2, t1, t0, half_low, half_high)
     best: s32
     for direction: 1..7 { if cost[direction] > cost[best] { best = cast(s32)direction } }
     result.direction = best
     // The best cost is the largest, so the difference is never negative.
     result.variance = cast(u32)((cost[best] - cost[(best + 4) & 7]) >> 10)
     return result
+}
+
+// Row at of samples shifted to 8 bits and centred on zero.
+CdefCentredRow :: (samples: []u16, at: s64, shift: u32) -> s16x8 #inline {
+    return Simd.Sub(Simd.Reinterpret(s16x8, Simd.ShiftRight(Simd.Load(u16x8, samples, at), shift)), Simd.Splat(s16x8, 128))
+}
+
+CdefInterleave32 :: (a: s16x8, b: s16x8, high: bool) -> s16x8 #inline {
+    x := Simd.Reinterpret(s32x4, a); y := Simd.Reinterpret(s32x4, b)
+    return Simd.Reinterpret(s16x8, ifx high then Simd.InterleaveHigh(x, y) else Simd.InterleaveLow(x, y))
+}
+
+CdefInterleave64 :: (a: s16x8, b: s16x8, high: bool) -> s16x8 #inline {
+    x := Simd.Reinterpret(s64x2, a); y := Simd.Reinterpret(s64x2, b)
+    return Simd.Reinterpret(s16x8, ifx high then Simd.InterleaveHigh(x, y) else Simd.InterleaveLow(x, y))
+}
+
+// A direction's cost from its partials: first holds partials 0..7 and paired
+// the partials sharing their weights, lane by lane, zero where none does.
+CdefFoldCost :: (first: s16x8, paired: s16x8, low: s32x4, high: s32x4) -> s32 #inline {
+    a := Simd.InterleaveLow(first, paired); b := Simd.InterleaveHigh(first, paired)
+    return Simd.ReduceAdd(Simd.Add(Simd.Mul(Simd.MulAddPairs(a, a), low), Simd.Mul(Simd.MulAddPairs(b, b), high)))
+}
+
+// The cost of a direction whose line through row pair j (t0..t3) and column
+// c is j + c: partials 0..10, those past 7 in the low lanes of a second
+// vector, paired 10, 9, 8 with 0, 1, 2.
+CdefHalfCost :: (t0: s16x8, t1: s16x8, t2: s16x8, t3: s16x8, low: s32x4, high: s32x4) -> s32 #inline {
+    first := Simd.Add(Simd.Add(t0, Simd.ShiftBytesLeft(t1, 2)), Simd.Add(Simd.ShiftBytesLeft(t2, 4), Simd.ShiftBytesLeft(t3, 6)))
+    rest := Simd.Add(Simd.ShiftBytesRight(t1, 14), Simd.Add(Simd.ShiftBytesRight(t2, 12), Simd.ShiftBytesRight(t3, 10)))
+    return CdefFoldCost(first, Simd.Shuffle(rest, 2, 1, 0, 3, 4, 5, 6, 7), low, high)
 }
 
 #scope_file

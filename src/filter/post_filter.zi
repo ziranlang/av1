@@ -52,7 +52,7 @@ PostFilterStrength :: (frame: *IntraFrame, header: *StillFrameHeader,
 // filtered together. Intra blocks filter every transform edge, so the
 // prediction-block edge test is not needed.
 PostDeblockEdge :: (frame: *IntraFrame, samples: []u16, header: *StillFrameHeader,
-    plane: s32, pass: s32, luma_row: s32, luma_column: s32) -> DecodeError {
+    plane: s32, pass: s32, luma_row: s32, luma_column: s32, scratch: *DeblockScratch) -> DecodeError {
     sx := IntraSubX(frame, plane); sy := IntraSubY(frame, plane)
     x := luma_column * 4; y := luma_row * 4
     if x >= frame.width || y >= frame.height || (pass == 0 && x == 0) || (pass == 1 && y == 0) {
@@ -81,7 +81,7 @@ PostDeblockEdge :: (frame: *IntraFrame, samples: []u16, header: *StillFrameHeade
     stride := cast(s64)frame.plane_stride[plane]
     line_step: s64 = ifx pass == 0 then stride else 1
     tap_step: s64 = ifx pass == 0 then 1 else stride
-    return FilterDeblockLines(samples, PostIndex(frame, plane, xp, yp), line_step, tap_step, length,
+    return FilterDeblockLinesIn(scratch, samples, PostIndex(frame, plane, xp, yp), line_step, tap_step, length,
         strength.block_limit, strength.limit, strength.threshold, frame.bit_depth)
 }
 
@@ -142,6 +142,7 @@ ApplyIntraLoopFilter :: (frame: *IntraFrame, samples: []u16, header: *StillFrame
     cancellation: *Cancellation = null) -> DecodeError {
     if frame == null || header == null || samples.count != frame.sample_count { return Error(InvalidInput) }
     if header.loop_filter_levels[0] == 0 && header.loop_filter_levels[1] == 0 { return Error(DecodeOK) }
+    scratch: DeblockScratch
     for plane_index: 0..frame.planes - 1 {
         plane := cast(s32)plane_index
         if plane > 0 && header.loop_filter_levels[1 + plane] == 0 { continue }
@@ -155,7 +156,7 @@ ApplyIntraLoopFilter :: (frame: *IntraFrame, samples: []u16, header: *StillFrame
                 if error.code != DecodeOK { return error }
                 column: s32 = 0
                 while column < frame.mi_cols {
-                    error = PostDeblockEdge(frame, samples, header, plane, pass, row, column)
+                    error = PostDeblockEdge(frame, samples, header, plane, pass, row, column, *scratch)
                     if error.code != DecodeOK { return error }
                     column += column_step
                 }

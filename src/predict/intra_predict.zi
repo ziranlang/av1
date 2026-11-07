@@ -1,4 +1,5 @@
 using Codec :: #import "image_codec/api"
+Simd :: #import "std/simd"
 
 // AV1 7.11.2 intra prediction for every transform size 4x4..64x64, scalar
 // reference. Smooth weights, directional derivatives and recursive filter taps
@@ -85,6 +86,30 @@ IntraFilterTaps :: s8.[
     -1,4,0,0,0,3,10, -1,3,4,0,0,4,6, -1,2,3,4,0,4,4, -1,2,2,3,4,3,3,
     -12,14,0,0,0,14,0, -10,0,14,0,0,12,0, -9,0,0,14,0,11,0, -8,0,0,0,14,10,0,
     -10,12,0,0,0,0,14, -9,1,12,0,0,0,12, -8,0,0,12,0,1,11, -7,0,0,1,12,1,9]
+
+// IntraFilterTaps paired for MulAddPairs: [mode][row 0..1][neighbor pair
+// 0..3][column 0..3][two taps], the last pair's second tap zero.
+IntraFilterTapPairs :: s16.[
+    -6,10,-5,2,-3,1,-3,1, 0,0,10,0,1,10,1,2,
+    0,12,0,9,0,7,10,5, 0,0,0,0,0,0,0,0,
+    -4,6,-3,2,-3,2,-3,1, 0,0,6,0,2,6,2,2,
+    0,2,0,2,0,2,6,3, 12,0,9,0,7,0,5,0,
+    -10,16,-6,0,-4,0,-2,0, 0,0,16,0,0,16,0,0,
+    0,10,0,6,0,4,16,2, 0,0,0,0,0,0,0,0,
+    -10,16,-6,0,-4,0,-2,0, 0,0,16,0,0,16,0,0,
+    0,0,0,0,0,0,16,0, 10,0,6,0,4,0,2,0,
+    -8,8,-8,0,-8,0,-8,0, 0,0,8,0,0,8,0,0,
+    0,16,0,16,0,16,8,16, 0,0,0,0,0,0,0,0,
+    -4,4,-4,0,-4,0,-4,0, 0,0,4,0,0,4,0,0,
+    0,0,0,0,0,0,4,0, 16,0,16,0,16,0,16,0,
+    -2,8,-1,3,-1,2,0,1, 0,0,8,0,3,8,2,3,
+    0,10,0,6,0,4,8,2, 0,0,0,0,0,0,0,0,
+    -1,4,-1,3,-1,2,-1,2, 0,0,4,0,3,4,2,3,
+    0,3,0,4,0,4,4,3, 10,0,6,0,4,0,3,0,
+    -12,14,-10,0,-9,0,-8,0, 0,0,14,0,0,14,0,0,
+    0,14,0,12,0,11,14,10, 0,0,0,0,0,0,0,0,
+    -10,12,-9,1,-8,0,-7,0, 0,0,12,0,0,12,0,1,
+    0,0,0,0,0,1,12,1, 14,0,12,0,11,0,9,0]
 
 // Builds AboveRow/LeftCol (AV1 7.11.2.1) from a reconstructed plane. x/y are
 // the transform block origin; max_x/max_y are the last decoded plane sample,
@@ -332,13 +357,16 @@ PredictPaethIntra :: (out: []u16, stride: s32, edges: *IntraEdges) {
 
 // AV1 7.11.2.3; each 4x2 group reads already predicted output samples.
 // PredictIntra checked the block; the guard repeats what bounds each index.
-PredictRecursiveIntra :: (out: []u16, stride: s32, edges: *IntraEdges, filter_mode: s32, maximum: s32) {
+PredictRecursiveIntra :: (out: []u16, stride: s32, edges: *IntraEdges, filter_mode: s32, maximum: s32) #target {
     groups_x := edges.width >> 2; groups_y := edges.height >> 1
     if groups_x < 1 || groups_x > 8 || groups_y < 1 || groups_y > 16 || filter_mode < 0 || filter_mode > 4 ||
-        stride < 4 * groups_x || cast(s64)(2 * groups_y - 1) * stride + 4 * groups_x > out.count {
+        stride < 4 * groups_x || cast(s64)(2 * groups_y - 1) * stride + 4 * groups_x > out.count ||
+        maximum < 0 || maximum > 65535 {
         return
     }
-    neighbors: [7]s32
+    neighbors: [8]s32
+    taps := cast(s64)filter_mode * 64
+    rounding := Simd.Splat(s32x4, 8); zero := Simd.Zero(s32x4); top := Simd.Splat(s32x4, maximum)
     for i2: 0..cast(s64)groups_y - 1 {
         for j4: 0..cast(s64)groups_x - 1 {
             for i: 0..4 {
@@ -350,17 +378,21 @@ PredictRecursiveIntra :: (out: []u16, stride: s32, edges: *IntraEdges, filter_mo
                 if j4 == 0 { neighbors[i] = edges.left[IntraEdgeOffset + (i2 << 1) + i - 5] }
                 else { neighbors[i] = cast(s32)out[((i2 << 1) + i - 5) * stride + (j4 << 2) - 1] }
             }
-            for r: 0..1 {
-                for c: 0..3 {
-                    taps := (filter_mode * 8 + r * 4 + c) * 7
-                    sum: s32
-                    for i: 0..6 { sum += cast(s32)IntraFilterTaps[taps + i] * neighbors[i] }
-                    value := ifx sum >= 0 then (sum + 8) >> 4 else -((-sum + 8) >> 4)
-                    if value < 0 { value = 0 }
-                    if value > maximum { value = maximum }
-                    out[((i2 << 1) + r) * stride + (j4 << 2) + c] = cast(u16)value
-                }
+            // Each s32 lane of a pair vector holds two neighbors, the first
+            // in its low half; the samples are at most 16 bits.
+            first: s32x4; second: s32x4
+            for k: 0..3 {
+                pair := Simd.Reinterpret(s16x8, Simd.Splat(s32x4, (neighbors[2 * k] & 65535) | (neighbors[2 * k + 1] << 16)))
+                first = Simd.Add(first, Simd.MulAddPairs(pair, Simd.Load(s16x8, IntraFilterTapPairs, taps + k * 8)))
+                second = Simd.Add(second, Simd.MulAddPairs(pair, Simd.Load(s16x8, IntraFilterTapPairs, taps + 32 + k * 8)))
             }
+            // Round2Signed then Clip1: a negative sum clips to zero either way.
+            first = Simd.Min(Simd.Max(Simd.ShiftRight(Simd.Add(first, rounding), 4), zero), top)
+            second = Simd.Min(Simd.Max(Simd.ShiftRight(Simd.Add(second, rounding), 4), zero), top)
+            rows := Simd.Narrow(u16x8, first, second)
+            at := (i2 << 1) * stride + (j4 << 2)
+            Simd.StoreLow(out, at, rows)
+            Simd.StoreLow(out, at + stride, Simd.ShiftBytesRight(rows, 8))
         }
     }
 }

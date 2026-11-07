@@ -67,14 +67,14 @@ IntraCoefficients :: (tile: *IntraTile, block: *IntraBlock, plane: s32, start_x:
             if resolved.error.code != DecodeOK { return resolved.error }
             tx_type = resolved.value
         }
-        coefficients := DecodeNonzeroCoefficients(*tile.decoder, *tile.cdfs.coefficients, tx_w, tx_h,
-            TransformClass(tx_type), plane_type, contexts.dc, tile.quant[:], *tile.coefficient_scratch, tile.cancellation)
-        if coefficients.error.code != DecodeOK { return coefficients.error }
-        level = coefficients.level; dc = coefficients.dc_category
         stride := frame.plane_stride[plane]
         plane_end := frame.plane_offset[plane] + cast(s64)stride * frame.plane_rows[plane]
         at := frame.plane_offset[plane] + cast(s64)start_y * stride + start_x
         if block.lossless {
+            coefficients := DecodeNonzeroCoefficients(*tile.decoder, *tile.cdfs.coefficients, tx_w, tx_h,
+                TransformClass(tx_type), plane_type, contexts.dc, tile.quant[:], *tile.coefficient_scratch, tile.cancellation)
+            if coefficients.error.code != DecodeOK { return coefficients.error }
+            level = coefficients.level; dc = coefficients.dc_category
             residual := InverseLossless4x4(tile.quant[:16], frame.bit_depth, tile.cancellation)
             if residual.error.code != DecodeOK { return residual.error }
             error := AddResidual(tile.samples[at:plane_end], stride, residual.samples[:], 4, 4, 0,
@@ -87,16 +87,20 @@ IntraCoefficients :: (tile: *IntraTile, block: *IntraBlock, plane: s32, start_x:
             delta_dc := header.delta_q[0]; delta_ac: s32
             if plane == 1 { delta_dc = header.delta_q[1]; delta_ac = header.delta_q[2] }
             if plane == 2 { delta_dc = header.delta_q[3]; delta_ac = header.delta_q[4] }
-            coded := IntraMin(32, tx_w) * IntraMin(32, tx_h)
+            steps := GetQuantizationSteps(q.value, delta_dc, delta_ac, frame.bit_depth, tile.cancellation)
+            if steps.error.code != DecodeOK { return steps.error }
             count := tx_w * tx_h
-            error := DequantizeSparseInto(tile.quant[:coded], tile.coefficient_scratch.nonzero[:], coefficients.nonzero,
-                tx_w, tx_h, q.value, delta_dc, delta_ac, frame.bit_depth, tile.dequant[:count], tile.cancellation)
-            if error.code != DecodeOK { return error }
-            error = InverseTransform2D(tile.dequant[:count], tile.residual[:count], tx_w, tx_h, tx_type,
-                frame.bit_depth, tile.cancellation)
-            if error.code != DecodeOK { return error }
-            error = AddResidual(tile.samples[at:plane_end], stride, tile.residual[:count], tx_w, tx_h, tx_type,
-                frame.bit_depth, tile.cancellation)
+            dequant: CoefficientDequant
+            dequant.samples = tile.dequant[:count]; dequant.dc = steps.dc; dequant.ac = steps.ac
+            dequant.depth = frame.bit_depth
+            coefficients := DecodeDequantizedCoefficients(*tile.decoder, *tile.cdfs.coefficients, tx_w, tx_h,
+                TransformClass(tx_type), plane_type, contexts.dc, *dequant, *tile.coefficient_scratch, tile.cancellation)
+            if coefficients.error.code != DecodeOK { return coefficients.error }
+            level = coefficients.level; dc = coefficients.dc_category
+            // The transform runs in place in dequant.
+            error := ReconstructTransformBlock(tile.samples[at:plane_end], stride, tile.dequant[:count],
+                tile.dequant[:count], tx_w, tx_h, tx_type, frame.bit_depth, coefficients.rows, coefficients.columns,
+                *tile.transform, tile.cancellation)
             if error.code != DecodeOK { return error }
         }
     }

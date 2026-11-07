@@ -413,8 +413,9 @@ bounds are validated before filtering; failure returns no committed samples.
 line per `std/simd` `s32x4` lane, with the same masks as lane masks. It is a
 `#target` procedure, reads only the samples the filter length covers and writes
 only those it can change. A sample above the depth, or any tap outside the
-buffer, rejects the whole segment unwritten. The frame loop filter uses it for
-every edge.
+buffer, rejects the whole segment unwritten. The frame loop filter uses
+`FilterDeblockLinesIn` for every edge, in tap lanes it keeps for the whole
+frame. Each call loads only the taps it reads and sets only those it writes.
 
 `build-queue -- sh tests/av1_deblock.sh` passed 3,072 vectors against both
 horizontal and vertical pinned libaom scalar functions and an independent
@@ -597,14 +598,11 @@ mask, transform-size division and source-depth clipping. The owned 4,096-cell
 result uses the full transform width; cells outside the coded upper-left
 rectangle and inactive cells remain zero. Errors and cancellation return no
 coefficients. Borrowed inputs remain unchanged. `DequantizeInto` writes the same values into a caller buffer.
-`DequantizeSparseInto` does so with flat weights from a list of the coded
-positions that may be nonzero, reading only those coefficients.
+The frame decoder dequantizes with flat weights while it reads coefficients;
+see `DecodeDequantizedCoefficients`.
 
 `build-queue -- sh tests/av1_quantization.sh` passed 98,304 lookup/delta cases and
 114 dequantization vectors across 8/10/12-bit depth and all nineteen sizes.
-`DequantizeSparseInto` matches `DequantizeBlock` on 342 sparse blocks of every
-size and depth, from one coefficient to all of them in random order, with
-samples past the block untouched.
 Native inverse-matrix data covers all fifteen active levels and both plane
 classes. The normative coefficient reference checks 44,640 compact coefficients
 and all 466,944 output cells, including 28,885 product wraps and 41,495 clips.
@@ -705,7 +703,11 @@ the specification. The caller resolves the legal transform class and neighbor
 contexts. No transform-type syntax is omitted inside this component. `DecodeNonzeroCoefficients` writes the coefficients into a caller buffer instead of returning them,
 using a caller `CoefficientScratch` for the levels, scan positions and the
 coded positions of nonzero levels, which the summary counts; the tile keeps
-one.
+one. The summary also gives the upper-left rows and columns that hold the
+nonzero coefficients. `DecodeDequantizedCoefficients` reads the same syntax
+but applies flat-weight dequantization to each coefficient as it reads its
+sign, as libaom does. It writes the row-major Dequant array only inside that
+box, rounded up to multiples of 4, so a transform reads no more.
 
 The reader covers nineteen transform sizes, the permitted 2D/horizontal/vertical
 coefficient classes, all EOB areas, reverse base/BR levels, forward signs and
@@ -719,7 +721,11 @@ the unmodified pinned `av1_write_coeffs_txb`, covering both plane categories,
 all four base-Q probability categories, empty/DC-only/full/random EOBs, signed
 levels, the 20-bit mask boundary and disabled adaptation. It compares all
 229,376 coefficient cells and 859,040 probability cells, including inactive
-storage. Thirty-two seeded arbitrary buffers test deterministic errors and
+storage. Each nonzero stream is decoded again by `DecodeDequantizedCoefficients`
+at one of four quantizers and three depths. Its summary, CDFs, range position
+and dequantized box must match `ReadNonzeroCoefficients` followed by
+`DequantizeBlock`, and it must leave every sample outside the box untouched.
+Thirty-two seeded arbitrary buffers test deterministic errors and
 zero output on failure. Source/saved C, Go, direct VM and C sanitizers pass
 with unchanged controlled source/compiler inputs. These are authoritative
 coefficient syntax streams; complete lossy frames are covered by the intra
@@ -761,7 +767,11 @@ Inputs must lie in the (BitDepth+8)-bit Dequant range. It writes the unflipped
 row-major Residual and may run in place. `AddResidual(samples,stride,residual,...)`
 applies the type's vertical/horizontal flips and Clip1 to caller-owned samples.
 Any failure clears the residual or leaves the samples unchanged; neither
-function allocates. Transform-set legality belongs to `transform/transform_type.zi`;
+function allocates. `ReconstructTransformBlock` does both for the frame
+decoder, given the box that holds a block's coefficients. Its passes read
+only that box, rounded up to multiples of 4. A DCT_DCT block with only a DC
+coefficient adds one constant without running either pass. It runs in place
+in the decoder's Dequant buffer, with lanes the tile keeps. Transform-set legality belongs to `transform/transform_type.zi`;
 these kernels accept every computable direction/length combination.
 
 `build-queue -- sh tests/av1_inverse_transform.sh` builds the pinned libaom
@@ -773,6 +783,10 @@ cases across all 185 legal size/type pairs at depths 8/10/12, plus 66 extreme
 nonconforming inputs whose deterministic s64 results come from the reference
 alone. Boundary cases cover invalid geometry, types and depths, out-of-range
 input, aliasing, ignored high-frequency cells, flips, clipping and cancellation.
+`ReconstructTransformBlock` must match `InverseTransform2D` then `AddResidual`
+on every size and depth. Cases include DC-only boxes (DCT_DCT and other types,
+small and extreme DCs) and random boxes of small and range-filling values
+under random legal types, with garbage outside each rounded box.
 Source and saved IR run in C, Go and the direct VM, and under ASan/UBSan. The
 frame decoder calls these kernels for every lossy transform block.
 
@@ -925,7 +939,7 @@ And in scalar code:
   the token straight to its color, and a map checks its five CDFs once
   instead of on every token.
 - `entropy/coefficient_block.zi`: signs and Golomb extensions are read for
-  the nonzero levels only, and `DequantizeSparseInto` reads just those
+  the nonzero levels only, and dequantization reads just those
   coefficients.
 - `predict/intra_predict.zi`: edge samples are written in place and checked
   against the bit depth once.
@@ -939,8 +953,26 @@ And in scalar code:
   prediction and the CDEF direction table check their block once on entry,
   so their reads need no bounds checks.
 
-It now takes 6 to 134 ms per frame, the medians of the fastest of three
-benchmark runs on a busy machine: 0.9 to 3.3 times libaom and 1.7 to 6.1 times
+Then, on Ziran giving each `#target` clone its own tier's copy of every
+`#inline` procedure:
+
+- `entropy/coefficient_block.zi`: coefficients are dequantized as their
+  signs are read, into only the box that holds them. Signs negate by
+  arithmetic, not a branch.
+- `entropy/coefficient_context.zi`: the 2D base context offset comes from a
+  table by shape and near position, as in libaom.
+- `transform/inverse_transform.zi`: the passes read only the coefficient
+  box, a DC-only DCT_DCT block adds one constant on `u16` vectors, and the
+  transform runs in place without clearing its lanes. The residual is added
+  on native-width vectors, and the samples are not checked again.
+- `predict/intra_predict.zi`: recursive intra prediction filters four rows
+  of a block at once as vectors.
+- `filter/cdef.zi`: the direction search runs on vectors.
+- `filter/deblock.zi`: the frame keeps its filter taps, so no edge clears
+  them.
+
+It now takes 5 to 117 ms per frame, the medians of the fastest of three
+benchmark runs on a busy machine: 0.8 to 2.2 times libaom and 1.5 to 4.6 times
 dav1d. The screen-content clip decodes faster than libaom. Entropy decoding is
 the largest remaining cost. The generated C still bounds-checks indices it
 cannot prove, such as row times stride, and calls the symbol decoder out of

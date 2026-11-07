@@ -2,6 +2,7 @@
 #import, file "../src/entropy/coefficient_cdfs.zi";
 #import, file "../src/entropy/coefficient_cdf_symbols.zi";
 #import, file "../src/entropy/range.zi";
+#import, file "../src/transform/quantization.zi";
 
 BlockIsZero :: (block: *CoefficientBlock) -> bool {
     if block.eob != 0 || block.level != 0 || block.dc_category != 0 ||
@@ -77,5 +78,72 @@ CoefficientBlockBoundaries :: () -> s32 {
         for i: 0..1023 { if ba.quant[i] != bb.quant[i] { return 15 } }
         for i: 0..3834 { if ca.values[i] != cb.values[i] { return 16 } }
     }
+    // DecodeDequantizedCoefficients checks its target before reading.
+    samples: [16]s32
+    target: CoefficientDequant; target.samples = samples[:]; target.dc = 4; target.ac = 4; target.depth = 8
+    scratch: CoefficientScratch; missing_target: *CoefficientDequant
+    decoder = NewRange(BorrowBytes(data[:]), 0, 16)
+    for i: 0..4 {
+        bad := target
+        if i == 1 { bad.samples = samples[:15] }
+        if i == 2 { bad.depth = 9 }
+        if i == 3 { bad.dc = -1 }
+        if i == 4 { bad.ac = -1 }
+        summary: CoefficientSummary
+        if i == 0 { summary = DecodeDequantizedCoefficients(*decoder, *cdfs, 4, 4, 0, 0, 0, missing_target, *scratch) }
+        else { summary = DecodeDequantizedCoefficients(*decoder, *cdfs, 4, 4, 0, 0, 0, *bad, *scratch) }
+        if summary.error.code != InvalidInput || RangeBitPosition(*decoder) != 15 { return 17 }
+    }
+    if DecodeDequantizedCoefficients(*decoder, *cdfs, 4, 4, 0, 0, 0, *target, *scratch,
+        *token).error.code != DecodeCancelled {
+        return 18
+    }
+    return 0
+}
+
+// DecodeDequantizedCoefficients on a block's stream against
+// ReadNonzeroCoefficients and then DequantizeBlock with flat weights: the
+// same summary, range position and CDFs; a box holding every nonzero
+// coefficient; the dequantized values in that box rounded up to multiples of
+// 4; and every other sample left as it was.
+DequantizedMatches :: (bytes: []u8, disable: bool, q: s32, skip_context: s32, width: s32, height: s32, tx_class: s32,
+    plane: s32, dc_context: s32, qindex: s32, depth: s32) -> s32 {
+    cdfs := NewCoefficientCDFs(q); fused_cdfs := NewCoefficientCDFs(q)
+    decoder := NewRange(BorrowBytes(bytes), 0, bytes.count, disable)
+    fused := NewRange(BorrowBytes(bytes), 0, bytes.count, disable)
+    if ReadCoefficientSkip(*decoder, *cdfs, width, height, plane, skip_context).value != 0 ||
+        ReadCoefficientSkip(*fused, *fused_cdfs, width, height, plane, skip_context).value != 0 {
+        return 1
+    }
+    block := ReadNonzeroCoefficients(*decoder, *cdfs, width, height, tx_class, plane, dc_context)
+    cw := ifx width < 32 then width else 32; ch := ifx height < 32 then height else 32
+    flat: [1]u8
+    expected := DequantizeBlock(block.quant[:cw * ch], width, height, qindex, 0, 0, depth, flat[:0])
+    steps := GetQuantizationSteps(qindex, 0, 0, depth)
+    if block.error.code != DecodeOK || expected.error.code != DecodeOK || steps.error.code != DecodeOK { return 2 }
+    samples: [4097]s32
+    for i: 0..4096 { samples[i] = 1234567 }
+    target: CoefficientDequant
+    target.samples = samples[:width * height]; target.dc = steps.dc; target.ac = steps.ac; target.depth = depth
+    scratch: CoefficientScratch
+    summary := DecodeDequantizedCoefficients(*fused, *fused_cdfs, width, height, tx_class, plane, dc_context, *target,
+        *scratch)
+    if summary.error.code != DecodeOK || summary.eob != block.eob || summary.level != block.level ||
+        summary.dc_category != block.dc_category || summary.rows < 1 || summary.rows > ch || summary.columns < 1 ||
+        summary.columns > cw {
+        return 3
+    }
+    if RangeBitPosition(*decoder) != RangeBitPosition(*fused) { return 4 }
+    for i: 0..3834 { if cdfs.values[i] != fused_cdfs.values[i] { return 5 } }
+    fill_rows := (cast(s64)summary.rows + 3) & -4; fill_columns := (cast(s64)summary.columns + 3) & -4
+    for i: 0..cast(s64)height - 1 { for j: 0..cast(s64)width - 1 {
+        at := i * width + j
+        if i < fill_rows && j < fill_columns {
+            if samples[at] != expected.samples[at] { return 6 }
+        } else if samples[at] != 1234567 || expected.samples[at] != 0 {
+            return 7
+        }
+    } }
+    for i: cast(s64)width * height..4096 { if samples[i] != 1234567 { return 8 } }
     return 0
 }

@@ -23,3 +23,4 @@
 - Self-guided restoration on SIMD vectors.
 - Faster coefficient signs, dequantization, intra edges and range decoding.
 - Faster post filters, output rows and recursive intra prediction.
+- Faster coefficient decoding with dequantization folded in, coefficient-box inverse transforms, and SIMD recursive intra prediction and CDEF direction search.

@@ -36,5 +36,90 @@ CdefBoundaries :: () -> s32 {
     for i: 0..63 { if cancelled.samples[i] != 0 { return 21 } }
     cancelled_dir := FindCdefDirection(source[:], 11, 8, *token)
     if cancelled_dir.error.code != DecodeCancelled || cancelled_dir.direction != 0 || cancelled_dir.variance != 0 { return 22 }
+    if CdefVectorDirections() != 0 { return 23 }
     return 0
 }
+
+// CdefDirectionOf against the scalar search on 3 x 4000 blocks: random
+// samples at each depth, and blocks of only the extremes, lines, ramps and
+// ties, where the costs are largest or several directions draw.
+CdefVectorDirections :: () -> s32 {
+    seed: u32 = 41563174
+    block: CdefLumaBlock
+    for d: 0..2 {
+        depth := 8 + 2 * cast(s32)d; maximum := (cast(u32)1 << cast(u32)depth) - 1
+        for n: 0..3999 {
+            seed = seed * 1664525 + 1013904223
+            kind := (seed >> 24) % 8; pick := seed & 63
+            for i: 0..63 {
+                seed = seed * 1664525 + 1013904223
+                value := (seed >> 8) % (maximum + 1)
+                row := cast(u32)i / 8; column := cast(u32)i % 8
+                if kind == 1 { value = ifx (seed >> 30) == 0 then maximum else 0 }
+                if kind == 2 { value = ifx (row + column + pick) % 2 == 0 then maximum else 0 }
+                if kind == 3 { value = ifx (row * (pick % 3) + column) % 8 < 4 then maximum else 0 }
+                if kind == 4 { value = (row * 32 + column * pick) % (maximum + 1) }
+                if kind == 5 { value = ifx n % 2 == 0 then maximum else 0 }
+                if kind == 6 { value = ifx row == pick % 8 || column == pick / 8 then maximum else 0 }
+                block.samples[i] = cast(u16)value
+            }
+            want := CdefDirectionScalar(*block, depth)
+            got := CdefDirectionOf(*block, depth)
+            if got.direction != want.direction || got.variance != want.variance { return 1 }
+        }
+    }
+    return 0
+}
+
+// The scalar direction search the vector CdefDirectionOf must match, for real samples at bit_depth
+// 8, 10 or 12, row r column c at samples[r * 8 + c]. Centred on zero, a line
+// of n samples sums to at most 128 * n in magnitude, and its cost weight is
+// 840 / n, so every direction costs at most 128 * 128 * 840 * 64 and all
+// arithmetic fits 32 bits.
+CdefDirectionScalar :: (block: *CdefLumaBlock, bit_depth: s32) -> CdefDirection {
+    result: CdefDirection
+    shift := cast(u32)(bit_depth - 8) & 7
+    partial: [120]s32
+    for row: 0..7 {
+        for column: 0..7 {
+            value := cast(s32)(block.samples[row * 8 + column] >> shift) - 128
+            partial[row + column] += value
+            partial[15 + row + column / 2] += value
+            partial[30 + row] += value
+            partial[45 + 3 + row - column / 2] += value
+            partial[60 + 7 + row - column] += value
+            partial[75 + 3 - row / 2 + column] += value
+            partial[90 + column] += value
+            partial[105 + row / 2 + column] += value
+        }
+    }
+    divisors: [9]s32 = .[0,840,420,280,210,168,140,120,105]
+    cost: [8]s32
+    for i: 0..7 {
+        cost[2] += partial[30 + i] * partial[30 + i]
+        cost[6] += partial[90 + i] * partial[90 + i]
+    }
+    cost[2] *= divisors[8]; cost[6] *= divisors[8]
+    for i: 0..6 {
+        cost[0] += (partial[i] * partial[i] + partial[14 - i] * partial[14 - i]) * divisors[i + 1]
+        cost[4] += (partial[60 + i] * partial[60 + i] + partial[74 - i] * partial[74 - i]) * divisors[i + 1]
+    }
+    cost[0] += partial[7] * partial[7] * divisors[8]
+    cost[4] += partial[67] * partial[67] * divisors[8]
+    for direction: 1..7 {
+        if direction % 2 == 0 { continue }
+        for j: 0..4 { cost[direction] += partial[direction * 15 + 3 + j] * partial[direction * 15 + 3 + j] }
+        cost[direction] *= divisors[8]
+        for j: 0..2 {
+            a := partial[direction * 15 + j]; b := partial[direction * 15 + 10 - j]
+            cost[direction] += (a * a + b * b) * divisors[2 * j + 2]
+        }
+    }
+    best: s32
+    for direction: 1..7 { if cost[direction] > cost[best] { best = cast(s32)direction } }
+    result.direction = best
+    // The best cost is the largest, so the difference is never negative.
+    result.variance = cast(u32)((cost[best] - cost[(best + 4) & 7]) >> 10)
+    return result
+}
+

@@ -84,5 +84,140 @@ InverseTransformBoundaries :: () -> s32 {
     if AddResidual(samples[:], 5, flat[:], 4, 4, 0, 8).code != InvalidInput { return 25 }
     if AddResidual(samples[:], 5, flat[:], 4, 4, 0, 8, *token).code != DecodeCancelled { return 26 }
     for j: 0..19 { if samples[j] != saved[j] { return 27 } }
+    if VectorResidualRows() != 0 { return 28 }
+    if BoxReconstruction() != 0 { return 29 }
+    return 0
+}
+
+// AddResidual without flips runs on vectors. It must match the scalar Clip1
+// sum at every size and depth, with rows stride + 3 apart and the samples
+// between rows untouched even when they are above the maximum. Residuals go
+// past +-65536 to the s32 limits. A sample above the maximum in the block,
+// first, last or in the middle, is rejected with nothing written.
+VectorResidualRows :: () -> s32 {
+    sizes: [38]s32 = .[4,4, 4,8, 8,4, 8,8, 8,16, 16,8, 16,16, 16,32, 32,16, 32,32, 32,64, 64,32, 64,64,
+        4,16, 16,4, 8,32, 32,8, 16,64, 64,16]
+    samples: [4285]u16; before: [4285]u16; expected: [4285]u16; residual: [4096]s32
+    seed: u32 = 41563174
+    for n: 0..18 {
+        w := sizes[2 * n]; h := sizes[2 * n + 1]; stride := w + 3
+        area := cast(s64)w * h; count := cast(s64)(h - 1) * stride + w
+        for d: 0..2 {
+            depth := 8 + 2 * cast(s32)d; maximum := (cast(s64)1 << cast(u32)depth) - 1
+            for i: 0..count - 1 {
+                seed = seed * 1664525 + 1013904223
+                samples[i] = ifx i % stride < w then cast(u16)(cast(s64)(seed >> 8) % (maximum + 1)) else 65535
+            }
+            for i: 0..area - 1 {
+                seed = seed * 1664525 + 1013904223
+                residual[i] = cast(s32)(cast(s64)(seed >> 4) % 140001) - 70000
+            }
+            residual[0] = 2147483647; residual[area - 1] = -2147483647 - 1
+            residual[area / 2] = 65537; residual[area / 3] = -65537
+            for i: 0..count - 1 { expected[i] = samples[i] }
+            for i: 0..cast(s64)h - 1 { for j: 0..cast(s64)w - 1 {
+                value := cast(s64)samples[i * stride + j] + cast(s64)residual[i * w + j]
+                if value < 0 { value = 0 }
+                if value > maximum { value = maximum }
+                expected[i * stride + j] = cast(u16)value
+            } }
+            if AddResidual(samples[:count], stride, residual[:area], w, h, 0, depth).code != DecodeOK { return 1 }
+            for i: 0..count - 1 { if samples[i] != expected[i] { return 2 } }
+            for k: 0..2 {
+                at := ifx k == 0 then 0 else ifx k == 1 then count - 1 else cast(s64)(h / 2) * stride + w / 2
+                samples[at] = cast(u16)(maximum + 1)
+                for i: 0..count - 1 { before[i] = samples[i] }
+                if AddResidual(samples[:count], stride, residual[:area], w, h, 0, depth).code != InvalidInput { return 3 }
+                for i: 0..count - 1 { if samples[i] != before[i] { return 4 } }
+                samples[at] = 0
+            }
+        }
+    }
+    return 0
+}
+
+// ReconstructTransformBlock in place against InverseTransform2D then
+// AddResidual on the zero-extended coefficients: every size and depth, with
+// DC-only boxes (DCT_DCT and other types, small and extreme DCs) and random
+// boxes of small and range-filling values under random legal types. Cells
+// outside the box rounded up to multiples of 4 hold garbage it must ignore.
+BoxReconstruction :: () -> s32 {
+    sizes: [38]s32 = .[4,4, 4,8, 8,4, 8,8, 8,16, 16,8, 16,16, 16,32, 32,16, 32,32, 32,64, 64,32, 64,64,
+        4,16, 16,4, 8,32, 32,8, 16,64, 64,16]
+    full: [4096]s32; boxed: [4096]s32; residual: [4096]s32; scratch: TransformScratch
+    samples: [4285]u16; expected: [4285]u16
+    seed: u32 = 2166136261
+    for n: 0..18 {
+        w := sizes[2 * n]; h := sizes[2 * n + 1]; stride := w + 3
+        area := cast(s64)w * h; count := cast(s64)(h - 1) * stride + w
+        cw := ifx w < 32 then w else 32; ch := ifx h < 32 then h else 32
+        for d: 0..2 {
+            depth := 8 + 2 * cast(s32)d; maximum := (cast(s64)1 << cast(u32)depth) - 1
+            limit := cast(s64)1 << cast(u32)(depth + 7)
+            for trial: 0..5 {
+                tx_type: s32 = 0
+                if trial >= 2 {
+                    for k: 0..63 {
+                        seed = seed * 1664525 + 1013904223
+                        candidate := cast(s32)((seed >> 8) % 16)
+                        if ValidateInverseTransform(w, h, candidate, depth).code == DecodeOK { tx_type = candidate; break }
+                    }
+                }
+                rows: s32 = 1; columns: s32 = 1
+                if trial >= 3 {
+                    seed = seed * 1664525 + 1013904223
+                    rows = 1 + cast(s32)((seed >> 8) % cast(u32)ch)
+                    seed = seed * 1664525 + 1013904223
+                    columns = 1 + cast(s32)((seed >> 8) % cast(u32)cw)
+                }
+                if trial == 5 { rows = ch; columns = cw }
+                range := ifx trial == 3 then cast(s64)96 else limit - 1
+                fill_rows := cast(s64)(rows + 3) & -4; fill_columns := cast(s64)(columns + 3) & -4
+                for i: 0..cast(s64)h - 1 { for j: 0..cast(s64)w - 1 {
+                    at := i * w + j
+                    seed = seed * 1664525 + 1013904223
+                    value := cast(s64)(seed >> 4) % (2 * range + 1) - range
+                    if (seed & 7) == 0 { value = ifx (seed & 8) != 0 then limit - 1 else -limit }
+                    inside := i < cast(s64)rows && j < cast(s64)columns
+                    full[at] = ifx inside then cast(s32)value else 0
+                    boxed[at] = ifx i < fill_rows && j < fill_columns then full[at] else cast(s32)(seed >> 1)
+                } }
+                if trial == 0 { full[0] = 37; boxed[0] = 37 }
+                if trial == 1 && (seed & 16) != 0 { full[0] = cast(s32)(limit - 1); boxed[0] = full[0] }
+                for i: 0..count - 1 {
+                    seed = seed * 1664525 + 1013904223
+                    samples[i] = ifx i % stride < w then cast(u16)(cast(s64)(seed >> 8) % (maximum + 1)) else 65535
+                    expected[i] = samples[i]
+                }
+                if InverseTransform2D(full[:area], residual[:area], w, h, tx_type, depth).code != DecodeOK { return 1 }
+                if AddResidual(expected[:count], stride, residual[:area], w, h, tx_type, depth).code != DecodeOK { return 2 }
+                if ReconstructTransformBlock(samples[:count], stride, boxed[:area], boxed[:area], w, h, tx_type, depth,
+                    rows, columns, *scratch).code != DecodeOK {
+                    return 3
+                }
+                for i: 0..count - 1 { if samples[i] != expected[i] { return 4 } }
+            }
+        }
+    }
+    // An empty box adds nothing; a bad box or coefficient writes nothing.
+    for i: 0..63 { samples[i] = 100; boxed[i] = 0 }
+    if ReconstructTransformBlock(samples[:64], 8, boxed[:64], boxed[:64], 8, 8, 0, 8, 0, 0, *scratch).code != DecodeOK ||
+        samples[0] != 100 {
+        return 5
+    }
+    boxed[0] = 1000
+    if ReconstructTransformBlock(samples[:64], 8, boxed[:64], boxed[:64], 8, 8, 0, 8, 9, 1, *scratch).code != InvalidInput {
+        return 6
+    }
+    boxed[9] = 32768
+    if ReconstructTransformBlock(samples[:64], 8, boxed[:64], boxed[:64], 8, 8, 0, 8, 2, 2, *scratch).code != InvalidInput {
+        return 7
+    }
+    for i: 0..63 { if samples[i] != 100 { return 8 } }
+    token: Cancellation; Cancel(*token)
+    if ReconstructTransformBlock(samples[:64], 8, boxed[:64], boxed[:64], 8, 8, 0, 8, 1, 1, *scratch,
+        *token).code != DecodeCancelled {
+        return 9
+    }
     return 0
 }
