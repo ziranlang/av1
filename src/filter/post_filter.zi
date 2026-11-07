@@ -166,13 +166,12 @@ ApplyIntraLoopFilter :: (frame: *IntraFrame, samples: []u16, header: *StillFrame
     return Error(DecodeOK)
 }
 
-// Whole-frame CDEF (7.15): destination receives a copy of source, then each
-// non-skip 8x8 block with a coded cdef_idx is filtered from source.
+// Whole-frame CDEF (7.15): destination holds a copy of source, and each
+// non-skip 8x8 block with a coded cdef_idx is filtered from source into it.
 ApplyIntraCdef :: (frame: *IntraFrame, source: []u16, destination: []u16, header: *StillFrameHeader,
     cancellation: *Cancellation = null) -> DecodeError {
     if frame == null || header == null || source.count != frame.sample_count ||
         destination.count != frame.sample_count { return Error(InvalidInput) }
-    for i: 0..frame.sample_count - 1 { destination[i] = source[i] }
     uv_directions: [32]s32 = .[0,1,2,3,4,5,6,7, 1,2,2,2,3,4,6,0, 7,0,2,4,5,6,6,6, 0,1,2,3,4,5,6,7]
     shift := frame.bit_depth - 8
     stride0 := cast(s64)frame.plane_stride[0]
@@ -219,8 +218,9 @@ ApplyIntraCdef :: (frame: *IntraFrame, source: []u16, destination: []u16, header
     return Error(DecodeOK)
 }
 
-// Whole-frame loop restoration (7.17) into output. cdef is the CDEF frame,
-// or an empty view when CDEF was the identity. Blocks are at most 8x8 and
+// Whole-frame loop restoration (7.17) into output, which holds a copy of the
+// CDEF frame. cdef is that frame, or an empty view when CDEF was the identity
+// and output holds the deblocked frame. Blocks are at most 8x8 and
 // never cross a restoration unit or a 64-luma-row stripe.
 ApplyIntraRestoration :: (frame: *IntraFrame, deblocked: []u16, cdef: []u16, output: []u16,
     header: *StillFrameHeader, cancellation: *Cancellation = null) -> DecodeError {
@@ -228,7 +228,6 @@ ApplyIntraRestoration :: (frame: *IntraFrame, deblocked: []u16, cdef: []u16, out
         (cdef.count != 0 && cdef.count != frame.sample_count) || output.count != frame.sample_count {
         return Error(InvalidInput)
     }
-    for i: 0..frame.sample_count - 1 { output[i] = ifx cdef.count == 0 then deblocked[i] else cdef[i] }
     for plane_index: 0..frame.planes - 1 {
         plane := cast(s32)plane_index
         if frame.restoration_type[plane] == 0 { continue }
@@ -301,9 +300,3 @@ ApplyIntraRestoration :: (frame: *IntraFrame, deblocked: []u16, cdef: []u16, out
     return Error(DecodeOK)
 }
 
-// Copies a post-filter result back into the decoded frame buffer.
-CopyIntraSamples :: (source: []u16, destination: []u16) -> DecodeError {
-    if source.count != destination.count { return Error(InvalidInput) }
-    for i: 0..source.count - 1 { destination[i] = source[i] }
-    return Error(DecodeOK)
-}

@@ -22,3 +22,4 @@
 - CDEF block copies on SIMD vectors.
 - Self-guided restoration on SIMD vectors.
 - Faster coefficient signs, dequantization, intra edges and range decoding.
+- Faster post filters, output rows and recursive intra prediction.

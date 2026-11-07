@@ -161,6 +161,9 @@ CdefPadded :: struct { samples: [256]u16; }
 CdefFilterPadded :: (block: *CdefPadded, width: s32, height: s32,
     primary_strength: s32, secondary_strength: s32, damping: s32, direction: s32, bit_depth: s32,
     output: []u16, output_stride: s32) #target {
+    // Both callers check the direction; checking it here bounds each
+    // directions read.
+    if direction < 0 || direction > 7 { return }
     scale := cast(s32)(cast(u32)1 << cast(u32)(bit_depth - 8))
     directions: [32]s32 = .[-1,1,-2,2,0,1,-1,2,0,1,0,2,0,1,1,2,1,1,2,2,1,0,2,1,1,0,2,0,1,0,2,-1]
     primary_taps: [4]s32 = .[4,2,3,3]

@@ -932,6 +932,12 @@ And in scalar code:
 - `entropy/range.zi`: renormalization shifts a 64-bit window and loads input
   a byte at a time, and coefficient skip, end-of-block and DC sign symbols
   read their CDF rows directly.
+- `decoder.zi`: CDEF and loop restoration each write into a copy of their
+  input that then takes the frame's place, instead of a zeroed frame copied
+  back, and output rows are stored with proven indices.
+- `predict/intra_predict.zi` and `filter/cdef.zi`: recursive intra
+  prediction and the CDEF direction table check their block once on entry,
+  so their reads need no bounds checks.
 
 It now takes 6 to 134 ms per frame, the medians of the fastest of three
 benchmark runs on a busy machine: 0.9 to 3.3 times libaom and 1.7 to 6.1 times

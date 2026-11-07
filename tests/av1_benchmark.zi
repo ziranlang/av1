@@ -5,15 +5,10 @@
 HashPlane :: (plane: *Plane, value: u64) -> u64 {
     hash := value
     row_bytes := cast(s64)plane.width * cast(s64)plane.sample_bytes
-    y: s64 = 0
-    while y < cast(s64)plane.height {
+    storage := VecSlice(plane.storage, 0, plane.storage.count)
+    for y: 0..cast(s64)plane.height - 1 {
         at := y * plane.stride
-        x: s64 = 0
-        while x < row_bytes {
-            hash = (hash ^ cast(u64)plane.storage[at + x]) * 1099511628211
-            x += 1
-        }
-        y += 1
+        for byte: storage[at:at + row_bytes] { hash = (hash ^ cast(u64)byte) * 1099511628211 }
     }
     return hash
 }

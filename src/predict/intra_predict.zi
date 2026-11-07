@@ -331,8 +331,13 @@ PredictPaethIntra :: (out: []u16, stride: s32, edges: *IntraEdges) {
 }
 
 // AV1 7.11.2.3; each 4x2 group reads already predicted output samples.
+// PredictIntra checked the block; the guard repeats what bounds each index.
 PredictRecursiveIntra :: (out: []u16, stride: s32, edges: *IntraEdges, filter_mode: s32, maximum: s32) {
     groups_x := edges.width >> 2; groups_y := edges.height >> 1
+    if groups_x < 1 || groups_x > 8 || groups_y < 1 || groups_y > 16 || filter_mode < 0 || filter_mode > 4 ||
+        stride < 4 * groups_x || cast(s64)(2 * groups_y - 1) * stride + 4 * groups_x > out.count {
+        return
+    }
     neighbors: [7]s32
     for i2: 0..cast(s64)groups_y - 1 {
         for j4: 0..cast(s64)groups_x - 1 {
@@ -345,13 +350,16 @@ PredictRecursiveIntra :: (out: []u16, stride: s32, edges: *IntraEdges, filter_mo
                 if j4 == 0 { neighbors[i] = edges.left[IntraEdgeOffset + (i2 << 1) + i - 5] }
                 else { neighbors[i] = cast(s32)out[((i2 << 1) + i - 5) * stride + (j4 << 2) - 1] }
             }
-            for k: 0..7 {
-                sum: s32
-                for i: 0..6 { sum += cast(s32)IntraFilterTaps[(filter_mode * 8 + k) * 7 + i] * neighbors[i] }
-                value := ifx sum >= 0 then (sum + 8) >> 4 else -((-sum + 8) >> 4)
-                if value < 0 { value = 0 }
-                if value > maximum { value = maximum }
-                out[((i2 << 1) + (k >> 2)) * stride + (j4 << 2) + (k & 3)] = cast(u16)value
+            for r: 0..1 {
+                for c: 0..3 {
+                    taps := (filter_mode * 8 + r * 4 + c) * 7
+                    sum: s32
+                    for i: 0..6 { sum += cast(s32)IntraFilterTaps[taps + i] * neighbors[i] }
+                    value := ifx sum >= 0 then (sum + 8) >> 4 else -((-sum + 8) >> 4)
+                    if value < 0 { value = 0 }
+                    if value > maximum { value = maximum }
+                    out[((i2 << 1) + r) * stride + (j4 << 2) + c] = cast(u16)value
+                }
             }
         }
     }

@@ -59,6 +59,24 @@ ApplyIntraFrameGrain :: (samples: []u16, scratch: []s16, intra: *IntraFrame, seq
     return ApplyFilmGrain(planes, frame.grain_parameters, scratch, cancellation)
 }
 
+// Stores one row of at most 65536 samples, as wide as a frame, as bytes:
+// the low byte first when a sample takes two.
+StoreSampleRow :: (source: []u16, destination: []u8) -> DecodeError {
+    if source.count > 65536 { return Error(InvalidInput) }
+    if destination.count == source.count {
+        for j: 0..source.count - 1 { destination[j] = cast(u8)(source[j] & 255) }
+    } else if destination.count == source.count * 2 {
+        for j: 0..source.count - 1 {
+            value := source[j]
+            destination[2 * j] = cast(u8)(value & 255)
+            destination[2 * j + 1] = cast(u8)(value >> 8)
+        }
+    } else {
+        return Error(InvalidInput)
+    }
+    return Error(DecodeOK)
+}
+
 DecodeAv1YUV :: (input: BorrowedBytes, options: *DecodeOptions) -> Av1YUVResult {
     error := ValidateOptions(options)
     if error.code != DecodeOK { return Av1Failure(error) }
@@ -81,9 +99,6 @@ DecodeAv1YUV :: (input: BorrowedBytes, options: *DecodeOptions) -> Av1YUVResult 
     // Owned planes and mode records drop on every return path.
     intra: IntraFrame
     samples: Vec(u16)
-    // Post-filter frames, allocated only when the filter is not the identity.
-    cdef_samples: Vec(u16)
-    restored: Vec(u16)
     // Film-grain noise stripes, allocated only when grain applies.
     grain_scratch: Vec(s16)
     empty: []u16
@@ -177,27 +192,31 @@ DecodeAv1YUV :: (input: BorrowedBytes, options: *DecodeOptions) -> Av1YUVResult 
         pending = false
         error = ApplyIntraLoopFilter(*intra, VecSlice(samples, 0, samples.count), *frame, options.cancellation)
         if error.code != DecodeOK { return Av1Failure(error) }
+        // Each post filter writes into a copy of its input, which then takes
+        // the place of samples; the deblocked frame stays for restoration.
+        deblocked: Vec(u16)
         if intra.cdef_enabled {
-            if !VecResizeBounded(cdef_samples, intra.sample_count, intra.sample_count) { return Av1Failure(Error(AllocationFailed)) }
+            filtered: Vec(u16)
+            if !VecClone(filtered, samples) { return Av1Failure(Error(AllocationFailed)) }
             error = ApplyIntraCdef(*intra, VecSlice(samples, 0, samples.count),
-                VecSlice(cdef_samples, 0, cdef_samples.count), *frame, options.cancellation)
+                VecSlice(filtered, 0, filtered.count), *frame, options.cancellation)
             if error.code != DecodeOK { return Av1Failure(error) }
+            VecSwap(samples, filtered)
+            VecSwap(deblocked, filtered)
         }
         if intra.restoration_enabled {
-            if !VecResizeBounded(restored, intra.sample_count, intra.sample_count) { return Av1Failure(Error(AllocationFailed)) }
+            restored: Vec(u16)
+            if !VecClone(restored, samples) { return Av1Failure(Error(AllocationFailed)) }
             if intra.cdef_enabled {
-                error = ApplyIntraRestoration(*intra, VecSlice(samples, 0, samples.count),
-                    VecSlice(cdef_samples, 0, cdef_samples.count), VecSlice(restored, 0, restored.count), *frame, options.cancellation)
+                error = ApplyIntraRestoration(*intra, VecSlice(deblocked, 0, deblocked.count),
+                    VecSlice(samples, 0, samples.count), VecSlice(restored, 0, restored.count), *frame, options.cancellation)
             } else {
                 error = ApplyIntraRestoration(*intra, VecSlice(samples, 0, samples.count), empty,
                     VecSlice(restored, 0, restored.count), *frame, options.cancellation)
             }
             if error.code != DecodeOK { return Av1Failure(error) }
-            error = CopyIntraSamples(VecSlice(restored, 0, restored.count), VecSlice(samples, 0, samples.count))
-        } else if intra.cdef_enabled {
-            error = CopyIntraSamples(VecSlice(cdef_samples, 0, cdef_samples.count), VecSlice(samples, 0, samples.count))
+            VecSwap(samples, restored)
         }
-        if error.code != DecodeOK { return Av1Failure(error) }
         if frame.grain_parameters.apply_grain {
             grain_count := GrainScratchCount(frame.width)
             if !VecResizeBounded(grain_scratch, grain_count, grain_count) { return Av1Failure(Error(AllocationFailed)) }
@@ -230,15 +249,14 @@ DecodeAv1YUV :: (input: BorrowedBytes, options: *DecodeOptions) -> Av1YUVResult 
         plane.width = width; plane.height = height; plane.stride = width * sample_bytes; plane.sample_bytes = sample_bytes
         plane_bytes := cast(s64)width * height * sample_bytes
         if !VecResizeBounded(plane.storage, plane_bytes, plane_bytes) { return Av1Failure(Error(AllocationFailed)) }
+        storage := VecSlice(plane.storage, 0, plane.storage.count)
+        line := cast(s64)plane.stride
         for row: 0..height - 1 {
-        error = CancellationError(options.cancellation)
-        if error.code != DecodeOK { return Av1Failure(error) }
-        for column: 0..width - 1 {
-            value := samples[offset + row * source_stride + column]
-            at := row * plane.stride + column * sample_bytes
-            plane.storage[at] = cast(u8)(value & 255)
-            if sample_bytes == 2 { plane.storage[at + 1] = cast(u8)(value >> 8) }
-        }
+            error = CancellationError(options.cancellation)
+            if error.code != DecodeOK { return Av1Failure(error) }
+            start := offset + row * source_stride
+            error = StoreSampleRow(VecSlice(samples, start, start + width), storage[row * line:row * line + line])
+            if error.code != DecodeOK { return Av1Failure(error) }
         }
     }
     result.is_ok = true
