@@ -724,10 +724,15 @@ arrays. Tile edge scheduling remains outside this component's coverage.
 
 ## Lossy inverse transforms
 
-`transform/inverse_transform.zi` is the scalar AV1 7.13 reference for all nineteen lossy
+`transform/inverse_transform.zi` implements AV1 7.13 for all nineteen lossy
 transform sizes: DCT 4–64, ADST 4–16 and identity 4–32 in both directions,
 including the rectangular 1/sqrt2 scaling, `Transform_Row_Shift`, the row/column
-clamp ranges and the specification's Hadamard clamps. Intermediates are s64.
+clamp ranges and the specification's Hadamard clamps. The scalar reference
+lane uses s64 intermediates. Each pass runs four rows or columns at once on
+`std/simd` `s32x4` vectors in a `#target` procedure, so native x86-64 C picks
+SSE2 to AVX2 at run time. A vector pass stays exact while every value is within
+2^17 (ADST4 inputs within 2^16). A pass that exceeds that bound, and every
+12-bit row pass, runs on the s64 lane instead, so the results are identical.
 
 `InverseTransform2D(dequant,residual,width,height,tx_type,bit_depth,token)`
 reads the row-major `width x height` Dequant array produced by `DequantizeBlock`
@@ -878,16 +883,18 @@ Then, on newer Ziran range proofs and the `#cold` modifier:
 - `filter/sgr.zi`: short guards restate the caller's bounds, so the box sums
   and the projection read and write without bounds checks.
 
-Then, on Ziran's `std/simd` vectors:
+Then, on Ziran's `std/simd` vectors, with SSE2 to AVX2 chosen at run time:
 
 - `filter/cdef.zi`: the filter runs each pass of eight samples as one
-  `s16x8` vector, with SSE2 to AVX2 chosen at run time.
+  `s16x8` vector.
+- `transform/inverse_transform.zi`: each transform pass runs four rows or
+  columns as `s32x4` vectors and skips all-zero groups.
 
-It now takes 9 to 176 ms per frame, the medians of one benchmark run: 2 to 5
-times libaom and 4 to 9 times dav1d. Entropy decoding is the largest remaining cost. The
+It now takes 8 to 169 ms per frame, the medians of one benchmark run: 2 to 4
+times libaom and 3 to 9 times dav1d. Entropy decoding is the largest remaining cost. The
 generated C still bounds-checks indices it cannot prove, such as row times
-stride, and calls the symbol decoder out of line. CDEF filtering is the only
-hand-written SIMD path; no thread, other machine, cold start or energy figure
+stride, and calls the symbol decoder out of line. CDEF filtering and the inverse
+transforms are the only hand-written SIMD paths; no thread, other machine, cold start or energy figure
 has been measured.
 
 ## Specification and provenance

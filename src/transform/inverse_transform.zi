@@ -1,8 +1,10 @@
 using Codec :: #import "image_codec/api"
+Simd :: #import "std/simd"
 
-// AV1 7.13.2/7.13.3 scalar inverse transforms for all nineteen lossy transform
-// sizes. This is the semantic reference: s64 intermediates, the specification's
-// Hadamard clamps and Round2 rounding, row-major Dequant/Residual arrays.
+// AV1 7.13.2/7.13.3 inverse transforms for all nineteen lossy transform sizes:
+// s64 lanes that are the semantic reference (the specification's Hadamard
+// clamps and Round2 rounding, row-major Dequant/Residual arrays), and s32x4
+// lanes that run four rows or columns at once with the same results.
 // Lossless blocks use InverseLossless4x4 in lossless.zi instead.
 
 TransformKindDCT :: 0
@@ -224,6 +226,293 @@ Inverse1D :: (t: *TransformLane, kind: s32, n: s64, r: u32) {
     } else { InverseIdentity(t, n) }
 }
 
+// Four rows or columns of a transform, one per lane of each value. A pass is
+// exact while every input and butterfly output stays within 2^17 (inputs of
+// ADST4 within 2^16): their products by at most 4096 then sum below 2^31, and
+// Hadamard clamps to at most 18 bits. peak records the largest magnitude; a
+// pass that exceeds the bound is redone on the s64 lane, so nonconforming
+// input still gets the reference result.
+VectorLane :: struct { values: [64]s32x4; peak: s32x4; }
+Quad :: struct { v: [4]s32x4; }
+
+VCos :: (angle: s64) -> s32 #inline { return Cos128Signed[angle & 255] }
+
+VButterfly :: (t: *VectorLane, a: s64, b: s64, angle: s64, flip: bool) #inline {
+    c := Simd.Splat(s32x4, VCos(angle)); s := Simd.Splat(s32x4, VCos(angle - 64))
+    p := t.values[a & 63]; q := t.values[b & 63]
+    round := Simd.Splat(s32x4, 2048)
+    x := Simd.ShiftRight(Simd.Add(Simd.Sub(Simd.Mul(p, c), Simd.Mul(q, s)), round), 12)
+    y := Simd.ShiftRight(Simd.Add(Simd.Add(Simd.Mul(p, s), Simd.Mul(q, c)), round), 12)
+    t.peak = Simd.Max(t.peak, Simd.Max(Simd.Abs(x), Simd.Abs(y)))
+    if flip { t.values[a & 63] = y; t.values[b & 63] = x } else { t.values[a & 63] = x; t.values[b & 63] = y }
+}
+
+VHadamard :: (t: *VectorLane, a: s64, b: s64, flip: bool, low: s32x4, high: s32x4) #inline {
+    first := ifx flip then b else a; second := ifx flip then a else b
+    x := t.values[first & 63]; y := t.values[second & 63]
+    t.values[first & 63] = Simd.Min(Simd.Max(Simd.Add(x, y), low), high)
+    t.values[second & 63] = Simd.Min(Simd.Max(Simd.Sub(x, y), low), high)
+}
+
+VInverseDCT :: (t: *VectorLane, n: s64, low: s32x4, high: s32x4) #inline {
+    count := cast(s64)1 << cast(u32)n
+    for i: 0..count - 1 {
+        j := Brev(n, i)
+        if i < j { value := t.values[i & 63]; t.values[i & 63] = t.values[j & 63]; t.values[j & 63] = value }
+    }
+    if n == 6 { for i: 0..15 { VButterfly(t, 32 + i, 63 - i, 63 - 4 * Brev(4, i), false) } }
+    if n >= 5 { for i: 0..7 { VButterfly(t, 16 + i, 31 - i, 6 + (Brev(3, 7 - i) << 3), false) } }
+    if n == 6 { for i: 0..15 { VHadamard(t, 32 + i * 2, 33 + i * 2, (i & 1) == 1, low, high) } }
+    if n >= 4 { for i: 0..3 { VButterfly(t, 8 + i, 15 - i, 12 + (Brev(2, 3 - i) << 4), false) } }
+    if n >= 5 { for i: 0..7 { VHadamard(t, 16 + 2 * i, 17 + 2 * i, (i & 1) == 1, low, high) } }
+    if n == 6 { for i: 0..3 { for j: 0..1 {
+        VButterfly(t, 62 - i * 4 - j, 33 + i * 4 + j, 60 - 16 * Brev(2, i) + 64 * j, true)
+    } } }
+    if n >= 3 { for i: 0..1 { VButterfly(t, 4 + i, 7 - i, 56 - 32 * i, false) } }
+    if n >= 4 { for i: 0..3 { VHadamard(t, 8 + 2 * i, 9 + 2 * i, (i & 1) == 1, low, high) } }
+    if n >= 5 { for i: 0..1 { for j: 0..1 {
+        VButterfly(t, 30 - 4 * i - j, 17 + 4 * i + j, 24 + (j << 6) + ((1 - i) << 5), true)
+    } } }
+    if n == 6 { for i: 0..7 { for j: 0..1 { VHadamard(t, 32 + i * 4 + j, 35 + i * 4 - j, (i & 1) == 1, low, high) } } }
+    for i: 0..1 { VButterfly(t, 2 * i, 2 * i + 1, 32 + 16 * i, i == 0) }
+    if n >= 3 { for i: 0..1 { VHadamard(t, 4 + 2 * i, 5 + 2 * i, i == 1, low, high) } }
+    if n >= 4 { for i: 0..1 { VButterfly(t, 14 - i, 9 + i, 48 + 64 * i, true) } }
+    if n >= 5 { for i: 0..3 { for j: 0..1 { VHadamard(t, 16 + 4 * i + j, 19 + 4 * i - j, (i & 1) == 1, low, high) } } }
+    if n == 6 { for i: 0..1 { for j: 0..3 {
+        VButterfly(t, 61 - i * 8 - j, 34 + i * 8 + j, 56 - i * 32 + (j >> 1) * 64, true)
+    } } }
+    for i: 0..1 { VHadamard(t, i, 3 - i, false, low, high) }
+    if n >= 3 { VButterfly(t, 6, 5, 32, true) }
+    if n >= 4 { for i: 0..1 { for j: 0..1 { VHadamard(t, 8 + 4 * i + j, 11 + 4 * i - j, i == 1, low, high) } } }
+    if n >= 5 { for i: 0..3 { VButterfly(t, 29 - i, 18 + i, 48 + (i >> 1) * 64, true) } }
+    if n == 6 { for i: 0..3 { for j: 0..3 { VHadamard(t, 32 + 8 * i + j, 39 + 8 * i - j, (i & 1) == 1, low, high) } } }
+    if n >= 3 { for i: 0..3 { VHadamard(t, i, 7 - i, false, low, high) } }
+    if n >= 4 { for i: 0..1 { VButterfly(t, 13 - i, 10 + i, 32, true) } }
+    if n >= 5 { for i: 0..1 { for j: 0..3 { VHadamard(t, 16 + i * 8 + j, 23 + i * 8 - j, i == 1, low, high) } } }
+    if n == 6 { for i: 0..7 { VButterfly(t, 59 - i, 36 + i, ifx i < 4 then 48 else 112, true) } }
+    if n >= 4 { for i: 0..7 { VHadamard(t, i, 15 - i, false, low, high) } }
+    if n >= 5 { for i: 0..3 { VButterfly(t, 27 - i, 20 + i, 32, true) } }
+    if n == 6 { for i: 0..7 { VHadamard(t, 32 + i, 47 - i, false, low, high); VHadamard(t, 48 + i, 63 - i, true, low, high) } }
+    if n >= 5 { for i: 0..15 { VHadamard(t, i, 31 - i, false, low, high) } }
+    if n == 6 { for i: 0..7 { VButterfly(t, 55 - i, 40 + i, 32, true) } }
+    if n == 6 { for i: 0..31 { VHadamard(t, i, 63 - i, false, low, high) } }
+}
+
+VRound12 :: (v: s32x4) -> s32x4 #inline { return Simd.ShiftRight(Simd.Add(v, Simd.Splat(s32x4, 2048)), 12) }
+
+VInverseADST4 :: (t: *VectorLane) #inline {
+    x0 := t.values[0]; x1 := t.values[1]; x2 := t.values[2]; xx3 := t.values[3]
+    s0 := Simd.Mul(Simd.Splat(s32x4, 1321), x0); s1 := Simd.Mul(Simd.Splat(s32x4, 2482), x0)
+    s2 := Simd.Mul(Simd.Splat(s32x4, 3344), x1); s3 := Simd.Mul(Simd.Splat(s32x4, 3803), x2)
+    s4 := Simd.Mul(Simd.Splat(s32x4, 1321), x2); s5 := Simd.Mul(Simd.Splat(s32x4, 2482), xx3)
+    s6 := Simd.Mul(Simd.Splat(s32x4, 3803), xx3)
+    b7 := Simd.Add(Simd.Sub(x0, x2), xx3)
+    s0 = Simd.Add(s0, s3); s1 = Simd.Sub(s1, s4); s3 = s2; s2 = Simd.Mul(Simd.Splat(s32x4, 3344), b7)
+    s0 = Simd.Add(s0, s5); s1 = Simd.Sub(s1, s6)
+    x3 := Simd.Sub(Simd.Add(s0, s1), s3)
+    t.values[0] = VRound12(Simd.Add(s0, s3)); t.values[1] = VRound12(Simd.Add(s1, s3))
+    t.values[2] = VRound12(s2); t.values[3] = VRound12(x3)
+}
+
+VADSTInputPermutation :: (t: *VectorLane, n: s64) #inline {
+    count := cast(s64)1 << cast(u32)n
+    copy: [16]s32x4
+    for i: 0..count - 1 { copy[i & 15] = t.values[i & 63] }
+    for i: 0..count - 1 { t.values[i & 63] = copy[(ifx (i & 1) == 1 then i - 1 else count - i - 1) & 15] }
+}
+
+VADSTOutputPermutation :: (t: *VectorLane, n: s64) #inline {
+    count := cast(s64)1 << cast(u32)n
+    copy: [16]s32x4
+    for i: 0..count - 1 { copy[i & 15] = t.values[i & 63] }
+    for i: 0..count - 1 {
+        a := (i >> 3) & 1; b := ((i >> 2) & 1) ^ ((i >> 3) & 1)
+        c := ((i >> 1) & 1) ^ ((i >> 2) & 1); d := (i & 1) ^ ((i >> 1) & 1)
+        index := (((d << 3) | (c << 2) | (b << 1) | a) >> cast(u32)(4 - n)) & 15
+        t.values[i & 63] = ifx (i & 1) == 1 then Simd.Neg(copy[index]) else copy[index]
+    }
+}
+
+VInverseADST8 :: (t: *VectorLane, low: s32x4, high: s32x4) #inline {
+    VADSTInputPermutation(t, 3)
+    for i: 0..3 { VButterfly(t, 2 * i, 2 * i + 1, 60 - 16 * i, true) }
+    for i: 0..3 { VHadamard(t, i, 4 + i, false, low, high) }
+    for i: 0..1 { VButterfly(t, 4 + 3 * i, 5 + i, 48 - 32 * i, true) }
+    for i: 0..1 { for j: 0..1 { VHadamard(t, 4 * j + i, 2 + 4 * j + i, false, low, high) } }
+    for i: 0..1 { VButterfly(t, 2 + 4 * i, 3 + 4 * i, 32, true) }
+    VADSTOutputPermutation(t, 3)
+}
+
+VInverseADST16 :: (t: *VectorLane, low: s32x4, high: s32x4) #inline {
+    VADSTInputPermutation(t, 4)
+    for i: 0..7 { VButterfly(t, 2 * i, 2 * i + 1, 62 - 8 * i, true) }
+    for i: 0..7 { VHadamard(t, i, 8 + i, false, low, high) }
+    for i: 0..1 {
+        VButterfly(t, 8 + 2 * i, 9 + 2 * i, 56 - 32 * i, true)
+        VButterfly(t, 13 + 2 * i, 12 + 2 * i, 8 + 32 * i, true)
+    }
+    for i: 0..3 { for j: 0..1 { VHadamard(t, 8 * j + i, 4 + 8 * j + i, false, low, high) } }
+    for i: 0..1 { for j: 0..1 { VButterfly(t, 4 + 8 * j + 3 * i, 5 + 8 * j + i, 48 - 32 * i, true) } }
+    for i: 0..1 { for j: 0..3 { VHadamard(t, 4 * j + i, 2 + 4 * j + i, false, low, high) } }
+    for i: 0..3 { VButterfly(t, 2 + 4 * i, 3 + 4 * i, 32, true) }
+    VADSTOutputPermutation(t, 4)
+}
+
+VInverseIdentity :: (t: *VectorLane, n: s64) #inline {
+    count := cast(s64)1 << cast(u32)n
+    for i: 0..count - 1 {
+        v := t.values[i & 63]
+        if n == 2 { v = VRound12(Simd.Mul(v, Simd.Splat(s32x4, 5793))) }
+        else if n == 3 { v = Simd.Add(v, v) }
+        else if n == 4 { v = VRound12(Simd.Mul(v, Simd.Splat(s32x4, 11586))) }
+        else { v = Simd.ShiftLeft(v, 2) }
+        t.values[i & 63] = v
+    }
+}
+
+// Runs one 1D kernel on four lanes; false if the pass left the exact range.
+VInverse1D :: (t: *VectorLane, kind: s32, n: s64, r: u32) -> bool #inline {
+    h := cast(s32)((cast(s64)1 << (r - 1)) - 1)
+    high := Simd.Splat(s32x4, h); low := Simd.Splat(s32x4, -h - 1)
+    limit: s32 = 131072
+    if kind == TransformKindDCT { VInverseDCT(t, n, low, high) }
+    else if kind == TransformKindADST {
+        if n == 2 { limit = 65536; if Simd.ReduceMax(t.peak) > limit { return false }; VInverseADST4(t) }
+        else if n == 3 { VInverseADST8(t, low, high) } else { VInverseADST16(t, low, high) }
+    } else { VInverseIdentity(t, n) }
+    return Simd.ReduceMax(t.peak) <= limit
+}
+
+VTranspose :: (r0: s32x4, r1: s32x4, r2: s32x4, r3: s32x4, out: *Quad) #inline {
+    t0 := Simd.Reinterpret(s64x2, Simd.InterleaveLow(r0, r1)); t1 := Simd.Reinterpret(s64x2, Simd.InterleaveHigh(r0, r1))
+    t2 := Simd.Reinterpret(s64x2, Simd.InterleaveLow(r2, r3)); t3 := Simd.Reinterpret(s64x2, Simd.InterleaveHigh(r2, r3))
+    out.v[0] = Simd.Reinterpret(s32x4, Simd.InterleaveLow(t0, t2)); out.v[1] = Simd.Reinterpret(s32x4, Simd.InterleaveHigh(t0, t2))
+    out.v[2] = Simd.Reinterpret(s32x4, Simd.InterleaveLow(t1, t3)); out.v[3] = Simd.Reinterpret(s32x4, Simd.InterleaveHigh(t1, t3))
+}
+
+// One row of the scalar reference pass, for a group that left the range.
+ScalarRow :: (dequant: []s32, residual: []s32, width: s32, i: s64, row_kind: s32, log2w: s64, rect: bool,
+    row_range: u32, row_shift: u32, column_low: s64, column_high: s64) {
+    lane: TransformLane
+    for j: 0..cast(s64)width - 1 {
+        value := ifx j < 32 then cast(s64)dequant[i * width + j] else 0
+        if rect { value = Round2Signed(value * 2896, 12) }
+        lane.values[j & 63] = value
+    }
+    Inverse1D(*lane, row_kind, log2w, row_range)
+    for j: 0..cast(s64)width - 1 {
+        value := Round2Signed(lane.values[j & 63], row_shift)
+        if value < column_low { value = column_low }; if value > column_high { value = column_high }
+        residual[i * width + j] = cast(s32)value
+    }
+}
+
+ScalarColumn :: (residual: []s32, width: s32, height: s32, j: s64, column_kind: s32, log2h: s64, column_range: u32) {
+    lane: TransformLane
+    for i: 0..cast(s64)height - 1 { lane.values[i & 63] = cast(s64)residual[i * width + j] }
+    Inverse1D(*lane, column_kind, log2h, column_range)
+    for i: 0..cast(s64)height - 1 { residual[i * width + j] = cast(s32)Round2Signed(lane.values[i & 63], 4) }
+}
+
+
+// The row pass of a validated transform: rows below 32, four at a time, as
+// columns of the lane; 12-bit rows (20-bit range) always take the s64 lane.
+InverseRowPass :: (dequant: []s32, residual: []s32, width: s32, height: s32, row_kind: s32, log2w: s64,
+    rect: bool, row_range: u32, row_shift: u32, column_low: s64, column_high: s64, vector: bool) #target {
+    if width < 4 || width > 64 || height < 4 || height > 64 ||
+        dequant.count < cast(s64)height * width || residual.count < cast(s64)height * width {
+        return
+    }
+    vector_high := Simd.Splat(s32x4, cast(s32)column_high); vector_low := Simd.Splat(s32x4, cast(s32)column_low)
+    lane: VectorLane
+    block: Quad
+    zero := Simd.Zero(s32x4)
+    columns := ifx width > 32 then 32 else cast(s64)width
+    for group: 0..15 {
+        i0 := group * 4
+        if i0 >= cast(s64)height { break }
+        if i0 >= 32 {
+            for k: 0..3 { for j: 0..cast(s64)width - 1 { residual[(i0 + k) * width + j] = 0 } }
+            continue
+        }
+        if !vector {
+            for k: 0..3 {
+                ScalarRow(dequant, residual, width, i0 + k, row_kind, log2w, rect, row_range, row_shift, column_low, column_high)
+            }
+            continue
+        }
+        // Load four rows as columns of the lane, four columns at a time.
+        any := zero
+        for j0: 0..7 {
+            j := j0 * 4
+            if j >= columns { break }
+            r0 := Simd.Load(s32x4, dequant, i0 * width + j); r1 := Simd.Load(s32x4, dequant, (i0 + 1) * width + j)
+            r2 := Simd.Load(s32x4, dequant, (i0 + 2) * width + j); r3 := Simd.Load(s32x4, dequant, (i0 + 3) * width + j)
+            any = Simd.Or(any, Simd.Or(Simd.Or(r0, r1), Simd.Or(r2, r3)))
+            VTranspose(r0, r1, r2, r3, *block)
+            for k: 0..3 { lane.values[(j + k) & 63] = block.v[k] }
+        }
+        // Every 1D kernel maps zero input to zero output, so zero rows skip it.
+        if Simd.AllZero(any) {
+            for k: 0..3 { for j: 0..cast(s64)width - 1 { residual[(i0 + k) * width + j] = 0 } }
+            continue
+        }
+        for j: columns..cast(s64)width - 1 { lane.values[j & 63] = zero }
+        peak := zero
+        for j: 0..cast(s64)width - 1 {
+            v := lane.values[j & 63]
+            if rect { v = VRound12(Simd.Mul(v, Simd.Splat(s32x4, 2896))) }
+            lane.values[j & 63] = v
+            peak = Simd.Max(peak, Simd.Abs(v))
+        }
+        lane.peak = peak
+        if !VInverse1D(*lane, row_kind, log2w, row_range) {
+            for k: 0..3 {
+                ScalarRow(dequant, residual, width, i0 + k, row_kind, log2w, rect, row_range, row_shift, column_low, column_high)
+            }
+            continue
+        }
+        for j0: 0..15 {
+            j := j0 * 4
+            if j >= cast(s64)width { break }
+            for k: 0..3 {
+                v := lane.values[(j + k) & 63]
+                if row_shift > 0 { v = Simd.ShiftRightRound(v, row_shift) }
+                block.v[k] = Simd.Min(Simd.Max(v, vector_low), vector_high)
+            }
+            out: Quad
+            VTranspose(block.v[0], block.v[1], block.v[2], block.v[3], *out)
+            for k: 0..3 { Simd.Store(residual, (i0 + k) * width + j, out.v[k]) }
+        }
+    }
+}
+
+// The column pass, four columns per lane, in place in residual.
+InverseColumnPass :: (residual: []s32, width: s32, height: s32, column_kind: s32, log2h: s64, column_range: u32) #target {
+    if width < 4 || width > 64 || height < 4 || height > 64 || residual.count < cast(s64)height * width { return }
+    lane: VectorLane
+    zero := Simd.Zero(s32x4)
+    for group: 0..15 {
+        j := group * 4
+        if j >= cast(s64)width { break }
+        any := zero; peak := zero
+        for i: 0..cast(s64)height - 1 {
+            v := Simd.Load(s32x4, residual, i * width + j)
+            lane.values[i & 63] = v
+            any = Simd.Or(any, v); peak = Simd.Max(peak, Simd.Abs(v))
+        }
+        if Simd.AllZero(any) { continue }
+        lane.peak = peak
+        if !VInverse1D(*lane, column_kind, log2h, column_range) {
+            for k: 0..3 { ScalarColumn(residual, width, height, j + k, column_kind, log2h, column_range) }
+            continue
+        }
+        for i: 0..cast(s64)height - 1 {
+            Simd.Store(residual, i * width + j, Simd.ShiftRightRound(lane.values[i & 63], 4))
+        }
+    }
+}
+
 ClearResidual :: (residual: []s32) { for i: 0..residual.count - 1 { residual[i] = 0 } }
 
 // dequant is the row-major width x height Dequant array; cells outside the
@@ -259,46 +548,11 @@ InverseTransform2D :: (dequant: []s32, residual: []s32, width: s32, height: s32,
     row_range := cast(u32)(bit_depth + 8)
     column_range := cast(u32)(ifx bit_depth + 6 > 16 then bit_depth + 6 else 16)
     column_high := (cast(s64)1 << (column_range - 1)) - 1; column_low := -column_high - 1
-    lane: TransformLane
-    for i: 0..cast(s64)height - 1 {
-        if i >= 32 {
-            for j: 0..cast(s64)width - 1 { residual[i * width + j] = 0 }
-            continue
-        }
-        // Every 1D kernel maps zero input to zero output, so zero rows skip it.
-        nonzero := false
-        for j: 0..cast(s64)width - 1 {
-            if j >= 32 { break }
-            if dequant[i * width + j] != 0 { nonzero = true; break }
-        }
-        if !nonzero {
-            for j: 0..cast(s64)width - 1 { residual[i * width + j] = 0 }
-            continue
-        }
-        for j: 0..cast(s64)width - 1 {
-            value := ifx j < 32 then cast(s64)dequant[i * width + j] else 0
-            if rect { value = Round2Signed(value * 2896, 12) }
-            lane.values[j] = value
-        }
-        Inverse1D(*lane, row_kind, log2w, row_range)
-        for j: 0..cast(s64)width - 1 {
-            value := Round2Signed(lane.values[j], row_shift)
-            if value < column_low { value = column_low }; if value > column_high { value = column_high }
-            residual[i * width + j] = cast(s32)value
-        }
-    }
+    InverseRowPass(dequant, residual, width, height, row_kind, log2w, rect, row_range, row_shift,
+        column_low, column_high, bit_depth <= 10)
     error = CancellationError(cancellation)
     if error.code != DecodeOK { ClearResidual(residual); return error }
-    for j: 0..cast(s64)width - 1 {
-        nonzero := false
-        for i: 0..cast(s64)height - 1 {
-            lane.values[i] = cast(s64)residual[i * width + j]
-            if lane.values[i] != 0 { nonzero = true }
-        }
-        if !nonzero { continue }
-        Inverse1D(*lane, column_kind, log2h, column_range)
-        for i: 0..cast(s64)height - 1 { residual[i * width + j] = cast(s32)Round2Signed(lane.values[i], 4) }
-    }
+    InverseColumnPass(residual, width, height, column_kind, log2h, column_range)
     error = CancellationError(cancellation)
     if error.code != DecodeOK { ClearResidual(residual); return error }
     return Error(DecodeOK)
