@@ -4,8 +4,16 @@
 // convention, unlike libaom/dav1d's inverse CDF representation. Entropy literals
 // must use ReadLiteral, not ReadBits. Virtual padding is bounded by exit_symbol.
 RangeDecoder :: struct {
-    bits: BitReader;
-    value: u32;
+    input: BorrowedBytes;
+    begin: s64;
+    end: s64;
+    // The next input byte for the window; the end once all are loaded.
+    next: s64;
+    // The specification's SymbolValue in bits 63..48, then count more input
+    // bits, complemented. Past the end they are ones, the complemented zero
+    // padding, so a renormalization only shifts and loads whole bytes.
+    window: u64;
+    count: s32;
     range: u32;
     max_bits: s64;
     disable_cdf_update: bool;
@@ -16,19 +24,41 @@ RangeDecoder :: struct {
 
 NewRange :: (input: BorrowedBytes, begin: s64, end: s64, disable_cdf_update: bool = false) -> RangeDecoder {
     decoder: RangeDecoder
-    decoder.bits = NewBits(input, begin, end)
-    decoder.error = decoder.bits.error
-    if decoder.error.code != DecodeOK { return decoder }
+    decoder.input = input; decoder.begin = begin; decoder.end = end; decoder.next = begin
+    if begin < 0 || end < begin || end > input.data.count { decoder.error = Error(InvalidInput, begin); return decoder }
     if end == begin { decoder.error = Error(TruncatedInput, end); return decoder }
     if end - begin > 1152921504606846975 { decoder.error = Error(LimitExceeded, begin); return decoder }
-    available := (end - begin) * 8
-    count := cast(s32)(ifx available < 15 then available else 15)
-    padded := ReadBits(*decoder.bits, count) << cast(u32)(15 - count)
-    decoder.value = 32767 ^ padded; decoder.range = 32768
-    decoder.max_bits = available - 15
+    // The first 15 bits go just below the top bit: SymbolValue starts as
+    // 32767 minus them.
+    decoder.count = -15
+    RangeFill(*decoder)
+    decoder.range = 32768
+    decoder.max_bits = (end - begin) * 8 - 15
     decoder.disable_cdf_update = disable_cdf_update; decoder.initialized = true
     return decoder
 }
+
+// Loads input bytes below the window's bits while another whole byte fits.
+RangeFill :: (decoder: *RangeDecoder) {
+    data := decoder.input.data
+    while decoder.count <= 40 {
+        byte: u64 = 0
+        if decoder.next < decoder.end { byte = cast(u64)data[decoder.next]; decoder.next += 1 }
+        decoder.window |= (byte ^ 255) << cast(u64)(40 - decoder.count)
+        decoder.count += 8
+    }
+}
+
+// Where the specification's bit reader stands, as a bit offset into the
+// input: renormalization has read all but max_bits of the interval.
+RangeBitPosition :: (decoder: *RangeDecoder) -> s64 {
+    if !decoder.initialized { return decoder.begin * 8 }
+    if decoder.finished { return decoder.end * 8 }
+    return decoder.end * 8 - (ifx decoder.max_bits > 0 then decoder.max_bits else 0)
+}
+
+// The byte of RangeBitPosition, for error offsets.
+RangeByte :: (decoder: *RangeDecoder) -> s64 { return RangeBitPosition(decoder) >> 3 }
 
 // Whether cdf has N probabilities followed by the adaptation counter,
 // 2 <= N <= 16: each value lies in [0,32768], is nondecreasing, cdf[N-1] is
@@ -48,9 +78,9 @@ ValidCdf :: (cdf: []u16) -> bool {
 // A symbol from a caller's cdf, which must be valid.
 ReadSymbol :: (decoder: *RangeDecoder, cdf: []u16) -> s32 {
     if decoder.error.code != DecodeOK { return 0 }
-    if cdf.count < 3 || cdf.count > 17 { decoder.error = Error(InvalidInput, decoder.bits.byte); return 0 }
+    if cdf.count < 3 || cdf.count > 17 { decoder.error = Error(InvalidInput, RangeByte(decoder)); return 0 }
     if !RangeReady(decoder) { return 0 }
-    if !ValidCdf(cdf) { decoder.error = Error(InvalidInput, decoder.bits.byte); return 0 }
+    if !ValidCdf(cdf) { decoder.error = Error(InvalidInput, RangeByte(decoder)); return 0 }
     return DecodeSymbol(decoder, cdf)
 }
 
@@ -59,9 +89,10 @@ ReadSymbol :: (decoder: *RangeDecoder, cdf: []u16) -> s32 {
 // state is checked here.
 DecodeSymbol :: (decoder: *RangeDecoder, cdf: []u16) -> s32 {
     if decoder.error.code != DecodeOK { return 0 }
-    if cdf.count < 3 || cdf.count > 17 { decoder.error = Error(InvalidInput, decoder.bits.byte); return 0 }
+    if cdf.count < 3 || cdf.count > 17 { decoder.error = Error(InvalidInput, RangeByte(decoder)); return 0 }
     if !RangeReady(decoder) { return 0 }
     n := cast(s32)cdf.count - 1
+    value := cast(u32)(decoder.window >> 48)
     cur := decoder.range
     prev: u32
     symbol: s32
@@ -70,10 +101,10 @@ DecodeSymbol :: (decoder: *RangeDecoder, cdf: []u16) -> s32 {
         f := 32768 - cast(u32)cdf[symbol]
         cur = ((decoder.range >> 8) * (f >> 6)) >> 1
         cur += cast(u32)(4 * (n - symbol - 1))
-        if decoder.value >= cur { break }
+        if value >= cur { break }
         symbol += 1
     }
-    decoder.range = prev - cur; decoder.value -= cur
+    decoder.range = prev - cur; decoder.window -= cast(u64)cur << 48
     RangeRenormalize(decoder)
     if decoder.error.code != DecodeOK { return 0 }
     if !decoder.disable_cdf_update { AdaptCdf(cdf, n, symbol) }
@@ -99,11 +130,11 @@ AdaptCdf :: (cdf: []u16, n: s32, symbol: s32) {
 
 // Valid state before a symbol; otherwise records the error.
 RangeReady :: (decoder: *RangeDecoder) -> bool {
-    if !decoder.initialized || decoder.finished ||
-        decoder.range < 32768 || decoder.range > 65535 || decoder.value >= decoder.range {
-        decoder.error = Error(InvalidInput, decoder.bits.byte); return false
+    if !decoder.initialized || decoder.finished || decoder.count < 15 || decoder.count > 48 ||
+        decoder.range < 32768 || decoder.range > 65535 || cast(u32)(decoder.window >> 48) >= decoder.range {
+        decoder.error = Error(InvalidInput, RangeByte(decoder)); return false
     }
-    if decoder.max_bits < -14 { decoder.error = Error(TruncatedInput, decoder.bits.end); return false }
+    if decoder.max_bits < -14 { decoder.error = Error(TruncatedInput, decoder.end); return false }
     return true
 }
 
@@ -114,12 +145,12 @@ RangeRenormalize :: (decoder: *RangeDecoder) {
     // No shift reads nothing and leaves the value: the state stays valid.
     if shifts == 0 { return }
     decoder.range <<= cast(u32)shifts
-    count := cast(s32)(ifx decoder.max_bits < shifts then (ifx decoder.max_bits > 0 then decoder.max_bits else 0) else cast(s64)shifts)
-    padded := ReadShortBits(*decoder.bits, count) << cast(u32)(shifts - count)
-    decoder.value = padded ^ (((decoder.value + 1) << cast(u32)shifts) - 1)
+    // A symbol starts with at least 15 bits below the value, and a shift is at
+    // most 15.
+    decoder.window <<= cast(u64)shifts; decoder.count -= shifts
+    if decoder.count < 15 { RangeFill(decoder) }
     decoder.max_bits -= shifts
-    if decoder.bits.error.code != DecodeOK { decoder.error = decoder.bits.error; return }
-    if decoder.max_bits < -14 { decoder.error = Error(TruncatedInput, decoder.bits.end) }
+    if decoder.max_bits < -14 { decoder.error = Error(TruncatedInput, decoder.end) }
 }
 
 // The fixed CDF {16384, 32768}: f is 16384, so the zero symbol's lower bound
@@ -129,7 +160,7 @@ ReadBool :: (decoder: *RangeDecoder) -> u32 {
     if !RangeReady(decoder) { return 0 }
     cur := ((decoder.range >> 8) << 7) + 4
     symbol: u32
-    if decoder.value >= cur { decoder.range -= cur; decoder.value -= cur }
+    if cast(u32)(decoder.window >> 48) >= cur { decoder.range -= cur; decoder.window -= cast(u64)cur << 48 }
     else { decoder.range = cur; symbol = 1 }
     RangeRenormalize(decoder)
     if decoder.error.code != DecodeOK { return 0 }
@@ -138,7 +169,7 @@ ReadBool :: (decoder: *RangeDecoder) -> u32 {
 
 ReadLiteral :: (decoder: *RangeDecoder, count: s32) -> u32 {
     if decoder.error.code != DecodeOK { return 0 }
-    if count < 0 || count > 32 { decoder.error = Error(InvalidInput, decoder.bits.byte); return 0 }
+    if count < 0 || count > 32 { decoder.error = Error(InvalidInput, RangeByte(decoder)); return 0 }
     value: u32
     i: s32
     while i < count && decoder.error.code == DecodeOK { value = (value << 1) | ReadBool(decoder); i += 1 }
@@ -148,20 +179,15 @@ ReadLiteral :: (decoder: *RangeDecoder, count: s32) -> u32 {
 
 FinishRange :: (decoder: *RangeDecoder) -> DecodeError {
     if decoder.error.code != DecodeOK { return decoder.error }
-    if !decoder.initialized || decoder.finished { decoder.error = Error(InvalidInput, decoder.bits.byte); return decoder.error }
-    if decoder.max_bits < -14 { decoder.error = Error(TruncatedInput, decoder.bits.end); return decoder.error }
-    ignored := ReadBits(*decoder.bits, 0)
-    if decoder.bits.error.code != DecodeOK { decoder.error = decoder.bits.error; return decoder.error }
-    if decoder.bits.end - decoder.bits.begin > 1152921504606846975 {
-        decoder.error = Error(LimitExceeded, decoder.bits.begin); return decoder.error
-    }
-    position := (decoder.bits.byte - decoder.bits.begin) * 8 + decoder.bits.bit
+    if !decoder.initialized || decoder.finished { decoder.error = Error(InvalidInput, RangeByte(decoder)); return decoder.error }
+    if decoder.max_bits < -14 { decoder.error = Error(TruncatedInput, decoder.end); return decoder.error }
+    position := RangeBitPosition(decoder) - decoder.begin * 8
     rewind := ifx decoder.max_bits >= 0 then 15 else decoder.max_bits + 15
     trailing := position - rewind
-    if trailing < 0 { decoder.error = Error(MalformedInput, decoder.bits.begin); return decoder.error }
-    tail := NewBits(decoder.bits.input, decoder.bits.begin + trailing / 8, decoder.bits.end)
+    if trailing < 0 { decoder.error = Error(MalformedInput, decoder.begin); return decoder.error }
+    tail := NewBits(decoder.input, decoder.begin + trailing / 8, decoder.end)
     tail.bit = cast(s32)(trailing % 8)
     decoder.error = FinishBits(*tail)
-    if decoder.error.code == DecodeOK { decoder.finished = true; decoder.bits.byte = decoder.bits.end; decoder.bits.bit = 0 }
+    if decoder.error.code == DecodeOK { decoder.finished = true }
     return decoder.error
 }

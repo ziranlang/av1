@@ -61,7 +61,7 @@ ReadIntraSegmentId :: (tile: *IntraTile, block: *IntraBlock) -> DecodeError {
             block.segment_id = IntraNegDeinterleave(symbol, prediction, tile.header.last_active_segment_id + 1)
         }
         if block.segment_id < 0 || block.segment_id > tile.header.last_active_segment_id {
-            return Error(MalformedInput, tile.decoder.bits.byte)
+            return Error(MalformedInput, RangeByte(*tile.decoder))
         }
     }
     block.lossless = tile.header.lossless[block.segment_id]
@@ -239,7 +239,7 @@ ReadIntraModeInfo :: (tile: *IntraTile, block: *IntraBlock) -> DecodeError {
     if tile.sequence.enable_filter_intra && block.y_mode == 0 && tile.palette.count == 0 &&
         IntraMax(block.width, block.height) <= 32 {
         index := FilterIntraBlockIndex(block.width, block.height)
-        if index < 0 { return Error(MalformedInput, tile.decoder.bits.byte) }
+        if index < 0 { return Error(MalformedInput, RangeByte(*tile.decoder)) }
         enabled := ReadSymbol(*tile.decoder, tile.cdfs.filter.enabled[index * 3:index * 3 + 3])
         if enabled != 0 { block.filter_mode = ReadSymbol(*tile.decoder, tile.cdfs.filter.mode[:]) }
         if tile.decoder.error.code != DecodeOK { return tile.decoder.error }

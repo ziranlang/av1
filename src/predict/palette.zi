@@ -99,7 +99,7 @@ PaletteCeilLog2 :: (value: s32) -> s32 {
 }
 ReadPaletteUniform :: (decoder: *RangeDecoder, count: s32) -> s32 {
     if count < 2 || count > 8 {
-        if decoder.error.code == DecodeOK { decoder.error = Error(InvalidInput, decoder.bits.byte) }
+        if decoder.error.code == DecodeOK { decoder.error = Error(InvalidInput, RangeByte(decoder)) }
         return 0
     }
     width := PaletteCeilLog2(count)
@@ -119,10 +119,10 @@ ReadPaletteColors :: (decoder: *RangeDecoder, size_cdf: []u16, size_context: s32
     error := CancellationError(cancellation)
     if error.code != DecodeOK { return error }
     if size_cdf.count != 56 || size_context < 0 || size_context > 6 || cache.count < 0 || cache.count > 16 ||
-        (bit_depth != 8 && bit_depth != 10 && bit_depth != 12) { return Error(InvalidInput, decoder.bits.byte) }
+        (bit_depth != 8 && bit_depth != 10 && bit_depth != 12) { return Error(InvalidInput, RangeByte(decoder)) }
     maximum := cast(s32)((cast(u32)1 << cast(u32)bit_depth) - 1)
     for i: 0..cache.count - 1 {
-        if cache[i] > maximum || (i > 0 && cache[i] <= cache[i - 1]) { return Error(InvalidInput, decoder.bits.byte) }
+        if cache[i] > maximum || (i > 0 && cache[i] <= cache[i - 1]) { return Error(InvalidInput, RangeByte(decoder)) }
     }
     at := size_context * 8
     count := ReadSymbol(decoder, size_cdf[at:at + 8]) + 2
@@ -186,12 +186,12 @@ ReadPaletteMap :: (decoder: *RangeDecoder, color_cdf: []u16, width: s32, height:
     error := CancellationError(cancellation)
     if error.code != DecodeOK { return error }
     if color_cdf.count != 315 || count < 2 || count > 8 || width < 4 || width > 64 || height < 4 || height > 64 ||
-        onscreen_width < 1 || onscreen_width > width || onscreen_height < 1 || onscreen_height > height { return Error(InvalidInput, decoder.bits.byte) }
+        onscreen_width < 1 || onscreen_width > width || onscreen_height < 1 || onscreen_height > height { return Error(InvalidInput, RangeByte(decoder)) }
     // Adaptation keeps a valid CDF valid, so the five this size reads are
     // checked once.
     for context: 0..4 {
         at := (count - 2) * 45 + cast(s32)context * 9
-        if !ValidCdf(color_cdf[at:at + count + 1]) { return Error(InvalidInput, decoder.bits.byte) }
+        if !ValidCdf(color_cdf[at:at + count + 1]) { return Error(InvalidInput, RangeByte(decoder)) }
     }
     output.indices[0] = cast(u8)ReadPaletteUniform(decoder, count)
     if decoder.error.code != DecodeOK { return decoder.error }

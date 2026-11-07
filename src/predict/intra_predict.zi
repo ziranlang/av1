@@ -89,7 +89,8 @@ IntraFilterTaps :: s8.[
 // Builds AboveRow/LeftCol (AV1 7.11.2.1) from a reconstructed plane. x/y are
 // the transform block origin; max_x/max_y are the last decoded plane sample,
 // ((MiCols * MI_SIZE) >> subsampling_x) - 1 and likewise for rows. Every read
-// is bounds-checked; edges is only written on success.
+// is bounds-checked. The samples go straight into edges; on failure its sizes
+// are zero, so it holds no block's edges.
 BuildIntraEdges :: (edges: *IntraEdges, plane: []u16, stride: s32, x: s32, y: s32,
     width: s32, height: s32, max_x: s32, max_y: s32, have_above: bool, have_left: bool,
     have_above_right: bool, have_below_left: bool, bit_depth: s32) -> DecodeError {
@@ -97,11 +98,14 @@ BuildIntraEdges :: (edges: *IntraEdges, plane: []u16, stride: s32, x: s32, y: s3
         stride < 1 || max_x < 0 || max_y < 0 || max_x >= stride || x < 0 || x > max_x || y < 0 || y > max_y ||
         (have_above && y == 0) || (have_left && x == 0) ||
         cast(s64)max_y * stride + max_x >= plane.count {
+        if edges != null { edges.width = 0; edges.height = 0 }
         return Error(InvalidInput)
     }
     maximum := cast(s32)((cast(u32)1 << cast(u32)bit_depth) - 1)
     midpoint := cast(s32)(cast(u32)1 << cast(u32)(bit_depth - 1))
-    above: [136]s32; left: [136]s32
+    above := edges.above[:]; left := edges.left[:]
+    // The largest sample read from the plane, checked once against the depth.
+    largest: s32
     total := width + height
     row := cast(s64)y * stride
     if have_above {
@@ -109,10 +113,12 @@ BuildIntraEdges :: (edges: *IntraEdges, plane: []u16, stride: s32, x: s32, y: s3
         limit := x + span - 1; if limit > max_x { limit = max_x }
         for i: 0..cast(s64)total - 1 {
             at := x + cast(s32)i; if at > limit { at = limit }
-            above[IntraEdgeOffset + i] = cast(s32)plane[row - stride + at]
+            value := cast(s32)plane[row - stride + at]
+            above[IntraEdgeOffset + i] = value; largest = ifx value > largest then value else largest
         }
     } else {
         value := ifx have_left then cast(s32)plane[row + x - 1] else midpoint - 1
+        largest = value
         for i: 0..cast(s64)total - 1 { above[IntraEdgeOffset + i] = value }
     }
     if have_left {
@@ -120,10 +126,12 @@ BuildIntraEdges :: (edges: *IntraEdges, plane: []u16, stride: s32, x: s32, y: s3
         limit := y + span - 1; if limit > max_y { limit = max_y }
         for i: 0..cast(s64)total - 1 {
             at := y + cast(s32)i; if at > limit { at = limit }
-            left[IntraEdgeOffset + i] = cast(s32)plane[cast(s64)at * stride + x - 1]
+            value := cast(s32)plane[cast(s64)at * stride + x - 1]
+            left[IntraEdgeOffset + i] = value; largest = ifx value > largest then value else largest
         }
     } else {
         value := ifx have_above then cast(s32)plane[row - stride + x] else midpoint + 1
+        largest = ifx value > largest then value else largest
         for i: 0..cast(s64)total - 1 { left[IntraEdgeOffset + i] = value }
     }
     corner := midpoint
@@ -131,10 +139,7 @@ BuildIntraEdges :: (edges: *IntraEdges, plane: []u16, stride: s32, x: s32, y: s3
     else if have_above { corner = cast(s32)plane[row - stride + x] }
     else if have_left { corner = cast(s32)plane[row + x - 1] }
     above[IntraEdgeOffset - 1] = corner; left[IntraEdgeOffset - 1] = corner
-    for i: -1..cast(s64)total - 1 {
-        if above[IntraEdgeOffset + i] > maximum || left[IntraEdgeOffset + i] > maximum { return Error(InvalidInput) }
-    }
-    edges.above = above; edges.left = left
+    if largest > maximum || corner > maximum { edges.width = 0; edges.height = 0; return Error(InvalidInput) }
     edges.width = width; edges.height = height
     available_width := max_x - x + 1; if available_width > width { available_width = width }
     available_height := max_y - y + 1; if available_height > height { available_height = height }

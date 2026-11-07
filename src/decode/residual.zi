@@ -88,10 +88,9 @@ IntraCoefficients :: (tile: *IntraTile, block: *IntraBlock, plane: s32, start_x:
             if plane == 1 { delta_dc = header.delta_q[1]; delta_ac = header.delta_q[2] }
             if plane == 2 { delta_dc = header.delta_q[3]; delta_ac = header.delta_q[4] }
             coded := IntraMin(32, tx_w) * IntraMin(32, tx_h)
-            no_weights: [1]u8
             count := tx_w * tx_h
-            error := DequantizeInto(tile.quant[:coded], tx_w, tx_h, q.value, delta_dc, delta_ac,
-                frame.bit_depth, no_weights[:0], tile.dequant[:count], tile.cancellation)
+            error := DequantizeSparseInto(tile.quant[:coded], tile.coefficient_scratch.nonzero[:], coefficients.nonzero,
+                tx_w, tx_h, q.value, delta_dc, delta_ac, frame.bit_depth, tile.dequant[:count], tile.cancellation)
             if error.code != DecodeOK { return error }
             error = InverseTransform2D(tile.dequant[:count], tile.residual[:count], tx_w, tx_h, tx_type,
                 frame.bit_depth, tile.cancellation)
@@ -155,7 +154,7 @@ IntraTransformBlock :: (tile: *IntraTile, block: *IntraBlock, plane: s32, base_x
             luma_x := IntraShift(start_x, sx); luma_y := IntraShift(start_y, sy)
             luma_w := IntraMin(block.max_luma_w - luma_x, IntraShift(tx_w, sx))
             luma_h := IntraMin(block.max_luma_h - luma_y, IntraShift(tx_h, sy))
-            if luma_w < 1 || luma_h < 1 || luma_w > 64 || luma_h > 64 { return Error(MalformedInput, tile.decoder.bits.byte) }
+            if luma_w < 1 || luma_h < 1 || luma_w > 64 || luma_h > 64 { return Error(MalformedInput, RangeByte(*tile.decoder)) }
             luma_stride := frame.plane_stride[0]
             for i: 0..luma_h - 1 {
                 source := frame.plane_offset[0] + cast(s64)(luma_y + cast(s32)i) * luma_stride + luma_x

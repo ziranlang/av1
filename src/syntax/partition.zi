@@ -41,7 +41,7 @@ ReadSquarePartition :: (decoder: *RangeDecoder, cdfs: *PartitionCDF,
     side: s32, above_width: s32, left_height: s32) -> s32 {
     if decoder == null { return 0 }
     if cdfs == null || (side != 8 && side != 16 && side != 32 && side != 64 && side != 128) ||
-        above_width < 0 || left_height < 0 { decoder.error = Error(InvalidInput, decoder.bits.byte); return 0 }
+        above_width < 0 || left_height < 0 { decoder.error = Error(InvalidInput, RangeByte(decoder)); return 0 }
     size_context: s32
     n := side
     while n > 8 { size_context += 4; n /= 2 }
@@ -59,7 +59,7 @@ ReadBoundaryPartition :: (decoder: *RangeDecoder, cdfs: *PartitionCDF,
     side: s32, above_width: s32, left_height: s32, has_rows: bool) -> s32 {
     if decoder == null { return 0 }
     if cdfs == null || (side != 16 && side != 32 && side != 64 && side != 128) || above_width < 0 || left_height < 0 {
-        decoder.error = Error(InvalidInput, decoder.bits.byte); return 0
+        decoder.error = Error(InvalidInput, RangeByte(decoder)); return 0
     }
     context: s32 = 4; n := side
     while n > 16 { context += 4; n /= 2 }
@@ -73,10 +73,10 @@ ReadBoundaryPartition :: (decoder: *RangeDecoder, cdfs: *PartitionCDF,
     for i: 0..terms {
         symbol := ifx has_rows then vertical[i] else horizontal[i]
         high := cast(s32)cdfs.cells[at + symbol]; low := cast(s32)cdfs.cells[at + symbol - 1]
-        if high < low { decoder.error = Error(InvalidInput, decoder.bits.byte); return 0 }
+        if high < low { decoder.error = Error(InvalidInput, RangeByte(decoder)); return 0 }
         probability += high - low
     }
-    if probability > 32768 { decoder.error = Error(InvalidInput, decoder.bits.byte); return 0 }
+    if probability > 32768 { decoder.error = Error(InvalidInput, RangeByte(decoder)); return 0 }
     cdf: [3]u16
     cdf[0] = cast(u16)(32768 - probability); cdf[1] = 32768
     symbol := ReadSymbol(decoder, cdf[:])

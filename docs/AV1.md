@@ -48,8 +48,6 @@ import each other with package-local file imports; `decoder` is the only export.
 - `NewBits(input,begin,end)` creates an MSB-first syntax `BitReader` over an
   absolute byte interval. `ReadBits(reader*,count)` reads 0–32 bits. Failed
   reads return zero, preserve the cursor, and retain the first `DecodeError`.
-  `ReadShortBits` is the same read for at most 16 bits, from one three-byte
-  window when the interval allows.
   `AlignBits` requires zero alignment bits; `FinishBits` requires a one followed
   by zero bits to the interval end. Neither operation decodes entropy symbols.
   `ReadSignedBits` handles 1–32-bit two's-complement literals; `ReadNS` handles
@@ -71,7 +69,9 @@ import each other with package-local file imports; `decoder` is the only export.
   oracles. `ReadBool` and `ReadLiteral` decode entropy literals. They are not
   replacements for syntax `ReadBits`.
 - Symbol decoding uses the specification's complemented range value and
-  bounded virtual zero padding. Reads past the permitted padding return
+  bounded virtual zero padding. The value tops a 64-bit window of the next
+  complemented input bits, refilled a byte at a time. `RangeBitPosition` is
+  where the specification's bit reader stands, and error offsets use its byte. Reads past the permitted padding return
   `TruncatedInput` at the interval end. `FinishRange` verifies `exit_symbol`'s
   one bit and zero tail and rejects reuse after success. Callers must finish a
   tile; decoding a symbol alone does not validate its termination. `DecodeSymbol` is the same decode without the CDF scan, for CDFs the decoder owns;
@@ -597,9 +597,14 @@ mask, transform-size division and source-depth clipping. The owned 4,096-cell
 result uses the full transform width; cells outside the coded upper-left
 rectangle and inactive cells remain zero. Errors and cancellation return no
 coefficients. Borrowed inputs remain unchanged. `DequantizeInto` writes the same values into a caller buffer.
+`DequantizeSparseInto` does so with flat weights from a list of the coded
+positions that may be nonzero, reading only those coefficients.
 
 `build-queue -- sh tests/av1_quantization.sh` passed 98,304 lookup/delta cases and
 114 dequantization vectors across 8/10/12-bit depth and all nineteen sizes.
+`DequantizeSparseInto` matches `DequantizeBlock` on 342 sparse blocks of every
+size and depth, from one coefficient to all of them in random order, with
+samples past the block untouched.
 Native inverse-matrix data covers all fifteen active levels and both plane
 classes. The normative coefficient reference checks 44,640 compact coefficients
 and all 466,944 output cells, including 28,885 product wraps and 41,495 clips.
@@ -698,8 +703,9 @@ coefficient integration is described below and used by the frame decoder.
 transform-type syntax between skip and nonzero coefficients, as required by
 the specification. The caller resolves the legal transform class and neighbor
 contexts. No transform-type syntax is omitted inside this component. `DecodeNonzeroCoefficients` writes the coefficients into a caller buffer instead of returning them,
-using a caller `CoefficientScratch` for the levels and scan positions; the
-tile keeps one.
+using a caller `CoefficientScratch` for the levels, scan positions and the
+coded positions of nonzero levels, which the summary counts; the tile keeps
+one.
 
 The reader covers nineteen transform sizes, the permitted 2D/horizontal/vertical
 coefficient classes, all EOB areas, reverse base/BR levels, forward signs and
@@ -918,9 +924,17 @@ And in scalar code:
 - `predict/palette.zi`: each index ranks its three neighbours once and maps
   the token straight to its color, and a map checks its five CDFs once
   instead of on every token.
+- `entropy/coefficient_block.zi`: signs and Golomb extensions are read for
+  the nonzero levels only, and `DequantizeSparseInto` reads just those
+  coefficients.
+- `predict/intra_predict.zi`: edge samples are written in place and checked
+  against the bit depth once.
+- `entropy/range.zi`: renormalization shifts a 64-bit window and loads input
+  a byte at a time, and coefficient skip, end-of-block and DC sign symbols
+  read their CDF rows directly.
 
-It now takes 7 to 162 ms per frame, the medians of the fastest of three
-benchmark runs on a busy machine: 0.9 to 3.7 times libaom and 1.7 to 6.9 times
+It now takes 6 to 134 ms per frame, the medians of the fastest of three
+benchmark runs on a busy machine: 0.9 to 3.3 times libaom and 1.7 to 6.1 times
 dav1d. The screen-content clip decodes faster than libaom. Entropy decoding is
 the largest remaining cost. The generated C still bounds-checks indices it
 cannot prove, such as row times stride, and calls the symbol decoder out of

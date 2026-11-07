@@ -119,7 +119,7 @@ IntraPredictBoundaries :: () -> s32 {
     if BuildIntraEdges(*edges, plane[:], 16, 4, 0, 4, 4, 15, 15, true, false, false, false, 10).code != InvalidInput { return 8 }
     if BuildIntraEdges(*edges, plane[:], 16, 0, 4, 4, 4, 15, 15, false, true, false, false, 10).code != InvalidInput { return 9 }
     if BuildIntraEdges(*edges, plane[:255], 16, 4, 4, 4, 4, 15, 15, true, true, false, false, 10).code != InvalidInput { return 10 }
-    // 8-bit samples above 255 are rejected and leave edges unchanged.
+    // 8-bit samples above 255 are rejected and leave edges holding no block.
     if BuildIntraEdges(*edges, plane[:], 16, 4, 4, 4, 4, 15, 15, true, true, false, false, 8).code != InvalidInput { return 11 }
     if edges.width != 0 { return 12 }
     // Edge construction: limits, replication and missing-side defaults.

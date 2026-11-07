@@ -30,7 +30,7 @@ DecodeIntraBlock :: (tile: *IntraTile, row: s32, column: s32, width: s32, height
     if error.code != DecodeOK { return error }
     // Subsampled_Size marks portrait luma blocks invalid in 4:2:2.
     if frame.planes > 1 && frame.subsampling_x == 1 && frame.subsampling_y == 0 && height > width {
-        return Error(MalformedInput, tile.decoder.bits.byte)
+        return Error(MalformedInput, RangeByte(*tile.decoder))
     }
     block: IntraBlock
     block.row = row; block.column = column; block.width = width; block.height = height
@@ -168,7 +168,7 @@ DecodeIntraPartition :: (tile: *IntraTile, row: s32, column: s32, side: s32) -> 
         }
         return Error(DecodeOK)
     }
-    return Error(MalformedInput, tile.decoder.bits.byte)
+    return Error(MalformedInput, RangeByte(*tile.decoder))
 }
 
 IntraInverseRecenter :: (r: s32, v: s32) -> s32 {

@@ -56,7 +56,7 @@ CoefficientBlockBoundaries :: () -> s32 {
     if ReadCoefficientSkip(*decoder, *cdfs, 4, 4, 0, 0, *token).error.code != DecodeCancelled { return 8 }
     fresh := NewCoefficientCDFs(0)
     for i: 0..3834 { if cdfs.values[i] != fresh.values[i] { return 9 } }
-    if decoder.max_bits != 113 || decoder.bits.byte != 1 || decoder.bits.bit != 7 { return 10 }
+    if decoder.max_bits != 113 || RangeBitPosition(*decoder) != 15 { return 10 }
     decoder = NewRange(BorrowBytes(data[:]), 0, 0)
     block = ReadNonzeroCoefficients(*decoder, *cdfs, 4, 4, 0, 0, 0)
     if block.error.code != TruncatedInput || !BlockIsZero(*block) { return 11 }

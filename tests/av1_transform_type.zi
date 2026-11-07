@@ -11,7 +11,7 @@ TransformTypeBoundaries :: () -> s32 {
         value := ReadTransformType(*decoder, *state, 4, 4, i == 1, false, 0, 0)
         if value.error.code != DecodeOK || value.value != 0 || value.tx_class != 0 { return 2 }
     }
-    if decoder.bits.byte != 1 || decoder.bits.bit != 7 || decoder.max_bits != 1 { return 3 }
+    if RangeBitPosition(*decoder) != 15 || decoder.max_bits != 1 { return 3 }
     for i: 0..500 { if state.values[i] != saved[i] { return 4 } }
     missing: *RangeDecoder; missing_cdfs: *TransformTypeCDFs
     if ReadTransformType(missing, *state, 4, 4, false, false, 1, 0).error.code != InvalidInput { return 5 }
