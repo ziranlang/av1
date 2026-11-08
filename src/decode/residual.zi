@@ -159,13 +159,12 @@ IntraTransformBlock :: (tile: *IntraTile, block: *IntraBlock, plane: s32, base_x
             luma_w := IntraMin(block.max_luma_w - luma_x, IntraShift(tx_w, sx))
             luma_h := IntraMin(block.max_luma_h - luma_y, IntraShift(tx_h, sy))
             if luma_w < 1 || luma_h < 1 || luma_w > 64 || luma_h > 64 { return Error(MalformedInput, RangeByte(*tile.decoder)) }
+            // The luma plane is read in place; CfL writes only chroma.
             luma_stride := frame.plane_stride[0]
-            for i: 0..luma_h - 1 {
-                source := frame.plane_offset[0] + cast(s64)(luma_y + cast(s32)i) * luma_stride + luma_x
-                for j: 0..luma_w - 1 { tile.cfl_luma[i * 64 + j] = tile.samples[source + j] }
-            }
+            luma_at := frame.plane_offset[0] + cast(s64)luma_y * luma_stride + luma_x
+            luma_end := frame.plane_offset[0] + cast(s64)luma_stride * frame.plane_rows[0]
             alpha := ifx plane == 1 then block.alpha_u else block.alpha_v
-            error = ApplyCfl(tile.samples[at:plane_end], stride, tile.cfl_luma[:], 64, tx_w, tx_h, sx, sy,
+            error = ApplyCfl(tile.samples[at:plane_end], stride, tile.samples[luma_at:luma_end], luma_stride, tx_w, tx_h, sx, sy,
                 luma_w, luma_h, alpha, frame.bit_depth, tile.cancellation)
             if error.code != DecodeOK { return error }
         }

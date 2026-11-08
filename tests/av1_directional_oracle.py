@@ -25,7 +25,7 @@ def main():
     text=header.split('dr_intra_derivative[90] = {',1)[1].split('};',1)[0]
     values=list(map(int,re.findall(r'\d+',re.sub(r'//[^\n]*','',text))))
     product=(a.root/'src/predict/intra_predict.zi').read_text()
-    table=re.search(r'table: \[90\]s16 = \.\[([^]]+)\]',product)
+    table=re.search(r'IntraDerivatives :: s16\.\[([^]]+)\]',product)
     if len(values)!=90 or not table or list(map(int,table[1].split(',')))!=values:raise SystemExit('derivative provenance mismatch')
     source=a.out/'decoder.c';source.write_text(DECODER.replace(
         'bad_mode+=!supported;','bad_mode+=mode<DC_PRED||mode>PAETH_PRED;'))

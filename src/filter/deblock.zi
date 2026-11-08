@@ -3,7 +3,7 @@ Simd :: #import "std/simd"
 
 // AV1 7.14.6 sample filtering: FilterDeblockEdge is the scalar reference for
 // one line, FilterDeblockLines filters the four lines of an edge segment at
-// once on s32x4 vectors. Input order is p7..p0,q0..q7; scheduling, boundary
+// once with p/q pairs packed in s16x8 vectors. Input order is p7..p0,q0..q7; scheduling, boundary
 // selection and adaptive threshold derivation are caller responsibilities.
 // No allocation or native codec calls.
 DeblockEdge :: struct {
@@ -98,143 +98,318 @@ FilterDeblockEdge :: (input: []u16, filter_length: s32, block_limit: s32,
     return result
 }
 
-// Sixteen taps p7..q7 of four lines, one line per lane.
-DeblockTaps :: struct { v: [16]s32x4; }
-
-// The taps FilterDeblockLinesIn works in, kept by its caller so that no call
-// clears them: a call loads only the taps its filter length reads and sets
-// only those it writes, so what earlier calls left is never read.
-DeblockScratch :: struct { x: DeblockTaps; y: DeblockTaps; flat: DeblockTaps; }
+// The taps of an edge segment's four lines, p and q packed: a<i> holds tap
+// p<i> of lines 0..3 in lanes 0..3 and q<i> in lanes 4..7, so the filter's
+// mirrored p and q arithmetic is one operation (libaom's four-line layout).
+// Samples are at most 12 bits, so differences and the narrow filter fit s16
+// and the flat sums, at most 16 * 4095, fit u16.
+DeblockTaps :: struct { a0: s16x8; a1: s16x8; a2: s16x8; a3: s16x8; a4: s16x8; a5: s16x8; a6: s16x8; }
 
 #scope_file
-DeblockLoad :: (samples: []u16, at: s64, line_step: s64) -> s32x4 #inline {
-    if line_step == 1 { return Simd.Reinterpret(s32x4, Simd.WidenLow(Simd.LoadLow(u16x8, samples, at))) }
-    return Simd.Make(s32x4, cast(s32)samples[at], cast(s32)samples[at + line_step],
-        cast(s32)samples[at + 2 * line_step], cast(s32)samples[at + 3 * line_step])
+// p and q halves exchanged.
+DeblockSwap :: (v: s16x8) -> s16x8 #inline { return Simd.Shuffle(v, 4, 5, 6, 7, 0, 1, 2, 3) }
+
+// The low or high 64 bits of a and of b.
+DeblockLow :: (a: s16x8, b: s16x8) -> s16x8 #inline {
+    return Simd.Reinterpret(s16x8, Simd.InterleaveLow(Simd.Reinterpret(u64x2, a), Simd.Reinterpret(u64x2, b)))
+}
+DeblockHigh :: (a: s16x8, b: s16x8) -> s16x8 #inline {
+    return Simd.Reinterpret(s16x8, Simd.InterleaveHigh(Simd.Reinterpret(u64x2, a), Simd.Reinterpret(u64x2, b)))
 }
 
-DeblockStore :: (samples: []u16, at: s64, line_step: s64, v: s32x4) #inline {
-    if line_step == 1 { Simd.StoreLow(samples, at, Simd.Narrow(u16x8, v, v)); return }
-    samples[at] = cast(u16)Simd.Lane(v, 0); samples[at + line_step] = cast(u16)Simd.Lane(v, 1)
-    samples[at + 2 * line_step] = cast(u16)Simd.Lane(v, 2); samples[at + 3 * line_step] = cast(u16)Simd.Lane(v, 3)
-}
-
-DeblockClampLanes :: (v: s32x4, low: s32x4, high: s32x4) -> s32x4 #inline { return Simd.Min(Simd.Max(v, low), high) }
+// A per-half mask set in both halves of a line where either half is set.
+DeblockBoth :: (mask: s16x8) -> s16x8 #inline { return Simd.Or(mask, DeblockSwap(mask)) }
 
 // Lanes where |a - b| > bound.
-DeblockApart :: (a: s32x4, b: s32x4, bound: s32x4) -> s32x4 #inline { return Simd.Greater(Simd.Abs(Simd.Sub(a, b)), bound) }
+DeblockApart :: (a: s16x8, b: s16x8, bound: s16x8) -> s16x8 #inline {
+    return Simd.Greater(Simd.Abs(Simd.Sub(a, b)), bound)
+}
 
-// The flat filter of half-width n into out.v[8 - n..7 + n]: taps within
-// double_extent of each output count twice and the sum rounds by shift.
-DeblockFlat :: (x: *DeblockTaps, out: *DeblockTaps, n: s64, double_extent: s64, shift: u32) #inline {
-    for output: 0..2 * n - 1 {
-        i := output - n
-        sum := Simd.Zero(s32x4)
-        for tap: 0..2 * n {
-            j := tap - n
-            source := i + j
-            if source < -(n + 1) { source = -(n + 1) }; if source > n { source = n }
-            v := x.v[(8 + source) & 15]
-            sum = Simd.Add(sum, v)
-            if j >= -double_extent && j <= double_extent { sum = Simd.Add(sum, v) }
+DeblockClampLanes :: (v: s16x8, low: s16x8, high: s16x8) -> s16x8 #inline { return Simd.Min(Simd.Max(v, low), high) }
+
+// A flat filter sum rounded down by shift bits, on unsigned lanes.
+DeblockRound :: (sum: s16x8, shift: u32) -> s16x8 #inline {
+    return Simd.Reinterpret(s16x8, Simd.ShiftRightRound(Simd.Reinterpret(u16x8, sum), shift))
+}
+
+DeblockLoadLow :: (samples: []u16, at: s64) -> s16x8 #inline { return Simd.Reinterpret(s16x8, Simd.LoadLow(u16x8, samples, at)) }
+DeblockLoadRow :: (samples: []u16, at: s64) -> s16x8 #inline { return Simd.Reinterpret(s16x8, Simd.Load(u16x8, samples, at)) }
+DeblockStoreLow :: (samples: []u16, at: s64, v: s16x8) #inline { Simd.StoreLow(samples, at, Simd.Reinterpret(u16x8, v)) }
+DeblockStoreRow :: (samples: []u16, at: s64, v: s16x8) #inline { Simd.Store(samples, at, Simd.Reinterpret(u16x8, v)) }
+
+// Tap i of both sides when each tap is a row of the four lines (line_step 1):
+// p<i> at at - (i + 1) * tap_step, q<i> at at + i * tap_step.
+DeblockLoadPair :: (samples: []u16, at: s64, tap_step: s64, i: s64, line_step: s64) -> s16x8 #inline {
+    p := at - (i + 1) * tap_step; q := at + i * tap_step
+    if line_step == 1 { return DeblockLow(DeblockLoadLow(samples, p), DeblockLoadLow(samples, q)) }
+    return Simd.Make(s16x8, cast(s16)samples[p], cast(s16)samples[p + line_step],
+        cast(s16)samples[p + 2 * line_step], cast(s16)samples[p + 3 * line_step],
+        cast(s16)samples[q], cast(s16)samples[q + line_step],
+        cast(s16)samples[q + 2 * line_step], cast(s16)samples[q + 3 * line_step])
+}
+DeblockStorePair :: (samples: []u16, at: s64, tap_step: s64, i: s64, v: s16x8, line_step: s64) #inline {
+    p := at - (i + 1) * tap_step; q := at + i * tap_step
+    if line_step == 1 {
+        DeblockStoreLow(samples, p, v); DeblockStoreLow(samples, q, DeblockSwap(v)); return
+    }
+    samples[p] = cast(u16)Simd.Lane(v, 0); samples[p + line_step] = cast(u16)Simd.Lane(v, 1)
+    samples[p + 2 * line_step] = cast(u16)Simd.Lane(v, 2); samples[p + 3 * line_step] = cast(u16)Simd.Lane(v, 3)
+    samples[q] = cast(u16)Simd.Lane(v, 4); samples[q + line_step] = cast(u16)Simd.Lane(v, 5)
+    samples[q + 2 * line_step] = cast(u16)Simd.Lane(v, 6); samples[q + 3 * line_step] = cast(u16)Simd.Lane(v, 7)
+}
+
+// Four rows of eight samples transposed: c01 holds column 0 of the rows in
+// its low half and column 1 in its high half, and so on.
+DeblockColumns :: struct { c01: s16x8; c23: s16x8; c45: s16x8; c67: s16x8; }
+
+DeblockTranspose :: (r0: s16x8, r1: s16x8, r2: s16x8, r3: s16x8) -> DeblockColumns #inline {
+    t0 := Simd.Reinterpret(s32x4, Simd.InterleaveLow(r0, r1)); t1 := Simd.Reinterpret(s32x4, Simd.InterleaveLow(r2, r3))
+    t2 := Simd.Reinterpret(s32x4, Simd.InterleaveHigh(r0, r1)); t3 := Simd.Reinterpret(s32x4, Simd.InterleaveHigh(r2, r3))
+    result: DeblockColumns
+    result.c01 = Simd.Reinterpret(s16x8, Simd.InterleaveLow(t0, t1)); result.c23 = Simd.Reinterpret(s16x8, Simd.InterleaveHigh(t0, t1))
+    result.c45 = Simd.Reinterpret(s16x8, Simd.InterleaveLow(t2, t3)); result.c67 = Simd.Reinterpret(s16x8, Simd.InterleaveHigh(t2, t3))
+    return result
+}
+
+// DeblockTranspose undone: the four rows from their column pairs, row l in
+// rows.c<2l><2l+1> order (c01 is row 0 and so on).
+DeblockRows :: (c: DeblockColumns) -> DeblockColumns #inline {
+    w0 := DeblockLow(c.c01, c.c23); w1 := DeblockHigh(c.c01, c.c23)
+    w2 := DeblockLow(c.c45, c.c67); w3 := DeblockHigh(c.c45, c.c67)
+    x0 := Simd.Reinterpret(s32x4, Simd.InterleaveLow(w0, w1)); x1 := Simd.Reinterpret(s32x4, Simd.InterleaveHigh(w0, w1))
+    x2 := Simd.Reinterpret(s32x4, Simd.InterleaveLow(w2, w3)); x3 := Simd.Reinterpret(s32x4, Simd.InterleaveHigh(w2, w3))
+    y0 := Simd.Reinterpret(s16x8, Simd.InterleaveLow(x0, x1)); y1 := Simd.Reinterpret(s16x8, Simd.InterleaveLow(x2, x3))
+    y2 := Simd.Reinterpret(s16x8, Simd.InterleaveHigh(x0, x1)); y3 := Simd.Reinterpret(s16x8, Simd.InterleaveHigh(x2, x3))
+    rows: DeblockColumns
+    rows.c01 = DeblockLow(y0, y1); rows.c23 = DeblockHigh(y0, y1)
+    rows.c45 = DeblockLow(y2, y3); rows.c67 = DeblockHigh(y2, y3)
+    return rows
+}
+
+// Four rows of four samples transposed into c01 and c23, and back.
+DeblockTranspose4 :: (r0: s16x8, r1: s16x8, r2: s16x8, r3: s16x8) -> DeblockColumns #inline {
+    t0 := Simd.Reinterpret(s32x4, Simd.InterleaveLow(r0, r1)); t1 := Simd.Reinterpret(s32x4, Simd.InterleaveLow(r2, r3))
+    result: DeblockColumns
+    result.c01 = Simd.Reinterpret(s16x8, Simd.InterleaveLow(t0, t1)); result.c23 = Simd.Reinterpret(s16x8, Simd.InterleaveHigh(t0, t1))
+    return result
+}
+DeblockStoreRows4 :: (samples: []u16, at: s64, line_step: s64, c01: s16x8, c23: s16x8) #inline {
+    w0 := DeblockLow(c01, c23); w1 := DeblockHigh(c01, c23)
+    x0 := Simd.Reinterpret(s32x4, Simd.InterleaveLow(w0, w1)); x1 := Simd.Reinterpret(s32x4, Simd.InterleaveHigh(w0, w1))
+    y0 := Simd.Reinterpret(s16x8, Simd.InterleaveLow(x0, x1)); y1 := Simd.Reinterpret(s16x8, Simd.InterleaveHigh(x0, x1))
+    DeblockStoreLow(samples, at, y0); DeblockStoreLow(samples, at + line_step, DeblockSwap(y0))
+    DeblockStoreLow(samples, at + 2 * line_step, y1); DeblockStoreLow(samples, at + 3 * line_step, DeblockSwap(y1))
+}
+
+// A p pair (p<k+1> low, p<k> high) and a q pair (q<k> low, q<k+1> high) of
+// transposed columns as the packed taps k and k + 1, and back.
+DeblockUnpair :: (p: s16x8, q: s16x8, near: *s16x8, far: *s16x8) #inline {
+    s := DeblockSwap(q)
+    near.* = DeblockHigh(p, s); far.* = DeblockLow(p, s)
+}
+
+// The taps of a segment of filter length n (constant at every call), read
+// with row loads when line_step is 1, a transpose when tap_step is 1,
+// or individual lanes for general strides. Only the n samples are read.
+DeblockLoad :: (t: *DeblockTaps, samples: []u16, at: s64, line_step: s64, tap_step: s64, n: s32) #inline {
+    if line_step == 1 || tap_step != 1 {
+        t.a0 = DeblockLoadPair(samples, at, tap_step, 0, line_step); t.a1 = DeblockLoadPair(samples, at, tap_step, 1, line_step)
+        if n >= 6 { t.a2 = DeblockLoadPair(samples, at, tap_step, 2, line_step) }
+        if n >= 8 { t.a3 = DeblockLoadPair(samples, at, tap_step, 3, line_step) }
+        if n == 14 {
+            t.a4 = DeblockLoadPair(samples, at, tap_step, 4, line_step); t.a5 = DeblockLoadPair(samples, at, tap_step, 5, line_step)
+            t.a6 = DeblockLoadPair(samples, at, tap_step, 6, line_step)
         }
-        out.v[(8 + i) & 15] = Simd.ShiftRightRound(sum, shift)
+        return
+    }
+    l1 := at + line_step; l2 := at + 2 * line_step; l3 := at + 3 * line_step
+    if n == 4 {
+        // p1 p0 q0 q1 per row.
+        c := DeblockTranspose4(DeblockLoadLow(samples, at - 2), DeblockLoadLow(samples, l1 - 2),
+            DeblockLoadLow(samples, l2 - 2), DeblockLoadLow(samples, l3 - 2))
+        DeblockUnpair(c.c01, c.c23, *t.a0, *t.a1)
+    } else if n == 6 {
+        // p2 p1 p0 q0 and p0 q0 q1 q2 per row.
+        c := DeblockTranspose(DeblockLow(DeblockLoadLow(samples, at - 3), DeblockLoadLow(samples, at - 1)),
+            DeblockLow(DeblockLoadLow(samples, l1 - 3), DeblockLoadLow(samples, l1 - 1)),
+            DeblockLow(DeblockLoadLow(samples, l2 - 3), DeblockLoadLow(samples, l2 - 1)),
+            DeblockLow(DeblockLoadLow(samples, l3 - 3), DeblockLoadLow(samples, l3 - 1)))
+        t.a0 = c.c23
+        DeblockUnpair(c.c01, c.c67, *t.a1, *t.a2)
+    } else if n == 8 {
+        // p3..q3 per row.
+        c := DeblockTranspose(DeblockLoadRow(samples, at - 4), DeblockLoadRow(samples, l1 - 4),
+            DeblockLoadRow(samples, l2 - 4), DeblockLoadRow(samples, l3 - 4))
+        DeblockUnpair(c.c23, c.c45, *t.a0, *t.a1)
+        DeblockUnpair(c.c01, c.c67, *t.a2, *t.a3)
+    } else {
+        // p6..q0 and p0..q6 per row.
+        p := DeblockTranspose(DeblockLoadRow(samples, at - 7), DeblockLoadRow(samples, l1 - 7),
+            DeblockLoadRow(samples, l2 - 7), DeblockLoadRow(samples, l3 - 7))
+        q := DeblockTranspose(DeblockLoadRow(samples, at - 1), DeblockLoadRow(samples, l1 - 1),
+            DeblockLoadRow(samples, l2 - 1), DeblockLoadRow(samples, l3 - 1))
+        t.a0 = q.c01
+        DeblockUnpair(p.c45, q.c23, *t.a1, *t.a2)
+        DeblockUnpair(p.c23, q.c45, *t.a3, *t.a4)
+        DeblockUnpair(p.c01, q.c67, *t.a5, *t.a6)
     }
 }
 
-#scope_export
-// FilterDeblockEdge on the four lines of an edge segment at once, one line
-// per s32x4 lane. Tap k (0..15 for p7..q7) of line l is
-// samples[at + l * line_step + (k - 8) * tap_step], so at is line 0's q0.
-// Only the filter_length samples around the edge are read, and only those the
-// filter can change are written. Every line gives FilterDeblockEdge's samples;
-// any invalid argument or sample above the depth returns InvalidInput with
-// nothing written.
-FilterDeblockLines :: (samples: []u16, at: s64, line_step: s64, tap_step: s64, filter_length: s32,
-    block_limit: s32, limit: s32, hev_threshold: s32, bit_depth: s32) -> DecodeError {
-    scratch: DeblockScratch
-    return FilterDeblockLinesIn(*scratch, samples, at, line_step, tap_step, filter_length, block_limit, limit,
-        hev_threshold, bit_depth)
+// The taps DeblockLoad read written back, the ones the filter left as read
+// included: p1..q1 for lengths 4 and 6, p3..q3 for 8 and p6..q6 for 14
+// (only p5..q5 along columns, where each tap is stored alone).
+DeblockStore :: (t: *DeblockTaps, samples: []u16, at: s64, line_step: s64, tap_step: s64, n: s32) #inline {
+    if line_step == 1 || tap_step != 1 {
+        DeblockStorePair(samples, at, tap_step, 0, t.a0, line_step); DeblockStorePair(samples, at, tap_step, 1, t.a1, line_step)
+        if n >= 8 { DeblockStorePair(samples, at, tap_step, 2, t.a2, line_step) }
+        if n == 14 {
+            DeblockStorePair(samples, at, tap_step, 3, t.a3, line_step); DeblockStorePair(samples, at, tap_step, 4, t.a4, line_step)
+            DeblockStorePair(samples, at, tap_step, 5, t.a5, line_step)
+        }
+        return
+    }
+    l1 := at + line_step; l2 := at + 2 * line_step; l3 := at + 3 * line_step
+    if n == 4 || n == 6 {
+        DeblockStoreRows4(samples, at - 2, line_step, DeblockLow(t.a1, t.a0), DeblockHigh(t.a0, t.a1))
+    } else if n == 8 {
+        c: DeblockColumns
+        c.c01 = DeblockLow(t.a3, t.a2); c.c23 = DeblockLow(t.a1, t.a0)
+        c.c45 = DeblockHigh(t.a0, t.a1); c.c67 = DeblockHigh(t.a2, t.a3)
+        r := DeblockRows(c)
+        DeblockStoreRow(samples, at - 4, r.c01); DeblockStoreRow(samples, l1 - 4, r.c23)
+        DeblockStoreRow(samples, l2 - 4, r.c45); DeblockStoreRow(samples, l3 - 4, r.c67)
+    } else {
+        p: DeblockColumns; q: DeblockColumns
+        p.c01 = DeblockLow(t.a6, t.a5); p.c23 = DeblockLow(t.a4, t.a3); p.c45 = DeblockLow(t.a2, t.a1); p.c67 = t.a0
+        q.c01 = t.a0; q.c23 = DeblockHigh(t.a1, t.a2); q.c45 = DeblockHigh(t.a3, t.a4); q.c67 = DeblockHigh(t.a5, t.a6)
+        pr := DeblockRows(p); qr := DeblockRows(q)
+        DeblockStoreRow(samples, at - 7, pr.c01); DeblockStoreRow(samples, l1 - 7, pr.c23)
+        DeblockStoreRow(samples, l2 - 7, pr.c45); DeblockStoreRow(samples, l3 - 7, pr.c67)
+        DeblockStoreRow(samples, at - 1, qr.c01); DeblockStoreRow(samples, l1 - 1, qr.c23)
+        DeblockStoreRow(samples, l2 - 1, qr.c45); DeblockStoreRow(samples, l3 - 1, qr.c67)
+    }
 }
 
-// FilterDeblockLines in the caller's scratch, which a frame's filter loop
-// reuses for every edge.
-FilterDeblockLinesIn :: (scratch: *DeblockScratch, samples: []u16, at: s64, line_step: s64, tap_step: s64,
-    filter_length: s32, block_limit: s32, limit: s32, hev_threshold: s32, bit_depth: s32) -> DecodeError #target {
-    if scratch == null { return Error(InvalidInput) }
+// The filter of length n (constant at every call) on validated taps, in
+// place. Returns false, with t unchanged, when no line is filtered.
+DeblockFilter :: (t: *DeblockTaps, n: s32, block_limit: s32, limit: s32, hev_threshold: s32, bit_depth: s32) -> bool #inline {
+    scale := cast(s32)(cast(u32)1 << cast(u32)(bit_depth - 8))
+    a0 := t.a0; a1 := t.a1; a2 := t.a2; a3 := t.a3
+    b0 := DeblockSwap(a0); b1 := DeblockSwap(a1)
+    step := Simd.Splat(s16x8, cast(s16)(limit * scale))
+    // Lanes of lines left as they are: the edge and every step of the filter
+    // mask (p1-p0 .. p3-p2 by length) within their limits.
+    edge := Simd.Add(Simd.ShiftLeft(Simd.Abs(Simd.Sub(a0, b0)), 1), Simd.ShiftRight(Simd.Abs(Simd.Sub(a1, b1)), 1))
+    off := Simd.Or(Simd.Greater(edge, Simd.Splat(s16x8, cast(s16)(block_limit * scale))), DeblockApart(a1, a0, step))
+    if n >= 6 { off = Simd.Or(off, DeblockApart(a2, a1, step)) }
+    if n >= 8 { off = Simd.Or(off, DeblockApart(a3, a2, step)) }
+    off = DeblockBoth(off)
+    if Simd.AllZero(Simd.Not(off)) { return false }
+    high_variance := DeblockBoth(DeblockApart(a1, a0, Simd.Splat(s16x8, cast(s16)(hev_threshold * scale))))
+    // The narrow filter on samples centred at zero, its value in the p half.
+    middle := Simd.Splat(s16x8, cast(s16)(128 * scale))
+    low := Simd.Splat(s16x8, cast(s16)(-128 * scale)); high := Simd.Splat(s16x8, cast(s16)(128 * scale - 1))
+    s0 := Simd.Sub(a0, middle); s1 := Simd.Sub(a1, middle)
+    filter := Simd.And(high_variance, DeblockClampLanes(Simd.Sub(s1, DeblockSwap(s1)), low, high))
+    difference := Simd.Sub(DeblockSwap(s0), s0)
+    filter = DeblockClampLanes(Simd.Add(filter, Simd.Add(Simd.ShiftLeft(difference, 1), difference)), low, high)
+    // filter2 = (filter + 3) >> 3 in the p half and filter1 = (filter + 4) >> 3
+    // in the q half, which subtracts it.
+    rounded := Simd.ShiftRight(DeblockClampLanes(Simd.Add(DeblockLow(filter, filter), Simd.Make(s16x8, 3, 3, 3, 3, 4, 4, 4, 4)),
+        low, high), 3)
+    signs := Simd.Make(s16x8, 1, 1, 1, 1, -1, -1, -1, -1)
+    outer := Simd.Sign(Simd.ShiftRight(Simd.Add(DeblockHigh(rounded, rounded), Simd.Splat(s16x8, 1)), 1), signs)
+    n0 := Simd.Add(DeblockClampLanes(Simd.Add(s0, Simd.Sign(rounded, signs)), low, high), middle)
+    n1 := Simd.Select(high_variance, a1, Simd.Add(DeblockClampLanes(Simd.Add(s1, outer), low, high), middle))
+    if n >= 6 {
+        one := Simd.Splat(s16x8, cast(s16)scale)
+        rough := Simd.Or(DeblockApart(a1, a0, one), DeblockApart(a2, a0, one))
+        if n >= 8 { rough = Simd.Or(rough, DeblockApart(a3, a0, one)) }
+        flat := Simd.AndNot(Simd.Not(DeblockBoth(rough)), off)
+        if !Simd.AllZero(flat) {
+            if n == 6 {
+                // op1 = 3p2 + 2p1 + 2p0 + q0, op0 = p2 + 2p1 + 2p0 + 2q0 + q1.
+                sum := Simd.Add(Simd.Add(Simd.Add(a2, Simd.ShiftLeft(a2, 1)), Simd.ShiftLeft(Simd.Add(a1, a0), 1)), b0)
+                n1 = Simd.Select(flat, DeblockRound(sum, 3), n1)
+                sum = Simd.Add(Simd.Sub(sum, Simd.ShiftLeft(a2, 1)), Simd.Add(b0, b1))
+                n0 = Simd.Select(flat, DeblockRound(sum, 3), n0)
+            } else {
+                // op2 = 3p3 + 2p2 + p1 + p0 + q0, then each output trades
+                // the two farthest p taps for the next q tap.
+                b2 := DeblockSwap(a2)
+                sum := Simd.Add(Simd.Add(Simd.Add(a3, Simd.ShiftLeft(a3, 1)), Simd.ShiftLeft(a2, 1)), Simd.Add(Simd.Add(a1, a0), b0))
+                n2 := Simd.Select(flat, DeblockRound(sum, 3), a2)
+                sum = Simd.Add(Simd.Sub(sum, Simd.Add(a3, a2)), Simd.Add(a1, b1))
+                n1 = Simd.Select(flat, DeblockRound(sum, 3), n1)
+                sum = Simd.Add(Simd.Sub(sum, Simd.Add(a3, a1)), Simd.Add(a0, b2))
+                n0 = Simd.Select(flat, DeblockRound(sum, 3), n0)
+                if n == 14 {
+                    a4 := t.a4; a5 := t.a5; a6 := t.a6
+                    wide := Simd.AndNot(flat, DeblockBoth(Simd.Or(Simd.Or(DeblockApart(a4, a0, one), DeblockApart(a5, a0, one)),
+                        DeblockApart(a6, a0, one))))
+                    if !Simd.AllZero(wide) {
+                        // op5 = 7p6 + 2p5 + 2p4 + p3 + p2 + p1 + p0 + q0 over 16,
+                        // then each output trades p6 and one more p tap for the
+                        // next q tap.
+                        b3 := DeblockSwap(a3); b4 := DeblockSwap(a4); b5 := DeblockSwap(a5)
+                        sum = Simd.Add(Simd.Sub(Simd.ShiftLeft(a6, 3), a6), Simd.ShiftLeft(Simd.Add(a5, a4), 1))
+                        sum = Simd.Add(sum, Simd.Add(Simd.Add(a3, a2), Simd.Add(Simd.Add(a1, a0), b0)))
+                        t.a5 = Simd.Select(wide, DeblockRound(sum, 4), a5)
+                        sum = Simd.Add(Simd.Sub(sum, Simd.ShiftLeft(a6, 1)), Simd.Add(a3, b1))
+                        t.a4 = Simd.Select(wide, DeblockRound(sum, 4), a4)
+                        sum = Simd.Add(Simd.Sub(sum, Simd.Add(a6, a5)), Simd.Add(a2, b2))
+                        t.a3 = Simd.Select(wide, DeblockRound(sum, 4), a3)
+                        sum = Simd.Add(Simd.Sub(sum, Simd.Add(a6, a4)), Simd.Add(a1, b3))
+                        n2 = Simd.Select(wide, DeblockRound(sum, 4), n2)
+                        sum = Simd.Add(Simd.Sub(sum, Simd.Add(a6, a3)), Simd.Add(a0, b4))
+                        n1 = Simd.Select(wide, DeblockRound(sum, 4), n1)
+                        sum = Simd.Add(Simd.Sub(sum, Simd.Add(a6, a2)), Simd.Add(b0, b5))
+                        n0 = Simd.Select(wide, DeblockRound(sum, 4), n0)
+                    }
+                }
+                t.a2 = Simd.Select(off, a2, n2)
+            }
+        }
+    }
+    t.a0 = Simd.Select(off, a0, n0); t.a1 = Simd.Select(off, a1, n1)
+    return true
+}
+
+// FilterDeblockLines for one filter length, constant at every call.
+DeblockSegment :: (samples: []u16, at: s64, line_step: s64, tap_step: s64, n: s32,
+    block_limit: s32, limit: s32, hev_threshold: s32, bit_depth: s32) -> DecodeError #inline {
+    t: DeblockTaps
+    DeblockLoad(*t, samples, at, line_step, tap_step, n)
+    any := Simd.Or(t.a0, t.a1)
+    if n >= 6 { any = Simd.Or(any, t.a2) }
+    if n >= 8 { any = Simd.Or(any, t.a3) }
+    if n == 14 { any = Simd.Or(any, Simd.Or(t.a4, Simd.Or(t.a5, t.a6))) }
+    if !Simd.AllZero(Simd.ShiftRight(Simd.Reinterpret(u16x8, any), cast(u32)bit_depth)) { return Error(InvalidInput) }
+    if DeblockFilter(*t, n, block_limit, limit, hev_threshold, bit_depth) {
+        DeblockStore(*t, samples, at, line_step, tap_step, n)
+    }
+    return Error(DecodeOK)
+}
+
+#scope_export
+// FilterDeblockEdge on the four lines of an edge segment at once. Tap k
+// (0..15 for p7..q7) of line l is samples[at + l * line_step + (k - 8) * tap_step],
+// so at is line 0's q0. Only the filter_length samples around
+// the edge are read, and only samples read are written. Every line gives
+// FilterDeblockEdge's samples; any invalid argument or sample above the depth
+// returns InvalidInput with nothing written.
+FilterDeblockLines :: (samples: []u16, at: s64, line_step: s64, tap_step: s64, filter_length: s32,
+    block_limit: s32, limit: s32, hev_threshold: s32, bit_depth: s32) -> DecodeError #target {
     if (filter_length != 4 && filter_length != 6 && filter_length != 8 && filter_length != 14) ||
         block_limit < 0 || block_limit > 255 || limit < 0 || limit > 255 || hev_threshold < 0 || hev_threshold > 255 ||
-        (bit_depth != 8 && bit_depth != 10 && bit_depth != 12) || line_step < 1 || tap_step < 1 || line_step > samples.count ||
-        tap_step > samples.count {
+        (bit_depth != 8 && bit_depth != 10 && bit_depth != 12) ||
+        line_step < 1 || tap_step < 1 || line_step > samples.count || tap_step > samples.count {
         return Error(InvalidInput)
     }
     half := cast(s64)(filter_length / 2)
     if at < half * tap_step || at + 3 * line_step + (half - 1) * tap_step >= samples.count { return Error(InvalidInput) }
-    maximum := cast(s32)((cast(u32)1 << cast(u32)bit_depth) - 1)
-    top := Simd.Splat(s32x4, maximum)
-    x := *scratch.x; y := *scratch.y
-    above := Simd.Zero(s32x4)
-    for k: 8 - half..7 + half {
-        v := DeblockLoad(samples, at + (k - 8) * tap_step, line_step)
-        x.v[k & 15] = v
-        above = Simd.Or(above, Simd.Greater(v, top))
-    }
-    if !Simd.AllZero(above) { return Error(InvalidInput) }
-    scale := cast(s32)(cast(u32)1 << cast(u32)(bit_depth - 8))
-    p0 := x.v[7]; q0 := x.v[8]; p1 := x.v[6]; q1 := x.v[9]
-    hev_bound := Simd.Splat(s32x4, hev_threshold * scale)
-    high_variance := Simd.Or(DeblockApart(p1, p0, hev_bound), DeblockApart(q1, q0, hev_bound))
-    edge := Simd.Add(Simd.ShiftLeft(Simd.Abs(Simd.Sub(p0, q0)), 1), Simd.ShiftRight(Simd.Abs(Simd.Sub(p1, q1)), 1))
-    disabled := Simd.Greater(edge, Simd.Splat(s32x4, block_limit * scale))
-    extent: s64 = 1
-    if filter_length == 6 { extent = 2 }; if filter_length >= 8 { extent = 3 }
-    step_bound := Simd.Splat(s32x4, limit * scale); flat_bound := Simd.Splat(s32x4, scale)
-    rough := Simd.Zero(s32x4)
-    for i: 1..extent {
-        disabled = Simd.Or(disabled, Simd.Or(DeblockApart(x.v[(7 - i) & 15], x.v[(8 - i) & 15], step_bound),
-            DeblockApart(x.v[(8 + i) & 15], x.v[(7 + i) & 15], step_bound)))
-        rough = Simd.Or(rough, Simd.Or(DeblockApart(x.v[(7 - i) & 15], p0, flat_bound), DeblockApart(x.v[(8 + i) & 15], q0, flat_bound)))
-    }
-    if Simd.AllZero(Simd.Not(disabled)) { return Error(DecodeOK) }
-    // The narrow filter, on samples centred at zero.
-    middle := Simd.Splat(s32x4, (maximum + 1) / 2)
-    low := Simd.Splat(s32x4, -((maximum + 1) / 2)); high := Simd.Splat(s32x4, (maximum + 1) / 2 - 1)
-    ps1 := Simd.Sub(p1, middle); ps0 := Simd.Sub(p0, middle); qs0 := Simd.Sub(q0, middle); qs1 := Simd.Sub(q1, middle)
-    filter := Simd.And(high_variance, DeblockClampLanes(Simd.Sub(ps1, qs1), low, high))
-    difference := Simd.Sub(qs0, ps0)
-    filter = DeblockClampLanes(Simd.Add(filter, Simd.Add(Simd.ShiftLeft(difference, 1), difference)), low, high)
-    filter1 := Simd.ShiftRight(DeblockClampLanes(Simd.Add(filter, Simd.Splat(s32x4, 4)), low, high), 3)
-    filter2 := Simd.ShiftRight(DeblockClampLanes(Simd.Add(filter, Simd.Splat(s32x4, 3)), low, high), 3)
-    outer := Simd.ShiftRight(Simd.Add(filter1, Simd.Splat(s32x4, 1)), 1)
-    // The taps the filter length can change, from x unless filtered below.
-    changed: s64 = ifx filter_length == 14 then 6 else ifx filter_length == 8 then 3 else 2
-    for k: 8 - changed..7 + changed { y.v[k & 15] = x.v[k & 15] }
-    y.v[8] = Simd.Add(DeblockClampLanes(Simd.Sub(qs0, filter1), low, high), middle)
-    y.v[7] = Simd.Add(DeblockClampLanes(Simd.Add(ps0, filter2), low, high), middle)
-    y.v[9] = Simd.Select(high_variance, q1, Simd.Add(DeblockClampLanes(Simd.Sub(qs1, outer), low, high), middle))
-    y.v[6] = Simd.Select(high_variance, p1, Simd.Add(DeblockClampLanes(Simd.Add(ps1, outer), low, high), middle))
-    if filter_length != 4 {
-        flat := Simd.Not(rough)
-        n: s64 = ifx filter_length == 6 then 2 else 3
-        if !Simd.AllZero(flat) {
-            short := *scratch.flat
-            DeblockFlat(x, short, n, ifx filter_length == 6 then 1 else 0, 3)
-            for k: 8 - n..7 + n { y.v[k & 15] = Simd.Select(flat, short.v[k & 15], y.v[k & 15]) }
-        }
-        if filter_length == 14 {
-            wide := flat
-            for i: 4..6 {
-                wide = Simd.AndNot(wide, Simd.Or(DeblockApart(x.v[(7 - i) & 15], p0, flat_bound), DeblockApart(x.v[(8 + i) & 15], q0, flat_bound)))
-            }
-            if !Simd.AllZero(wide) {
-                long := *scratch.flat
-                DeblockFlat(x, long, 6, 1, 4)
-                for k: 2..13 { y.v[k & 15] = Simd.Select(wide, long.v[k & 15], y.v[k & 15]) }
-            }
-        }
-    }
-    for k: 8 - changed..7 + changed {
-        DeblockStore(samples, at + (k - 8) * tap_step, line_step, Simd.Select(disabled, x.v[k & 15], y.v[k & 15]))
-    }
-    return Error(DecodeOK)
+    if filter_length == 4 { return DeblockSegment(samples, at, line_step, tap_step, 4, block_limit, limit, hev_threshold, bit_depth) }
+    if filter_length == 6 { return DeblockSegment(samples, at, line_step, tap_step, 6, block_limit, limit, hev_threshold, bit_depth) }
+    if filter_length == 8 { return DeblockSegment(samples, at, line_step, tap_step, 8, block_limit, limit, hev_threshold, bit_depth) }
+    return DeblockSegment(samples, at, line_step, tap_step, 14, block_limit, limit, hev_threshold, bit_depth)
 }

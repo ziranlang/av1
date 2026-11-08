@@ -190,7 +190,7 @@ def main():
         machine=dict(cpu=next((line.split(':', 1)[1].strip() for line in open('/proc/cpuinfo') if line.startswith('model name')), ''),
             kernel=platform.release(), pinned_cpu=a.cpu or None, compiler=version(cc + ['--version'])),
         authored=dict(form='generated C', cflags=' '.join(cflags), threads=1,
-            simd='std/simd vectors, SSE2 to AVX2 chosen at run time'),
+            simd='std/simd vectors, SSE2 to AVX2 chosen at run time; typed assembly for the 8x8 inverse DCT'),
         libaom=dict(revision=PIN, threads=1, simd='runtime CPU detection (AVX2 and below on x86-64)'),
         dav1d=dict(revision=run(['git', '-C', str(a.dav1d_source), 'rev-parse', 'HEAD'], text=True,
             capture_output=True).stdout.strip(), threads=1, max_frame_delay=1, simd='runtime CPU detection'),
@@ -199,8 +199,8 @@ def main():
             'allocation calls counted through malloc/calloc/realloc/posix_memalign wrappers for one decode',
         bit_exact=True, corpus=rows,
         limits=['single machine and single thread', 'synthetic libaom-encoded KEY frames only', 'warm cache',
-            'no energy, RSS or cold-start measurement', 'authored SIMD covers CDEF, inverse transforms, deblocking and self-guided restoration; '
-            'libaom and dav1d use their hand-written assembly'])
+            'no energy, RSS or cold-start measurement', 'authored SIMD covers CDEF, inverse transforms, deblocking, self-guided restoration, '
+            'simple intra prediction and CfL; authored assembly covers the 8x8 inverse DCT; libaom and dav1d use their hand-written assembly'])
     (a.out / 'receipt.json').write_text(json.dumps(receipt, indent=2) + '\n')
 
 

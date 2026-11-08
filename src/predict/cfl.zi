@@ -1,11 +1,12 @@
 #import, file "./intra_predict.zi";
 using Codec :: #import "image_codec/api"
+Simd :: #import "std/simd"
 
 // AV1 7.11.5 for any CfL transform size (4..32 per side). chroma holds the DC
 // prediction and is updated in place; luma starts at the co-located luma
 // sample (startX << subsampling_x, startY << subsampling_y), and luma_width /
-// luma_height are MaxLumaW / MaxLumaH relative to that origin. Validation and
-// all reads finish before the first write, so failure changes nothing.
+// luma_height are MaxLumaW / MaxLumaH relative to that origin. Every read is
+// validated before the first write, so failure changes nothing.
 ApplyCfl :: (chroma: []u16, chroma_stride: s32, luma: []u16, luma_stride: s32,
     width: s32, height: s32, subsampling_x: s32, subsampling_y: s32,
     luma_width: s32, luma_height: s32, alpha: s32, bit_depth: s32,
@@ -24,41 +25,109 @@ ApplyCfl :: (chroma: []u16, chroma_stride: s32, luma: []u16, luma_stride: s32,
         return Error(InvalidInput)
     }
     maximum := cast(s32)((cast(u32)1 << cast(u32)bit_depth) - 1)
-    values: [1024]s32
-    sum: s32
-    scale := 3 - subsampling_x - subsampling_y
-    for i: 0..cast(s64)height - 1 {
-        luma_y := cast(s32)i << subsampling_y
-        if luma_y > luma_height - step_y { luma_y = luma_height - step_y }
-        for j: 0..cast(s64)width - 1 {
-            luma_x := cast(s32)j << subsampling_x
-            if luma_x > luma_width - step_x { luma_x = luma_width - step_x }
-            total: s32
-            for dy: 0..cast(s64)subsampling_y {
-                line := (cast(s64)luma_y + dy) * luma_stride + luma_x
-                for dx: 0..cast(s64)subsampling_x {
-                    sample := cast(s32)luma[line + dx]
-                    if sample > maximum { return Error(InvalidInput) }
-                    total += sample
-                }
-            }
-            value := total << scale
-            values[i * width + j] = value; sum += value
-        }
-        for j: 0..cast(s64)width - 1 { if chroma[i * chroma_stride + j] > maximum { return Error(InvalidInput) } }
+    // Every luma sample a value reads, and every chroma sample.
+    read_width := ifx luma_width < (width << subsampling_x) then luma_width else width << subsampling_x
+    read_height := ifx luma_height < (height << subsampling_y) then luma_height else height << subsampling_y
+    if !CflSamplesAtMost(luma, luma_stride, read_width, read_height, maximum) ||
+        !CflSamplesAtMost(chroma, chroma_stride, width, height, maximum) {
+        return Error(InvalidInput)
     }
     bits := IntraLog2(width) + IntraLog2(height)
+    // Without padding the luma rows are read on vectors.
+    if luma_width >= (width << subsampling_x) && luma_height >= (height << subsampling_y) {
+        sum := CflSumRows(luma, luma_stride, width, height, subsampling_x, subsampling_y)
+        average := (sum + cast(s32)(cast(u32)1 << cast(u32)(bits - 1))) >> bits
+        CflAddRows(chroma, chroma_stride, luma, luma_stride, width, height, subsampling_x, subsampling_y,
+            average, alpha, maximum)
+        return Error(DecodeOK)
+    }
+    sum: s32
+    for i: 0..cast(s64)height - 1 {
+        for j: 0..cast(s64)width - 1 {
+            sum += CflValue(luma, luma_stride, cast(s32)i, cast(s32)j, subsampling_x, subsampling_y, luma_width, luma_height)
+        }
+    }
     average := (sum + cast(s32)(cast(u32)1 << cast(u32)(bits - 1))) >> bits
     for i: 0..cast(s64)height - 1 {
         line := i * chroma_stride
         for j: 0..cast(s64)width - 1 {
-            product := alpha * (values[i * width + j] - average)
+            value := CflValue(luma, luma_stride, cast(s32)i, cast(s32)j, subsampling_x, subsampling_y, luma_width, luma_height)
+            product := alpha * (value - average)
             scaled := ifx product >= 0 then (product + 32) >> 6 else -((-product + 32) >> 6)
-            value := cast(s32)chroma[line + j] + scaled
-            if value < 0 { value = 0 }
-            if value > maximum { value = maximum }
-            chroma[line + j] = cast(u16)value
+            sample := cast(s32)chroma[line + j] + scaled
+            if sample < 0 { sample = 0 }
+            if sample > maximum { sample = maximum }
+            chroma[line + j] = cast(u16)sample
         }
     }
     return Error(DecodeOK)
+}
+
+// The scaled luma average at chroma (i, j), clamped to the last full
+// subsampled position as 7.11.5 pads.
+CflValue :: (luma: []u16, luma_stride: s32, i: s32, j: s32, subsampling_x: s32, subsampling_y: s32,
+    luma_width: s32, luma_height: s32) -> s32 {
+    step_x := cast(s32)1 << subsampling_x; step_y := cast(s32)1 << subsampling_y
+    luma_y := i << subsampling_y; if luma_y > luma_height - step_y { luma_y = luma_height - step_y }
+    luma_x := j << subsampling_x; if luma_x > luma_width - step_x { luma_x = luma_width - step_x }
+    total: s32
+    for dy: 0..cast(s64)subsampling_y {
+        line := (cast(s64)luma_y + dy) * luma_stride + luma_x
+        for dx: 0..cast(s64)subsampling_x { total += cast(s32)luma[line + dx] }
+    }
+    return total << (3 - subsampling_x - subsampling_y)
+}
+
+// Whether every sample of a width x height block is at most maximum.
+CflSamplesAtMost :: (samples: []u16, stride: s32, width: s32, height: s32, maximum: s32) -> bool #target {
+    peak := Simd.Zero(u16x8); highest: u16
+    for i: 0..cast(s64)height - 1 {
+        line := i * stride
+        j: s64 = 0
+        while j + 8 <= cast(s64)width { peak = Simd.Max(peak, Simd.Load(u16x8, samples, line + j)); j += 8 }
+        while j < cast(s64)width { if samples[line + j] > highest { highest = samples[line + j] }; j += 1 }
+    }
+    return cast(s32)Simd.ReduceMax(peak) <= maximum && cast(s32)highest <= maximum
+}
+
+// Four scaled luma averages from chroma row i, columns j..j+3, without padding.
+CflValues :: (luma: []u16, luma_stride: s32, i: s64, j: s64, subsampling_x: s32, subsampling_y: s32) -> s32x4 #inline {
+    line := (i << cast(u32)subsampling_y) * luma_stride
+    values: u32x4
+    if subsampling_x == 1 {
+        values = Simd.AddPairs(Simd.Load(u16x8, luma, line + 2 * j))
+        if subsampling_y == 1 { values = Simd.Add(values, Simd.AddPairs(Simd.Load(u16x8, luma, line + luma_stride + 2 * j))) }
+    } else {
+        values = Simd.WidenLow(Simd.LoadLow(u16x8, luma, line + j))
+        if subsampling_y == 1 { values = Simd.Add(values, Simd.WidenLow(Simd.LoadLow(u16x8, luma, line + luma_stride + j))) }
+    }
+    return Simd.ShiftLeft(Simd.Reinterpret(s32x4, values), cast(u32)(3 - subsampling_x - subsampling_y))
+}
+
+CflSumRows :: (luma: []u16, luma_stride: s32, width: s32, height: s32, subsampling_x: s32, subsampling_y: s32) -> s32 #target {
+    total := Simd.Zero(s32x4)
+    for i: 0..cast(s64)height - 1 {
+        j: s64 = 0
+        while j < cast(s64)width { total = Simd.Add(total, CflValues(luma, luma_stride, i, j, subsampling_x, subsampling_y)); j += 4 }
+    }
+    return Simd.ReduceAdd(total)
+}
+
+CflAddRows :: (chroma: []u16, chroma_stride: s32, luma: []u16, luma_stride: s32, width: s32, height: s32,
+    subsampling_x: s32, subsampling_y: s32, average: s32, alpha: s32, maximum: s32) #target {
+    centre := Simd.Splat(s32x4, average); scale := Simd.Splat(s32x4, alpha)
+    rounding := Simd.Splat(s32x4, 32); top := Simd.Splat(s32x4, maximum)
+    for i: 0..cast(s64)height - 1 {
+        line := i * chroma_stride
+        j: s64 = 0
+        while j < cast(s64)width {
+            product := Simd.Mul(scale, Simd.Sub(CflValues(luma, luma_stride, i, j, subsampling_x, subsampling_y), centre))
+            // Round half away from zero: the magnitude rounds, then takes the sign back.
+            scaled := Simd.Sign(Simd.ShiftRight(Simd.Add(Simd.Abs(product), rounding), 6), product)
+            sample := Simd.Add(Simd.Reinterpret(s32x4, Simd.WidenLow(Simd.LoadLow(u16x8, chroma, line + j))), scaled)
+            sample = Simd.Min(sample, top)
+            Simd.StoreLow(chroma, line + j, Simd.Narrow(u16x8, sample, sample))
+            j += 4
+        }
+    }
 }

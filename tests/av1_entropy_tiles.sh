@@ -21,6 +21,7 @@ CFLAGS='-O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer' LDFLAGS='-f
 ASAN_OPTIONS=detect_leaks=1 UBSAN_OPTIONS=halt_on_error=1 "$out/sanitized/av1_entropy_tiles"
 printf '%s\n' 'AV1 tile group framing/cancellation: source/saved C/Go + direct VM + ASan/UBSan passed; entropy decode pending'
 sh tests/av1_coefficient_scan.sh
+sh tests/av1_coefficient_symbols.sh
 sh tests/av1_coefficient_context.sh
 sh tests/av1_coefficient_cdfs.sh
 sh tests/av1_coefficient_block.sh

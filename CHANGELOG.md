@@ -24,3 +24,6 @@
 - Faster coefficient signs, dequantization, intra edges and range decoding.
 - Faster post filters, output rows and recursive intra prediction.
 - Faster coefficient decoding with dequantization folded in, coefficient-box inverse transforms, and SIMD recursive intra prediction and CDEF direction search.
+- Faster 8x8 inverse transforms with assembly, and CDEF, intra prediction and CfL on SIMD vectors.
+- Packed 8-bit and 10-bit inverse transforms in frame reconstruction, direct packed deblocking, and reused SIMD restoration halos.
+- Packed coefficient contexts and direct small-alphabet entropy decoding.

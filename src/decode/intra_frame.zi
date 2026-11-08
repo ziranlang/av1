@@ -105,8 +105,7 @@ IntraTile :: struct {
     quant: [1024]s32;
     coefficient_scratch: CoefficientScratch;
     dequant: [4096]s32;
-    transform: TransformScratch;
-    cfl_luma: [4096]u16;
+    transform: ReconstructionScratch;
     cancellation: *Cancellation;
 }
 

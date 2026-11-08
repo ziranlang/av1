@@ -92,20 +92,10 @@ DecodeSymbol :: (decoder: *RangeDecoder, cdf: []u16) -> s32 {
     if cdf.count < 3 || cdf.count > 17 { decoder.error = Error(InvalidInput, RangeByte(decoder)); return 0 }
     if !RangeReady(decoder) { return 0 }
     n := cast(s32)cdf.count - 1
-    value := cast(u32)(decoder.window >> 48)
-    cur := decoder.range
-    prev: u32
-    symbol: s32
-    while symbol < n {
-        prev = cur
-        f := 32768 - cast(u32)cdf[symbol]
-        cur = ((decoder.range >> 8) * (f >> 6)) >> 1
-        cur += cast(u32)(4 * (n - symbol - 1))
-        if value >= cur { break }
-        symbol += 1
-    }
-    decoder.range = prev - cur; decoder.window -= cast(u64)cur << 48
-    RangeRenormalize(decoder)
+    if n == 2 { return RangeSymbol2(decoder, cdf, true) }
+    if n == 3 { return RangeSymbol3(decoder, cdf, true) }
+    if n == 4 { return RangeSymbol4(decoder, cdf, true) }
+    symbol := RangeDecodeN(decoder, cdf, n)
     if decoder.error.code != DecodeOK { return 0 }
     if !decoder.disable_cdf_update { AdaptCdf(cdf, n, symbol) }
     return symbol
@@ -113,19 +103,142 @@ DecodeSymbol :: (decoder: *RangeDecoder, cdf: []u16) -> s32 {
 
 // The adaptation of 8.2.6 after decoding symbol from the n-symbol cdf.
 AdaptCdf :: (cdf: []u16, n: s32, symbol: s32) {
-    if n < 0 || cast(s64)n >= cdf.count { return }
-    rate: s32 = 3
-    if cdf[n] > 15 { rate += 1 }
-    if cdf[n] > 31 { rate += 1 }
-    rate += ifx n < 4 then 1 else 2
-    i: s32
-    while i < n - 1 {
-        current := cast(u32)cdf[i]
-        if i < symbol { current -= current >> cast(u32)rate }
-        else { current += (32768 - current) >> cast(u32)rate }
-        cdf[i] = cast(u16)current; i += 1
-    }
+    if n < 2 || n > 16 || cast(s64)n >= cdf.count { return }
+    rate := AdaptRate(cdf[n], ifx n < 4 then 4 else 5)
+    for i: 0..n - 2 { cdf[i] = AdaptCell(cdf[i], i < symbol, rate) }
     if cdf[n] < 32 { cdf[n] += 1 }
+}
+
+// The adaptation rate of 8.2.6 from a cdf's counter: base is 4 for two or
+// three symbols and 5 for more.
+AdaptRate :: (counter: u16, base: u32) -> u32 #inline {
+    return base + (ifx counter > 15 then 1 else 0) + (ifx counter > 31 then 1 else 0)
+}
+
+// One adapted probability: those below the decoded symbol fall, the others
+// rise. Both sides are computed, so no branch depends on the symbol.
+AdaptCell :: (value: u16, below: bool, rate: u32) -> u16 #inline {
+    current := cast(u32)value
+    down := current - (current >> rate); up := current + ((32768 - current) >> rate)
+    return cast(u16)(ifx below then down else up)
+}
+
+// The lower bound of a symbol within the range: its probability cdf_value
+// and rest, the count of symbols after it, as 8.2.6 computes it from r8, the
+// range shifted right by 8.
+SymbolBound :: (r8: u32, cdf_value: u16, rest: s32) -> u32 #inline {
+    return ((r8 * ((32768 - cast(u32)cdf_value) >> 6)) >> 1) + 4 * cast(u32)rest
+}
+
+// Narrows the range to the decoded symbol's [low, high) and renormalizes.
+RangeTake :: (decoder: *RangeDecoder, high: u32, low: u32) #inline {
+    decoder.range = high - low; decoder.window -= cast(u64)low << 48
+    RangeRenormalize(decoder)
+}
+
+// Larger CDFs use a descending-bound walk, stopping at the decoded symbol.
+// Computing every bound slows palette-heavy streams; the small coefficient
+// CDFs below instead compare their fixed two or three bounds directly.
+RangeDecodeN :: (decoder: *RangeDecoder, cdf: []u16, n: s32) -> s32 #inline {
+    if n < 2 || n > 16 || cast(s64)n >= cdf.count { decoder.error = Error(InvalidInput, RangeByte(decoder)); return 0 }
+    r8 := decoder.range >> 8
+    value := cast(u32)(decoder.window >> 48)
+    high := decoder.range
+    low: u32
+    symbol: s32
+    while symbol < n {
+        low = SymbolBound(r8, cdf[symbol], n - 1 - symbol)
+        if value >= low { break }
+        high = low; symbol += 1
+    }
+    RangeTake(decoder, high, low)
+    return symbol
+}
+
+// Symbols of decoder-owned CDFs within a coefficient block, with
+// adaptation. The caller checks RangeReady once for its block. They neither
+// validate the state nor stop at an error: past a truncation they decode the
+// padding while RangeRenormalize records the error, so the caller checks
+// decoder.error before it uses any result, and the bounded block syntax ends.
+// checked retains ReadSymbol's stop-before-adaptation behavior on error;
+// block readers leave it false and discard their CDF state after any error.
+
+// Two symbols: cdf holds one probability and the counter.
+RangeSymbol2 :: (decoder: *RangeDecoder, cdf: []u16, checked: bool = false) -> s32 #inline {
+    if cdf.count != 3 { decoder.error = Error(InvalidInput, RangeByte(decoder)); return 0 }
+    b0 := SymbolBound(decoder.range >> 8, cdf[0], 1)
+    one := cast(u32)(decoder.window >> 48) < b0
+    RangeTake(decoder, ifx one then b0 else decoder.range, ifx one then 0 else b0)
+    if checked && decoder.error.code != DecodeOK { return 0 }
+    if !decoder.disable_cdf_update {
+        rate := AdaptRate(cdf[2], 4)
+        cdf[0] = AdaptCell(cdf[0], one, rate)
+        if cdf[2] < 32 { cdf[2] += 1 }
+    }
+    return ifx one then 1 else 0
+}
+
+// Three symbols: two probabilities and the counter.
+RangeSymbol3 :: (decoder: *RangeDecoder, cdf: []u16, checked: bool = false) -> s32 #inline {
+    if cdf.count != 4 { decoder.error = Error(InvalidInput, RangeByte(decoder)); return 0 }
+    r8 := decoder.range >> 8
+    value := cast(u32)(decoder.window >> 48)
+    b0 := SymbolBound(r8, cdf[0], 2); b1 := SymbolBound(r8, cdf[1], 1)
+    above0 := value < b0; above1 := value < b1
+    high := ifx above1 then b1 else ifx above0 then b0 else decoder.range
+    low := ifx above1 then 0 else ifx above0 then b1 else b0
+    RangeTake(decoder, high, low)
+    if checked && decoder.error.code != DecodeOK { return 0 }
+    symbol: s32 = (ifx above0 then 1 else 0) + (ifx above1 then 1 else 0)
+    if !decoder.disable_cdf_update {
+        rate := AdaptRate(cdf[3], 4)
+        cdf[0] = AdaptCell(cdf[0], above0, rate); cdf[1] = AdaptCell(cdf[1], above1, rate)
+        if cdf[3] < 32 { cdf[3] += 1 }
+    }
+    return symbol
+}
+
+// Four symbols: three probabilities and the counter.
+RangeSymbol4 :: (decoder: *RangeDecoder, cdf: []u16, checked: bool = false) -> s32 #inline {
+    if cdf.count != 5 { decoder.error = Error(InvalidInput, RangeByte(decoder)); return 0 }
+    r8 := decoder.range >> 8
+    value := cast(u32)(decoder.window >> 48)
+    b0 := SymbolBound(r8, cdf[0], 3); b1 := SymbolBound(r8, cdf[1], 2); b2 := SymbolBound(r8, cdf[2], 1)
+    above0 := value < b0; above1 := value < b1; above2 := value < b2
+    high := ifx above2 then b2 else ifx above1 then b1 else ifx above0 then b0 else decoder.range
+    low := ifx above2 then 0 else ifx above1 then b2 else ifx above0 then b1 else b0
+    RangeTake(decoder, high, low)
+    if checked && decoder.error.code != DecodeOK { return 0 }
+    symbol: s32 = (ifx above0 then 1 else 0) + (ifx above1 then 1 else 0) + (ifx above2 then 1 else 0)
+    if !decoder.disable_cdf_update {
+        rate := AdaptRate(cdf[4], 5)
+        cdf[0] = AdaptCell(cdf[0], above0, rate); cdf[1] = AdaptCell(cdf[1], above1, rate)
+        cdf[2] = AdaptCell(cdf[2], above2, rate)
+        if cdf[4] < 32 { cdf[4] += 1 }
+    }
+    return symbol
+}
+
+// An n-symbol cdf, 2 <= n <= 16, with adaptation.
+RangeSymbolN :: (decoder: *RangeDecoder, cdf: []u16, n: s32) -> s32 #inline {
+    symbol := RangeDecodeN(decoder, cdf, n)
+    if !decoder.disable_cdf_update { AdaptCdf(cdf, n, symbol) }
+    return symbol
+}
+
+// The fixed CDF {16384, 32768}, as ReadBool.
+RangeBit :: (decoder: *RangeDecoder) -> u32 #inline {
+    cur := ((decoder.range >> 8) << 7) + 4
+    one := cast(u32)(decoder.window >> 48) < cur
+    RangeTake(decoder, ifx one then cur else decoder.range, ifx one then 0 else cur)
+    return ifx one then 1 else 0
+}
+
+// count bits of RangeBit, most significant first, 0 <= count <= 32.
+RangeBits :: (decoder: *RangeDecoder, count: s32) -> u32 {
+    value: u32
+    for i: 1..count { value = (value << 1) | RangeBit(decoder) }
+    return value
 }
 
 // Valid state before a symbol; otherwise records the error.
@@ -139,11 +252,10 @@ RangeReady :: (decoder: *RangeDecoder) -> bool {
 }
 
 // AV1 8.2.6 renormalization after the range shrank to the decoded symbol.
-RangeRenormalize :: (decoder: *RangeDecoder) {
+// No shift reads nothing and leaves the value, so it needs no branch.
+RangeRenormalize :: (decoder: *RangeDecoder) #inline {
     // The range is below 65536, so its leading zeros past 16 are the shift.
     shifts := cast(s32)clz(decoder.range) - 16
-    // No shift reads nothing and leaves the value: the state stays valid.
-    if shifts == 0 { return }
     decoder.range <<= cast(u32)shifts
     // A symbol starts with at least 15 bits below the value, and a shift is at
     // most 15.
@@ -158,11 +270,7 @@ RangeRenormalize :: (decoder: *RangeDecoder) {
 ReadBool :: (decoder: *RangeDecoder) -> u32 {
     if decoder.error.code != DecodeOK { return 0 }
     if !RangeReady(decoder) { return 0 }
-    cur := ((decoder.range >> 8) << 7) + 4
-    symbol: u32
-    if cast(u32)(decoder.window >> 48) >= cur { decoder.range -= cur; decoder.window -= cast(u64)cur << 48 }
-    else { decoder.range = cur; symbol = 1 }
-    RangeRenormalize(decoder)
+    symbol := RangeBit(decoder)
     if decoder.error.code != DecodeOK { return 0 }
     return symbol
 }

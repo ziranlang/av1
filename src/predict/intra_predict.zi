@@ -54,12 +54,14 @@ IntraFloorShift :: (value: s32, bits: s32) -> s32 {
     return -((-value + cast(s32)(cast(u32)1 << cast(u32)bits) - 1) >> bits)
 }
 
+// Dr_Intra_Derivative by angle 0..89.
+IntraDerivatives :: s16.[0,0,0,1023,0,0,547,0,0,372,0,0,0,0,273,0,0,215,0,0,178,0,0,151,0,0,132,0,0,116,
+    0,0,102,0,0,0,90,0,0,80,0,0,71,0,0,64,0,0,57,0,0,51,0,0,45,0,0,0,40,0,0,35,0,0,31,0,0,27,0,0,
+    23,0,0,19,0,0,15,0,0,0,0,11,0,0,7,0,0,3,0,0]
+
 IntraDerivative :: (angle: s32) -> s32 {
-    table: [90]s16 = .[0,0,0,1023,0,0,547,0,0,372,0,0,0,0,273,0,0,215,0,0,178,0,0,151,0,0,132,0,0,116,
-        0,0,102,0,0,0,90,0,0,80,0,0,71,0,0,64,0,0,57,0,0,51,0,0,45,0,0,0,40,0,0,35,0,0,31,0,0,27,0,0,
-        23,0,0,19,0,0,15,0,0,0,0,11,0,0,7,0,0,3,0,0]
     if angle < 0 || angle > 89 { return 0 }
-    return cast(s32)table[angle]
+    return cast(s32)IntraDerivatives[angle]
 }
 
 // Smooth weights for sizes 4, 8, 16, 32 and 64; size n starts at n - 4.
@@ -72,7 +74,9 @@ IntraSmoothWeights :: u8.[
     255,248,240,233,225,218,210,203,196,189,182,176,169,163,156,
     150,144,138,133,127,121,116,111,106,101,96,91,86,82,77,73,69,
     65,61,57,54,50,47,44,41,38,35,32,29,27,25,22,20,18,16,15,
-    13,12,10,9,8,7,6,6,5,5,4,4,4]
+    13,12,10,9,8,7,6,6,5,5,4,4,4,
+    // Padding for vector loads of the last four weights.
+    0,0,0,0,0,0,0,0]
 
 // Intra_Filter_Taps[mode][output (i1 << 2) + j1][neighbor 0..6].
 IntraFilterTaps :: s8.[
@@ -118,7 +122,7 @@ IntraFilterTapPairs :: s16.[
 // are zero, so it holds no block's edges.
 BuildIntraEdges :: (edges: *IntraEdges, plane: []u16, stride: s32, x: s32, y: s32,
     width: s32, height: s32, max_x: s32, max_y: s32, have_above: bool, have_left: bool,
-    have_above_right: bool, have_below_left: bool, bit_depth: s32) -> DecodeError {
+    have_above_right: bool, have_below_left: bool, bit_depth: s32) -> DecodeError #target {
     if edges == null || !IntraSizeValid(width, height) || !IntraDepthValid(bit_depth) ||
         stride < 1 || max_x < 0 || max_y < 0 || max_x >= stride || x < 0 || x > max_x || y < 0 || y > max_y ||
         (have_above && y == 0) || (have_left && x == 0) ||
@@ -136,11 +140,27 @@ BuildIntraEdges :: (edges: *IntraEdges, plane: []u16, stride: s32, x: s32, y: s3
     if have_above {
         span := ifx have_above_right then 2 * width else width
         limit := x + span - 1; if limit > max_x { limit = max_x }
-        for i: 0..cast(s64)total - 1 {
-            at := x + cast(s32)i; if at > limit { at = limit }
-            value := cast(s32)plane[row - stride + at]
-            above[IntraEdgeOffset + i] = value; largest = ifx value > largest then value else largest
+        // The first count samples come from the row above, the rest repeat
+        // its last one.
+        count := cast(s64)(limit - x + 1); if count > cast(s64)total { count = cast(s64)total }
+        source := row - stride + x
+        peak := Simd.Zero(u16x8)
+        i: s64 = 0
+        while i + 8 <= count {
+            samples := Simd.Load(u16x8, plane, source + i)
+            peak = Simd.Max(peak, samples)
+            Simd.Store(above, IntraEdgeOffset + i, Simd.Reinterpret(s32x4, Simd.WidenLow(samples)))
+            Simd.Store(above, IntraEdgeOffset + i + 4, Simd.Reinterpret(s32x4, Simd.WidenHigh(samples)))
+            i += 8
         }
+        largest = cast(s32)Simd.ReduceMax(peak)
+        while i < count {
+            value := cast(s32)plane[source + i]
+            above[IntraEdgeOffset + i] = value; largest = ifx value > largest then value else largest
+            i += 1
+        }
+        last := above[IntraEdgeOffset + count - 1]
+        while i < cast(s64)total { above[IntraEdgeOffset + i] = last; i += 1 }
     } else {
         value := ifx have_left then cast(s32)plane[row + x - 1] else midpoint - 1
         largest = value
@@ -267,12 +287,7 @@ PredictIntra :: (out: []u16, stride: s32, edges: *IntraEdges, mode: s32, angle_d
         return Error(InvalidInput)
     }
     maximum := cast(s32)((cast(u32)1 << cast(u32)bit_depth) - 1)
-    total := width + height
-    for i: -1..cast(s64)total - 1 {
-        a := edges.above[IntraEdgeOffset + i]; l := edges.left[IntraEdgeOffset + i]
-        if a < 0 || a > maximum || l < 0 || l > maximum { return Error(InvalidInput) }
-    }
-    if edges.above[IntraEdgeOffset - 1] != edges.left[IntraEdgeOffset - 1] { return Error(InvalidInput) }
+    if !IntraEdgesWithin(edges, width + height, maximum) { return Error(InvalidInput) }
     if filter_mode >= 0 {
         PredictRecursiveIntra(out, stride, edges, filter_mode, maximum)
     } else if mode >= 1 && mode <= 8 {
@@ -287,13 +302,28 @@ PredictIntra :: (out: []u16, stride: s32, edges: *IntraEdges, mode: s32, angle_d
     return Error(DecodeOK)
 }
 
+// Whether both edges hold samples in [0, maximum] at indices -1..total-1,
+// total a multiple of 4, with one shared corner.
+IntraEdgesWithin :: (edges: *IntraEdges, total: s32, maximum: s32) -> bool #target {
+    corner := edges.above[IntraEdgeOffset - 1]
+    if corner != edges.left[IntraEdgeOffset - 1] || corner < 0 || corner > maximum { return false }
+    low := Simd.Splat(s32x4, corner); high := low
+    j: s64 = 0
+    while j + 4 <= cast(s64)total {
+        a := Simd.Load(s32x4, edges.above, IntraEdgeOffset + j); l := Simd.Load(s32x4, edges.left, IntraEdgeOffset + j)
+        low = Simd.Min(low, Simd.Min(a, l)); high = Simd.Max(high, Simd.Max(a, l))
+        j += 4
+    }
+    return Simd.ReduceMin(low) >= 0 && Simd.ReduceMax(high) <= maximum
+}
+
 // AV1 7.11.2.5.
-PredictDCIntra :: (out: []u16, stride: s32, edges: *IntraEdges) {
+PredictDCIntra :: (out: []u16, stride: s32, edges: *IntraEdges) #target {
     width := edges.width; height := edges.height
     value := cast(s32)(cast(u32)1 << cast(u32)(edges.bit_depth - 1))
     sum: s32
-    if edges.have_above { for k: 0..cast(s64)width - 1 { sum += edges.above[IntraEdgeOffset + k] } }
-    if edges.have_left { for k: 0..cast(s64)height - 1 { sum += edges.left[IntraEdgeOffset + k] } }
+    if edges.have_above { sum += IntraEdgeSum(edges.above[:], width) }
+    if edges.have_left { sum += IntraEdgeSum(edges.left[:], height) }
     if edges.have_above && edges.have_left {
         value = (sum + ((width + height) >> 1)) / (width + height)
     } else if edges.have_left {
@@ -301,56 +331,93 @@ PredictDCIntra :: (out: []u16, stride: s32, edges: *IntraEdges) {
     } else if edges.have_above {
         value = (sum + (width >> 1)) >> IntraLog2(width)
     }
-    sample := cast(u16)value
-    for i: 0..cast(s64)height - 1 {
-        line := i * stride
-        for j: 0..cast(s64)width - 1 { out[line + j] = sample }
+    sample := Simd.Splat(u16x8, cast(u16)value)
+    for i: 0..cast(s64)height - 1 { IntraStoreRow(out, i * stride, width, sample) }
+}
+
+// The sum of edge[IntraEdgeOffset..+count), count a multiple of 4.
+IntraEdgeSum :: (edge: []s32, count: s32) -> s32 #inline {
+    total := Simd.Zero(s32x4)
+    j: s64 = 0
+    while j + 4 <= cast(s64)count { total = Simd.Add(total, Simd.Load(s32x4, edge, IntraEdgeOffset + j)); j += 4 }
+    return Simd.ReduceAdd(total)
+}
+
+// Writes the same eight samples across one row of a block 4 to 64 wide.
+IntraStoreRow :: (out: []u16, at: s64, width: s32, row: u16x8) #inline {
+    if width == 4 { Simd.StoreLow(out, at, row); return }
+    j: s64 = 0
+    while j + 8 <= cast(s64)width { Simd.Store(out, at + j, row); j += 8 }
+}
+
+// V_PRED: every row is the above edge.
+PredictVerticalIntra :: (out: []u16, stride: s32, above: []s32, width: s32, height: s32) #target {
+    j: s64 = 0
+    while j < cast(s64)width {
+        row := Simd.Narrow(u16x8, Simd.Load(s32x4, above, IntraEdgeOffset + j), Simd.Load(s32x4, above, IntraEdgeOffset + j + 4))
+        for i: 0..cast(s64)height - 1 {
+            if width == 4 { Simd.StoreLow(out, i * stride + j, row) } else { Simd.Store(out, i * stride + j, row) }
+        }
+        j += 8
     }
 }
 
-// AV1 7.11.2.6.
-PredictSmoothIntra :: (out: []u16, stride: s32, edges: *IntraEdges, mode: s32) {
+// H_PRED: every sample of a row is its left edge sample.
+PredictHorizontalIntra :: (out: []u16, stride: s32, left: []s32, width: s32, height: s32) #target {
+    for i: 0..cast(s64)height - 1 {
+        IntraStoreRow(out, i * stride, width, Simd.Splat(u16x8, cast(u16)left[IntraEdgeOffset + i]))
+    }
+}
+
+// AV1 7.11.2.6, four samples at a time in s32 lanes.
+PredictSmoothIntra :: (out: []u16, stride: s32, edges: *IntraEdges, mode: s32) #target {
     width := edges.width; height := edges.height
-    x_base := width - 4; y_base := height - 4
+    x_base := cast(s64)width - 4; y_base := cast(s64)height - 4
     bottom := edges.left[IntraEdgeOffset + height - 1]
-    right := edges.above[IntraEdgeOffset + width - 1]
+    right := Simd.Splat(s32x4, edges.above[IntraEdgeOffset + width - 1])
+    full := Simd.Splat(s32x4, 256)
+    rounding := Simd.Splat(s32x4, ifx mode == 9 then 256 else 128)
+    shift: u32 = ifx mode == 9 then 9 else 8
     for i: 0..cast(s64)height - 1 {
         line := i * stride
         wy := cast(s32)IntraSmoothWeights[y_base + i]
-        left := edges.left[IntraEdgeOffset + i]
-        for j: 0..cast(s64)width - 1 {
-            wx := cast(s32)IntraSmoothWeights[x_base + j]
-            above := edges.above[IntraEdgeOffset + j]
-            value: s32
-            if mode == 9 {
-                value = (wy * above + (256 - wy) * bottom + wx * left + (256 - wx) * right + 256) >> 9
-            } else if mode == 10 {
-                value = (wy * above + (256 - wy) * bottom + 128) >> 8
-            } else {
-                value = (wx * left + (256 - wx) * right + 128) >> 8
+        vertical := Simd.Splat(s32x4, wy); below := Simd.Splat(s32x4, (256 - wy) * bottom)
+        left := Simd.Splat(s32x4, edges.left[IntraEdgeOffset + i])
+        j: s64 = 0
+        while j < cast(s64)width {
+            weights := Simd.Reinterpret(s32x4, Simd.WidenLow(Simd.WidenLow(Simd.LoadLow(u8x16, IntraSmoothWeights, x_base + j))))
+            sum := rounding
+            if mode != 11 {
+                sum = Simd.Add(sum, Simd.Add(Simd.Mul(vertical, Simd.Load(s32x4, edges.above, IntraEdgeOffset + j)), below))
             }
-            out[line + j] = cast(u16)value
+            if mode != 10 {
+                sum = Simd.Add(sum, Simd.Add(Simd.Mul(weights, left), Simd.Mul(Simd.Sub(full, weights), right)))
+            }
+            value := Simd.ShiftRight(sum, shift)
+            Simd.StoreLow(out, line + j, Simd.Narrow(u16x8, value, value))
+            j += 4
         }
     }
 }
 
-// AV1 7.11.2.2 (PAETH_PRED).
-PredictPaethIntra :: (out: []u16, stride: s32, edges: *IntraEdges) {
-    corner := edges.above[IntraEdgeOffset - 1]
+// AV1 7.11.2.2 (PAETH_PRED), four samples at a time: with base = above +
+// left - corner, |base - left| = |above - corner|, |base - above| =
+// |left - corner| and |base - corner| = |above + left - 2 corner|.
+PredictPaethIntra :: (out: []u16, stride: s32, edges: *IntraEdges) #target {
+    corner := Simd.Splat(s32x4, edges.above[IntraEdgeOffset - 1])
     for i: 0..cast(s64)edges.height - 1 {
         line := i * stride
-        left := edges.left[IntraEdgeOffset + i]
-        for j: 0..cast(s64)edges.width - 1 {
-            above := edges.above[IntraEdgeOffset + j]
-            base := above + left - corner
-            p_left := base - left; p_top := base - above; p_corner := base - corner
-            if p_left < 0 { p_left = -p_left }
-            if p_top < 0 { p_top = -p_top }
-            if p_corner < 0 { p_corner = -p_corner }
-            value := corner
-            if p_left <= p_top && p_left <= p_corner { value = left }
-            else if p_top <= p_corner { value = above }
-            out[line + j] = cast(u16)value
+        left := Simd.Splat(s32x4, edges.left[IntraEdgeOffset + i])
+        p_top := Simd.Abs(Simd.Sub(left, corner))
+        j: s64 = 0
+        while j < cast(s64)edges.width {
+            above := Simd.Load(s32x4, edges.above, IntraEdgeOffset + j)
+            p_left := Simd.Abs(Simd.Sub(above, corner))
+            p_corner := Simd.Abs(Simd.Sub(Simd.Add(above, left), Simd.Add(corner, corner)))
+            use_left := Simd.AndNot(Simd.Not(Simd.Greater(p_left, p_top)), Simd.Greater(p_left, p_corner))
+            value := Simd.Select(use_left, left, Simd.Select(Simd.Greater(p_top, p_corner), corner, above))
+            Simd.StoreLow(out, line + j, Simd.Narrow(u16x8, value, value))
+            j += 4
         }
     }
 }
@@ -398,11 +465,13 @@ PredictRecursiveIntra :: (out: []u16, stride: s32, edges: *IntraEdges, filter_mo
 }
 
 // AV1 7.11.2.4 with 7.11.2.7 and 7.11.2.9--12 on private edge copies.
+// The nominal angle of each directional mode V_PRED..D67_PRED.
+IntraModeAngles :: s16.[90,180,45,135,113,157,203,67]
+
 PredictDirectionalIntra :: (out: []u16, stride: s32, edges: *IntraEdges, mode: s32, angle_delta: s32,
     enable_edge_filter: bool, filter_type: s32, maximum: s32) {
     width := edges.width; height := edges.height
-    angles: [8]s32 = .[90,180,45,135,113,157,203,67]
-    angle := angles[mode - 1] + angle_delta * 3
+    angle := cast(s32)IntraModeAngles[mode - 1] + angle_delta * 3
     above := edges.above; left := edges.left
     upsample_above: s32; upsample_left: s32
     if enable_edge_filter {
@@ -431,15 +500,8 @@ PredictDirectionalIntra :: (out: []u16, stride: s32, edges: *IntraEdges, mode: s
             IntraUpsampleEdge(left[:], height + (ifx angle > 180 then width else 0), maximum)
         }
     }
-    if angle == 90 || angle == 180 {
-        for i: 0..cast(s64)height - 1 {
-            line := i * stride
-            for j: 0..cast(s64)width - 1 {
-                out[line + j] = cast(u16)(ifx angle == 90 then above[IntraEdgeOffset + j] else left[IntraEdgeOffset + i])
-            }
-        }
-        return
-    }
+    if angle == 90 { PredictVerticalIntra(out, stride, above[:], width, height); return }
+    if angle == 180 { PredictHorizontalIntra(out, stride, left[:], width, height); return }
     dx: s32; dy: s32
     if angle < 90 { dx = IntraDerivative(angle) }
     else if angle < 180 { dx = IntraDerivative(180 - angle); dy = IntraDerivative(angle - 90) }

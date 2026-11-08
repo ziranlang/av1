@@ -185,12 +185,10 @@ FilterCdefBlock :: (input: []u16, stride: s32, width: s32, height: s32,
     }
     result.error = CancellationError(cancellation)
     if result.error.code != DecodeOK { return result }
-    block: CdefPadded
-    for row: 0..height + 3 { for column: 0..width + 3 { block.samples[row * 16 + column] = input[row * stride + column] } }
     // Output commits only after the last cancellation check.
     samples: [64]u16
-    CdefFilterPadded(*block, width, height, primary_strength, secondary_strength, damping, direction,
-        bit_depth, samples[:], 8)
+    CdefFilterRows(input, 0, stride, width, height, primary_strength, secondary_strength, damping, direction,
+        bit_depth, true, samples[:], 8)
     result.error = CancellationError(cancellation)
     if result.error.code != DecodeOK { return result }
     result.samples = samples; result.width = width; result.height = height
@@ -199,105 +197,108 @@ FilterCdefBlock :: (input: []u16, stride: s32, width: s32, height: s32,
 
 CdefPadded :: struct { samples: [256]u16; }
 
-// The filter of a validated block padded to 16 samples per row: halo row r,
-// column c is samples[r * 16 + c], written to output rows output_stride
-// apart. Each pass filters eight samples as one s16x8 vector, one row of an
-// 8-wide block or two rows of a 4-wide one. Every intermediate fits s16:
+// Cdef_Directions: the (row, column) offsets of the first and second taps
+// along each direction.
+CdefDirectionOffsets :: s8.[-1,1,-2,2, 0,1,-1,2, 0,1,0,2, 0,1,1,2, 1,1,2,2, 1,0,2,1, 1,0,2,0, 1,0,2,-1]
+CdefPrimaryTaps :: s16.[4,2,3,3]
+
+// The filter of a validated block whose halo row r, column c is
+// input[at + r * stride + c], written to output rows output_stride apart.
+// Each pass filters sixteen samples as one s16x16 vector: two rows of an
+// 8-wide block or four rows of a 4-wide one. Every intermediate fits s16:
 // samples and the missing value are at most 30000, constrained differences
 // at most 240 and the weighted sum at most 12 * 4 * 240.
 // A missing neighbor is 30000, at least 25905 above any sample; shifted by at
 // most 10 - log2(threshold) its magnitude still exceeds the threshold, so its
 // constrained difference is zero and it is left out of the maximum only.
+// Without padded no neighbor is missing, so none is masked out.
 // Taps of a zero strength add nothing; with a single nonzero strength the
 // weights sum to 12, so the result already lies within the taps' range and the
 // clamp is skipped.
-CdefFilterPadded :: (block: *CdefPadded, width: s32, height: s32,
+CdefFilterRows :: (input: []u16, at: s64, stride: s64, width: s32, height: s32,
     primary_strength: s32, secondary_strength: s32, damping: s32, direction: s32, bit_depth: s32,
-    output: []u16, output_stride: s32) #target {
-    // Both callers check the direction; checking it here bounds each
-    // directions read.
-    if direction < 0 || direction > 7 { return }
-    scale := cast(s32)(cast(u32)1 << cast(u32)(bit_depth - 8))
-    directions: [32]s32 = .[-1,1,-2,2,0,1,-1,2,0,1,0,2,0,1,1,2,1,1,2,2,1,0,2,1,1,0,2,0,1,0,2,-1]
-    primary_taps: [4]s32 = .[4,2,3,3]
-    // Offsets are from the top-left halo sample to the neighbor of the
-    // centre sample (row 2, column 2), so they are never negative.
-    tap_offsets: [12]s64; tap_weights: [12]s32; tap_thresholds: [12]s32; tap_shifts: [12]s32
-    taps: s32 = 0
-    for tap: 0..1 {
-        for family: 0..2 {
-            filter_direction := direction; strength := primary_strength
-            weight := primary_taps[(primary_strength / scale & 1) * 2 + tap]
-            if family > 0 {
-                offset: s32 = ifx family == 1 then 6 else 2
-                filter_direction = (direction + offset) % 8
-                strength = secondary_strength
-                weight = ifx tap == 0 then 2 else 1
-            }
-            if strength == 0 { continue }
-            for side: 0..1 {
-                sign: s32 = ifx side == 0 then -1 else 1
-                tap_offsets[taps] = cast(s64)(34 + sign * (directions[(filter_direction * 2 + tap) * 2] * 16 +
-                    directions[(filter_direction * 2 + tap) * 2 + 1]))
-                tap_weights[taps] = weight; tap_thresholds[taps] = strength
-                tap_shifts[taps] = cast(s32)CdefDampingShift(strength, damping)
-                taps += 1
-            }
-        }
+    padded: bool, output: []u16, output_stride: s32) #target {
+    w := cast(s64)width; h := cast(s64)height; line_step := cast(s64)output_stride
+    if direction < 0 || direction > 7 || (width != 4 && width != 8) || (height != 4 && height != 8) ||
+        at < 0 || stride < w + 4 || at + (h + 3) * stride + w + 4 > input.count ||
+        line_step < w || (h - 1) * line_step + w > output.count {
+        return
     }
+    scale := cast(s32)(cast(u32)1 << cast(u32)(bit_depth - 8))
+    // Tap offsets from the centre sample (halo row 2, column 2): the
+    // primary direction's two taps, then each secondary direction's.
+    offsets: [6]s64
+    for k: 0..5 {
+        d := ifx k < 2 then direction else ifx k < 4 then (direction + 2) & 7 else (direction + 6) & 7
+        tap := k & 1
+        offsets[k] = cast(s64)CdefDirectionOffsets[d * 4 + tap * 2] * stride + cast(s64)CdefDirectionOffsets[d * 4 + tap * 2 + 1]
+    }
+    centre := at + 2 * stride + 2
+    p_threshold := Simd.Splat(s16x16, cast(s16)primary_strength)
+    s_threshold := Simd.Splat(s16x16, cast(s16)secondary_strength)
+    p_shift: u32 = 0; s_shift: u32 = 0
+    if primary_strength != 0 { p_shift = CdefDampingShift(primary_strength, damping) & 15 }
+    if secondary_strength != 0 { s_shift = CdefDampingShift(secondary_strength, damping) & 15 }
+    odd := (primary_strength / scale) & 1
+    p_first := Simd.Splat(s16x16, CdefPrimaryTaps[odd * 2]); p_second := Simd.Splat(s16x16, CdefPrimaryTaps[odd * 2 + 1])
     clamp := primary_strength != 0 && secondary_strength != 0
-    rows: s64 = ifx width == 4 then 2 else 1
-    zero := Simd.Zero(s16x8)
-    missing := Simd.Splat(s16x8, cast(s16)CdefMissingSample)
-    eight := Simd.Splat(s16x8, 8)
-    for pass: 0..7 {
-        first := pass * rows
-        if first >= cast(s64)height || first > 7 { break }
-        line := first * 16
-        // In a 4-wide block the second row's four samples are the upper lanes.
-        current: s16x8
-        if width == 4 {
-            upper := Simd.Reinterpret(u64x2, Simd.LoadLow(u16x8, block.samples, line + 34))
-            lower := Simd.Reinterpret(u64x2, Simd.LoadLow(u16x8, block.samples, line + 50))
-            current = Simd.Reinterpret(s16x8, Simd.InterleaveLow(upper, lower))
-        } else {
-            current = Simd.Reinterpret(s16x8, Simd.Load(u16x8, block.samples, line + 34))
-        }
+    rows: s64 = ifx width == 4 then 4 else 2
+    // The second half of a pass starts this far into the input.
+    half := (rows / 2) * stride
+    zero := Simd.Zero(s16x16)
+    missing := Simd.Splat(s16x16, cast(s16)CdefMissingSample)
+    eight := Simd.Splat(s16x16, 8)
+    first: s64 = 0
+    while first < h {
+        line := centre + first * stride
+        current := Simd.Combine(CdefLoadHalf(input, line, stride, width), CdefLoadHalf(input, line + half, stride, width))
         sums := zero; lows := current; highs := current
-        for tap: 0..11 {
-            if tap >= cast(s64)taps { break }
-            // Offsets lie in 0..68, so every read stays in the block.
-            offset := tap_offsets[tap]
-            threshold := Simd.Splat(s16x8, cast(s16)tap_thresholds[tap])
-            shift := tap_shifts[tap] & 15
-            weight := Simd.Splat(s16x8, cast(s16)tap_weights[tap])
-            if offset < 0 || offset > 68 { continue }
-            value: s16x8
-            if width == 4 {
-                upper := Simd.Reinterpret(u64x2, Simd.LoadLow(u16x8, block.samples, line + offset))
-                lower := Simd.Reinterpret(u64x2, Simd.LoadLow(u16x8, block.samples, line + offset + 16))
-                value = Simd.Reinterpret(s16x8, Simd.InterleaveLow(upper, lower))
-            } else {
-                value = Simd.Reinterpret(s16x8, Simd.Load(u16x8, block.samples, line + offset))
+        for k: 0..5 {
+            if k < 2 && primary_strength == 0 { continue }
+            if k >= 2 && secondary_strength == 0 { break }
+            threshold := ifx k < 2 then p_threshold else s_threshold
+            shift := ifx k < 2 then p_shift else s_shift
+            for side: 0..1 {
+                tap_at := ifx side == 0 then line + offsets[k] else line - offsets[k]
+                value := Simd.Combine(CdefLoadHalf(input, tap_at, stride, width), CdefLoadHalf(input, tap_at + half, stride, width))
+                difference := Simd.Sub(value, current)
+                magnitude := Simd.Abs(difference)
+                constrained := Simd.Min(magnitude, Simd.Max(zero, Simd.Sub(threshold, Simd.ShiftRight(magnitude, shift))))
+                signed := Simd.Sign(constrained, difference)
+                if k < 2 { sums = Simd.Add(sums, Simd.Mul(ifx k == 0 then p_first else p_second, signed)) }
+                else if (k & 1) == 0 { sums = Simd.Add(sums, Simd.ShiftLeft(signed, 1)) }
+                else { sums = Simd.Add(sums, signed) }
+                if clamp {
+                    lows = Simd.Min(lows, value)
+                    highs = Simd.Max(highs, ifx padded then Simd.AndNot(value, Simd.Equal(value, missing)) else value)
+                }
             }
-            difference := Simd.Sub(value, current)
-            magnitude := Simd.Abs(difference)
-            constrained := Simd.Max(zero, Simd.Sub(threshold, Simd.ShiftRight(magnitude, shift)))
-            constrained = Simd.Min(constrained, magnitude)
-            signed := Simd.Select(Simd.Less(difference, zero), Simd.Neg(constrained), constrained)
-            sums = Simd.Add(sums, Simd.Mul(weight, signed))
-            lows = Simd.Min(lows, value)
-            highs = Simd.Max(highs, Simd.AndNot(value, Simd.Equal(value, missing)))
         }
         // (8 + sum - (sum < 0)) >> 4, the comparison being -1 where sum < 0.
         result := Simd.Add(current, Simd.ShiftRight(Simd.Add(Simd.Add(sums, eight), Simd.Less(sums, zero)), 4))
         if clamp { result = Simd.Min(Simd.Max(result, lows), highs) }
-        out := Simd.Reinterpret(u16x8, result)
+        low := Simd.Reinterpret(u16x8, Simd.Low(result)); high := Simd.Reinterpret(u16x8, Simd.High(result))
+        target := first * line_step
         if width == 4 {
-            Simd.StoreLow(output, first * output_stride, out)
-            Simd.StoreLow(output, (first + 1) * output_stride, Simd.ShiftBytesRight(out, 8))
+            Simd.StoreLow(output, target, low)
+            Simd.StoreLow(output, target + line_step, Simd.ShiftBytesRight(low, 8))
+            Simd.StoreLow(output, target + 2 * line_step, high)
+            Simd.StoreLow(output, target + 3 * line_step, Simd.ShiftBytesRight(high, 8))
         } else {
-            Simd.Store(output, first * output_stride, out)
+            Simd.Store(output, target, low)
+            Simd.Store(output, target + line_step, high)
         }
+        first += rows
     }
+}
+
+// Eight samples from row at: one row of an 8-wide block, or the four of
+// rows at and at + stride of a 4-wide one.
+CdefLoadHalf :: (input: []u16, at: s64, stride: s64, width: s32) -> s16x8 #inline {
+    if width == 4 {
+        a := Simd.Reinterpret(u64x2, Simd.LoadLow(u16x8, input, at))
+        b := Simd.Reinterpret(u64x2, Simd.LoadLow(u16x8, input, at + stride))
+        return Simd.Reinterpret(s16x8, Simd.InterleaveLow(a, b))
+    }
+    return Simd.Reinterpret(s16x8, Simd.Load(u16x8, input, at))
 }

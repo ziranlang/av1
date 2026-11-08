@@ -37,6 +37,55 @@ CdefBoundaries :: () -> s32 {
     cancelled_dir := FindCdefDirection(source[:], 11, 8, *token)
     if cancelled_dir.error.code != DecodeCancelled || cancelled_dir.direction != 0 || cancelled_dir.variance != 0 { return 22 }
     if CdefVectorDirections() != 0 { return 23 }
+    if CdefStridedRows() != 0 { return 24 }
+    return 0
+}
+
+// CdefFilterRows reading a block in place at a wide stride, with no
+// neighbor missing, must equal FilterCdefBlock on the same samples, and so
+// must the padded form on them. Blocks cover both widths and heights, every
+// direction, all legal strengths and dampings, and the three depths; samples
+// outside each output block stay untouched.
+CdefStridedRows :: () -> s32 {
+    plane: [1200]u16; output: [1200]u16; window: [144]u16
+    seed: u32 = 2246822519
+    for trial: 0..2999 {
+        depth := 8 + 2 * cast(s32)(trial % 3); shift := depth - 8; scale := cast(s32)(cast(s64)1 << cast(u32)shift)
+        seed = seed * 1664525 + 1013904223
+        width: s32 = ifx (seed & 256) != 0 then 8 else 4; height: s32 = ifx (seed & 512) != 0 then 8 else 4
+        direction := cast(s32)((seed >> 12) & 7)
+        seed = seed * 1664525 + 1013904223
+        primary := cast(s32)((seed >> 8) % 16) * scale
+        if (seed & 3) == 0 { primary += cast(s32)((seed >> 4) % cast(u32)scale) }
+        secondary_steps: [3]s32 = .[0, 1, 2]
+        secondary := (ifx (seed & 64) != 0 then 4 else secondary_steps[cast(s64)((seed >> 20) % 3)]) * scale
+        damping := 2 + shift + cast(s32)((seed >> 24) % 5)
+        if primary == 0 && secondary == 0 { primary = scale }
+        maximum := (cast(s64)1 << cast(u32)depth) - 1
+        for i: 0..1199 {
+            seed = seed * 1664525 + 1013904223
+            plane[i] = cast(u16)(cast(s64)(seed >> 8) % (maximum + 1))
+            if trial % 7 == 0 { plane[i] = ifx (seed & 1) != 0 then cast(u16)maximum else 0 }
+            output[i] = 7
+        }
+        stride: s64 = 40; at := 3 * stride + 5
+        for r: 0..cast(s64)height + 3 { for c: 0..cast(s64)width + 3 { window[r * 12 + c] = plane[at + r * stride + c] } }
+        expected := FilterCdefBlock(window[:], 12, width, height, primary, secondary, damping, direction, depth)
+        if expected.error.code != DecodeOK { return 1 }
+        target := 4 * stride + 3
+        CdefFilterRows(plane[:], at, stride, width, height, primary, secondary, damping, direction, depth, false,
+            output[target:], cast(s32)stride)
+        for r: 0..cast(s64)height - 1 { for c: 0..cast(s64)width - 1 {
+            if output[target + r * stride + c] != expected.samples[r * 8 + c] { return 2 }
+            output[target + r * stride + c] = 7
+        } }
+        for i: 0..1199 { if output[i] != 7 { return 3 } }
+        CdefFilterRows(window[:], 0, 12, width, height, primary, secondary, damping, direction, depth, true,
+            output[:], 8)
+        for r: 0..cast(s64)height - 1 { for c: 0..cast(s64)width - 1 {
+            if output[r * 8 + c] != expected.samples[r * 8 + c] { return 4 }
+        } }
+    }
     return 0
 }
 

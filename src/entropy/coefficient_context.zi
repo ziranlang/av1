@@ -9,9 +9,25 @@ CoefficientContexts :: struct { base: s32; br: s32; error: DecodeError; }
 // rows below the coded rectangle, so every neighbor read stays in range.
 CoefficientLevelStride :: (coded_width: s32) -> s32 { return coded_width + 4 }
 
-CoefficientLevel :: (levels: []u8, at: s32, limit: s32) -> s32 {
-    value := cast(s32)levels[at]
-    return ifx value < limit then value else limit
+// A level as the context selection keeps it, as in dav1d: min(level, 3) in
+// the top two bits and min(level, 15) below. A sum of five neighbors then
+// gives the base magnitude in its top bits, and of three the BR magnitude in
+// its low six bits, which hold at most 45.
+CoefficientPackedLevel :: (level: s32) -> u8 #inline {
+    return cast(u8)(((ifx level < 3 then level else 3) << 6) | (ifx level < 15 then level else 15))
+}
+
+// The base context's magnitude part from the packed sum of five neighbors:
+// min((sum of min(level, 3) + 1) / 2, 4). Their min(level, 15) parts stay
+// below 64 while that sum is at most 7, so they never carry into the result.
+CoefficientBaseMagnitude :: (sum: u32) -> s32 #inline {
+    return ifx sum > 512 then 4 else cast(s32)((sum + 64) >> 7)
+}
+
+// The BR context's magnitude part from the packed sum of three neighbors.
+CoefficientBrMagnitude :: (sum: u32) -> s32 #inline {
+    magnitude := cast(s32)(sum & 63)
+    return ifx magnitude > 12 then 6 else (magnitude + 1) >> 1
 }
 
 // AV1 coefficient-base/base-eob/BR CDF selection. Class values are the AV1
@@ -44,7 +60,7 @@ GetCoefficientContexts :: (levels: []u8, width: s32, height: s32, position: s32,
     }
     stride := CoefficientLevelStride(cw)
     padded: [1296]u8
-    for r: 0..ch - 1 { for c: 0..cw - 1 { padded[r * stride + c] = levels[r * cw + c] } }
+    for r: 0..ch - 1 { for c: 0..cw - 1 { padded[r * stride + c] = CoefficientPackedLevel(cast(s32)levels[r * cw + c]) } }
     contexts := CoefficientContextsAt(padded[:], stride, position / cw, position % cw,
         width, height, scan_index, tx_class, is_eob)
     result.error = CancellationError(cancellation)
@@ -53,13 +69,19 @@ GetCoefficientContexts :: (levels: []u8, width: s32, height: s32, position: s32,
     return result
 }
 
-// The selection itself, over padded levels at a validated coded position.
+// The selection itself, over packed padded levels at a validated coded position.
 CoefficientContextsAt :: (levels: []u8, stride: s32, row: s32, column: s32,
     width: s32, height: s32, scan_index: s32, tx_class: s32, is_eob: bool) -> CoefficientContexts {
     result: CoefficientContexts
+    at := cast(s64)row * stride + column
+    near := CoefficientNearSum(levels, at, stride, tx_class)
     if is_eob { result.base = CoefficientEOBContext(width, height, scan_index) }
-    else { result.base = CoefficientBaseContext(levels, stride, row, column, width, height, tx_class) }
-    result.br = CoefficientBrContext(levels, stride, row, column, tx_class)
+    else if tx_class == CoefficientClass2D && row == 0 && column == 0 { result.base = 0 }
+    else {
+        result.base = CoefficientBaseOffset(row, column, width, height, tx_class) +
+            CoefficientBaseMagnitude(near + CoefficientFarSum(levels, at, stride, tx_class))
+    }
+    result.br = CoefficientBrContext(near, row, column, tx_class)
     return result
 }
 
@@ -79,45 +101,41 @@ BaseContextOffsets2D :: u8.[
     0,16,6,6,21,16,16,6,21,21,16,16,21,21,21,16,16,21,21,21,16,16,21,21,21
 ]
 
-// The base context of any other coefficient, from the levels after it.
-CoefficientBaseContext :: (levels: []u8, stride: s32, row: s32, column: s32,
-    width: s32, height: s32, tx_class: s32) -> s32 {
-    at := row * stride + column
-    magnitude := CoefficientLevel(levels, at + 1, 3) + CoefficientLevel(levels, at + stride, 3)
-    if tx_class == CoefficientClass2D {
-        magnitude += CoefficientLevel(levels, at + stride + 1, 3) + CoefficientLevel(levels, at + 2, 3) +
-            CoefficientLevel(levels, at + 2 * stride, 3)
-    } else if tx_class == CoefficientClassHorizontal {
-        magnitude += CoefficientLevel(levels, at + 2, 3) + CoefficientLevel(levels, at + 3, 3) +
-            CoefficientLevel(levels, at + 4, 3)
-    } else {
-        magnitude += CoefficientLevel(levels, at + 2 * stride, 3) + CoefficientLevel(levels, at + 3 * stride, 3) +
-            CoefficientLevel(levels, at + 4 * stride, 3)
-    }
-    base := (magnitude + 1) >> 1
-    if base > 4 { base = 4 }
-    if tx_class == CoefficientClass2D {
-        if row == 0 && column == 0 { return 0 }
-        // A table instead of the specification's chain of position tests,
-        // which mispredict along a scan.
-        shape := ifx width == height then 0 else ifx width < height then 25 else 50
-        near_row := ifx row < 4 then row else 4; near_column := ifx column < 4 then column else 4
-        return base + cast(s32)BaseContextOffsets2D[shape + near_row * 5 + near_column]
-    }
-    index := ifx tx_class == CoefficientClassVertical then row else column
-    return base + (ifx index == 0 then 26 else ifx index == 1 then 31 else 36)
+// The packed sum of the three neighbors both contexts read: right and below,
+// then below-right (2D), two right (horizontal) or two below (vertical).
+CoefficientNearSum :: (levels: []u8, at: s64, stride: s32, tx_class: s32) -> u32 #inline {
+    third := (ifx tx_class == CoefficientClass2D then cast(s64)stride + 1 else
+        ifx tx_class == CoefficientClassHorizontal then 2 else 2 * cast(s64)stride)
+    return cast(u32)levels[at + 1] + cast(u32)levels[at + stride] + cast(u32)levels[at + third]
 }
 
-// The base-range context; decoders need it only for levels above 2.
-CoefficientBrContext :: (levels: []u8, stride: s32, row: s32, column: s32, tx_class: s32) -> s32 {
-    at := row * stride + column
-    magnitude := CoefficientLevel(levels, at + 1, 15) + CoefficientLevel(levels, at + stride, 15)
-    if tx_class == CoefficientClass2D { magnitude += CoefficientLevel(levels, at + stride + 1, 15) }
-    else if tx_class == CoefficientClassHorizontal { magnitude += CoefficientLevel(levels, at + 2, 15) }
-    else { magnitude += CoefficientLevel(levels, at + 2 * stride, 15) }
-    br := (magnitude + 1) >> 1
-    if br > 6 { br = 6 }
+// The packed sum of the two further neighbors only the base context reads:
+// two right and two below (2D), or three and four along the class.
+CoefficientFarSum :: (levels: []u8, at: s64, stride: s32, tx_class: s32) -> u32 #inline {
+    step := ifx tx_class == CoefficientClassVertical then cast(s64)stride else 1
+    if tx_class == CoefficientClass2D { return cast(u32)levels[at + 2] + cast(u32)levels[at + 2 * cast(s64)stride] }
+    return cast(u32)levels[at + 3 * step] + cast(u32)levels[at + 4 * step]
+}
+
+// The base context's position offset, except 2D position (0, 0), which has
+// context 0 whatever its neighbors. A table replaces the specification's
+// chain of position tests, which mispredict along a scan.
+CoefficientBaseOffset :: (row: s32, column: s32, width: s32, height: s32, tx_class: s32) -> s32 #inline {
+    if tx_class == CoefficientClass2D {
+        shape := ifx width == height then 0 else ifx width < height then 25 else 50
+        near_row := ifx row < 4 then row else 4; near_column := ifx column < 4 then column else 4
+        return cast(s32)BaseContextOffsets2D[shape + near_row * 5 + near_column]
+    }
+    index := ifx tx_class == CoefficientClassVertical then row else column
+    return 26 + 5 * (ifx index < 2 then index else 2)
+}
+
+// The base-range context from the near sum; decoders need it only for
+// levels above 2.
+CoefficientBrContext :: (near: u32, row: s32, column: s32, tx_class: s32) -> s32 #inline {
+    br := CoefficientBrMagnitude(near)
     if row == 0 && column == 0 { return br }
-    near := ifx tx_class == CoefficientClass2D then row < 2 && column < 2 else ifx tx_class == CoefficientClassHorizontal then column == 0 else row == 0
-    return br + (ifx near then 7 else 14)
+    close := (ifx tx_class == CoefficientClass2D then row < 2 && column < 2 else
+        ifx tx_class == CoefficientClassHorizontal then column == 0 else row == 0)
+    return br + (ifx close then 7 else 14)
 }

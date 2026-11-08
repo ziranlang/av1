@@ -1,0 +1,44 @@
+#import, file "../src/transform/inverse_transform.zi";
+#import, file "../src/transform/kernels_8bit.zi";
+#import, file "../src/transform/kernels_highbit.zi";
+
+// Timing entry for a C host: `iterations` reconstructions of one 8/10-bit block
+// whose rows x columns box holds coefficients of decoded-block magnitude, by
+// the specialized kernels (path 0) or InverseTransform2D plus AddResidual (path 1). Returns
+// a sample checksum, or -1 if the kernels hand the block back.
+KernelBench :: (width: s32, height: s32, tx_type: s32, rows: s32, columns: s32, path: s32, depth: s32,
+    iterations: s64) -> s64 {
+    coefficients: [4096]s32; residual: [4096]s32; samples: [4096]u16
+    scratch: TransformKernelScratch; high: TransformHighKernelScratch
+    seed: u32 = 12345
+    w := cast(s64)width; count := w * height
+    for i: 0..count - 1 {
+        seed = seed * 1664525 + 1013904223
+        r := i / w; c := i % w
+        value := cast(s64)((seed >> 8) % 401) - 200
+        coefficients[i] = ifx r < rows && c < columns then cast(s32)value else 0
+        samples[i] = cast(u16)((seed >> 4) & cast(u32)((cast(s64)1 << cast(u32)depth) - 1))
+    }
+    coefficients[0] = 700
+    for k: 0..iterations - 1 {
+        if path == 0 && depth == 8 {
+            if !InverseTransformAdd8(coefficients[:count], width, height, tx_type, rows, columns, samples[:count], w,
+                *scratch) {
+                return -1
+            }
+        } else if path == 0 {
+            if !InverseTransformAdd10(coefficients[:count], width, height, tx_type, rows, columns, samples[:count], w,
+                1023, *high) { return -1 }
+        } else {
+            if InverseTransform2D(coefficients[:count], residual[:count], width, height, tx_type, depth).code != DecodeOK {
+                return -1
+            }
+            if AddResidual(samples[:count], width, residual[:count], width, height, tx_type, depth).code != DecodeOK {
+                return -1
+            }
+        }
+    }
+    sum: s64
+    for i: 0..count - 1 { sum = sum * 31 + samples[i] }
+    return sum
+}

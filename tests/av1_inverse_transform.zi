@@ -1,4 +1,5 @@
 #import, file "../src/transform/inverse_transform.zi";
+#import, file "../src/transform/dct8x8.zi";
 
 // Deterministic mid-range prediction shared with the oracle generator.
 TransformPrediction :: (width: s32, height: s32, depth: s32, seed: s32) -> [4096]u16 {
@@ -86,6 +87,90 @@ InverseTransformBoundaries :: () -> s32 {
     for j: 0..19 { if samples[j] != saved[j] { return 27 } }
     if VectorResidualRows() != 0 { return 28 }
     if BoxReconstruction() != 0 { return 29 }
+    if Dct8Kernel() != 0 { return 30 }
+    if CoefficientRanges() != 0 { return 31 }
+    return 0
+}
+
+// CoefficientsWithin accepts every box whose cells reach both limits, with
+// out-of-range values just outside it, and rejects the box once any one
+// cell is past either limit. Empty, unaligned and oversized boxes fail.
+CoefficientRanges :: () -> s32 {
+    values: [4096]s32
+    seed: u32 = 40503
+    for log2w: 2..6 {
+        w := cast(s32)(cast(s64)1 << cast(u32)log2w)
+        for d: 0..2 {
+            limit := cast(s32)(cast(s64)1 << cast(u32)(15 + 2 * d))
+            for trial: 0..19 {
+                seed = seed * 1664525 + 1013904223
+                rows := 4 * (1 + cast(s64)((seed >> 8) % 8)); if rows > 64 { rows = 64 }
+                seed = seed * 1664525 + 1013904223
+                top := ifx w < 32 then cast(s64)w else 32
+                columns := 4 * (1 + cast(s64)((seed >> 8) % cast(u32)(top / 4)))
+                for i: 0..rows - 1 { for j: 0..cast(s64)w - 1 {
+                    seed = seed * 1664525 + 1013904223
+                    if j < columns { values[i * w + j] = cast(s32)(cast(s64)(seed >> 4) % (2 * cast(s64)limit) - limit) }
+                    else { values[i * w + j] = ifx (seed & 1) != 0 then limit else -limit - 1 }
+                } }
+                values[0] = limit - 1; values[(rows - 1) * w + columns - 1] = -limit
+                area := values[:(rows - 1) * w + columns]
+                if !CoefficientsWithin(area, w, rows, columns, limit) { return 1 }
+                seed = seed * 1664525 + 1013904223
+                at := cast(s64)((seed >> 8) % cast(u32)rows) * w + cast(s64)((seed >> 4) % cast(u32)columns)
+                saved := values[at]
+                values[at] = ifx (seed & 1) != 0 then limit else -limit - 1
+                if CoefficientsWithin(area, w, rows, columns, limit) { return 2 }
+                values[at] = saved
+            }
+        }
+    }
+    if CoefficientsWithin(values[:64], 8, 0, 4, 128) || CoefficientsWithin(values[:64], 8, 4, 0, 128) ||
+        CoefficientsWithin(values[:64], 8, 4, 6, 128) || CoefficientsWithin(values[:64], 8, 4, 12, 128) ||
+        CoefficientsWithin(values[:27], 8, 4, 4, 128) {
+        return 3
+    }
+    return 0
+}
+
+// The 16-bit 8x8 DCT_DCT kernel must equal the s64 reference passes on every
+// block it accepts, separate or in place, and leave the output alone on every
+// block it rejects. Blocks range from small values, which it must always
+// accept, to the 8-bit Dequant limits, and include sparse large ones.
+Dct8Kernel :: () -> s32 {
+    input: [64]s32; expected: [64]s32; output: [64]s32; inplace: [64]s32; lane: VectorLane
+    shape := TransformShapeOf(8, 8, 0, 8)
+    seed: u32 = 2654435761
+    accepted := 0; rejected := 0
+    for trial: 0..5999 {
+        kind := trial % 6
+        range: s64 = ifx kind == 0 then 64 else ifx kind == 1 then 1024 else ifx kind == 2 then 4096 else 32767
+        for i: 0..63 {
+            seed = seed * 1664525 + 1013904223
+            value := cast(s64)(seed >> 4) % (2 * range + 1) - range
+            if kind == 4 && (seed & 3) != 0 { value = 0 }
+            if kind == 5 { value = ifx (seed & 15) == 0 then (ifx (seed & 16) != 0 then 32767 else -32768) else value / 64 }
+            input[i] = cast(s32)value
+        }
+        InverseRowPass(input[:], expected[:], 8, 8, shape.row_kind, shape.log2w, shape.rect, shape.row_range,
+            shape.row_shift, shape.column_low, shape.column_high, false, 8, 8, *lane)
+        InverseColumnPass(expected[:], 8, 8, shape.column_kind, shape.log2h, shape.column_range, 8, *lane)
+        for i: 0..63 { output[i] = -7 - cast(s32)i; inplace[i] = input[i] }
+        if InverseDct8x8(input[:], output[:]) {
+            accepted += 1
+            for i: 0..63 { if output[i] != expected[i] { return 1 } }
+            if !InverseDct8x8(inplace[:], inplace[:]) { return 2 }
+            for i: 0..63 { if inplace[i] != expected[i] { return 3 } }
+        } else {
+            rejected += 1
+            if kind == 0 { return 4 }
+            for i: 0..63 { if output[i] != -7 - cast(s32)i { return 5 } }
+            if InverseDct8x8(inplace[:], inplace[:]) { return 6 }
+            for i: 0..63 { if inplace[i] != input[i] { return 7 } }
+        }
+    }
+    if accepted < 3000 || rejected < 500 { return 8 }
+    if InverseDct8x8(input[:63], output[:]) || InverseDct8x8(input[:], output[:63]) { return 9 }
     return 0
 }
 
@@ -144,7 +229,7 @@ VectorResidualRows :: () -> s32 {
 BoxReconstruction :: () -> s32 {
     sizes: [38]s32 = .[4,4, 4,8, 8,4, 8,8, 8,16, 16,8, 16,16, 16,32, 32,16, 32,32, 32,64, 64,32, 64,64,
         4,16, 16,4, 8,32, 32,8, 16,64, 64,16]
-    full: [4096]s32; boxed: [4096]s32; residual: [4096]s32; scratch: TransformScratch
+    full: [4096]s32; boxed: [4096]s32; residual: [4096]s32; scratch: ReconstructionScratch
     samples: [4285]u16; expected: [4285]u16
     seed: u32 = 2166136261
     for n: 0..18 {

@@ -1,5 +1,8 @@
 using Codec :: #import "image_codec/api"
 Simd :: #import "std/simd"
+#import, file "./dct8x8.zi";
+#import, file "./kernels_8bit.zi";
+#import, file "./kernels_highbit.zi";
 
 // AV1 7.13.2/7.13.3 inverse transforms for all nineteen lossy transform sizes:
 // s64 lanes that are the semantic reference (the specification's Hadamard
@@ -421,6 +424,15 @@ ScalarColumn :: (residual: []s32, width: s32, height: s32, j: s64, column_kind: 
 // Lanes a transform pass works in, kept by its caller so no pass clears one.
 TransformScratch :: struct { lane: VectorLane; }
 
+// The decoder retains the transform block and lanes between calls. Keep
+// the general reference's scratch separate so it does not clear these
+// larger buffers when checking an individual transform.
+ReconstructionScratch :: struct {
+    general: TransformScratch;
+    packed8: TransformKernelScratch;
+    packed10: TransformHighKernelScratch;
+}
+
 // The row pass of a validated transform: the first `rows` rows (a multiple
 // of 4, at most 32), four at a time, as columns of the lane, reading the
 // first `columns` (a multiple of 4, at most 32) of each, the rest being
@@ -536,14 +548,15 @@ TransformShape :: struct {
     row_shift: u32; row_range: u32; column_range: u32; column_low: s64; column_high: s64
 }
 
+// Transform_Row_Shift indexed by (log2W-2)*5 + log2H-2; illegal shapes are rejected by validation.
+TransformRowShifts :: u32.[0,0,1,0,0, 0,1,1,2,0, 1,1,2,1,2, 0,2,1,2,1, 0,0,2,1,2]
+
 TransformShapeOf :: (width: s32, height: s32, tx_type: s32, bit_depth: s32) -> TransformShape {
     shape: TransformShape
     shape.log2w = cast(s64)TransformLog2(width); shape.log2h = cast(s64)TransformLog2(height)
     shape.row_kind = TransformRowKind(tx_type); shape.column_kind = TransformColumnKind(tx_type)
     shape.rect = shape.log2w - shape.log2h == 1 || shape.log2h - shape.log2w == 1
-    // Transform_Row_Shift indexed by (log2W-2)*5 + log2H-2; illegal shapes are rejected by validation.
-    shifts: [25]u32 = .[0,0,1,0,0, 0,1,1,2,0, 1,1,2,1,2, 0,2,1,2,1, 0,0,2,1,2]
-    shape.row_shift = shifts[(shape.log2w - 2) * 5 + shape.log2h - 2]
+    shape.row_shift = TransformRowShifts[(shape.log2w - 2) * 5 + shape.log2h - 2]
     shape.row_range = cast(u32)(bit_depth + 8)
     shape.column_range = cast(u32)(ifx bit_depth + 6 > 16 then bit_depth + 6 else 16)
     shape.column_high = (cast(s64)1 << (shape.column_range - 1)) - 1; shape.column_low = -shape.column_high - 1
@@ -567,6 +580,9 @@ InverseTransform2D :: (dequant: []s32, residual: []s32, width: s32, height: s32,
     for i: 0..count - 1 {
         value := cast(s64)dequant[i]
         if value < -input_limit || value >= input_limit { ClearResidual(residual); return Error(InvalidInput) }
+    }
+    if bit_depth == 8 && width == 8 && height == 8 && tx_type == 0 && InverseDct8x8(dequant, residual) {
+        return Error(DecodeOK)
     }
     shape := TransformShapeOf(width, height, tx_type, bit_depth)
     scratch: TransformScratch
@@ -644,7 +660,7 @@ AddConstantRows :: (samples: []u16, stride: s32, width: s32, height: s32, value:
 // bit depth's maximum, so unlike AddResidual this does not check them.
 // Nothing is written on failure.
 ReconstructTransformBlock :: (samples: []u16, stride: s32, dequant: []s32, residual: []s32, width: s32, height: s32,
-    tx_type: s32, bit_depth: s32, rows: s32, columns: s32, scratch: *TransformScratch,
+    tx_type: s32, bit_depth: s32, rows: s32, columns: s32, scratch: *ReconstructionScratch,
     cancellation: *Cancellation = null) -> DecodeError {
     error := CancellationError(cancellation)
     if error.code != DecodeOK { return error }
@@ -658,12 +674,8 @@ ReconstructTransformBlock :: (samples: []u16, stride: s32, dequant: []s32, resid
     }
     if rows == 0 || columns == 0 { return Error(DecodeOK) }
     box_rows := (cast(s64)rows + 3) & -4; box_columns := (cast(s64)columns + 3) & -4
-    input_limit := cast(s64)1 << cast(u32)(bit_depth + 7)
-    for i: 0..box_rows - 1 {
-        for j: 0..box_columns - 1 {
-            value := cast(s64)dequant[i * width + j]
-            if value < -input_limit || value >= input_limit { return Error(InvalidInput) }
-        }
+    if !CoefficientsWithin(dequant, width, box_rows, box_columns, cast(s32)(cast(s64)1 << cast(u32)(bit_depth + 7))) {
+        return Error(InvalidInput)
     }
     shape := TransformShapeOf(width, height, tx_type, bit_depth)
     maximum := cast(s32)((cast(s64)1 << cast(u32)bit_depth) - 1)
@@ -671,12 +683,60 @@ ReconstructTransformBlock :: (samples: []u16, stride: s32, dequant: []s32, resid
         AddConstantRows(samples, stride, width, height, DCOnlyResidual(cast(s64)dequant[0], shape), maximum)
         return Error(DecodeOK)
     }
+    if bit_depth == 8 && width == 8 && height == 8 && tx_type == 0 {
+        // The 16-bit kernel reads all 64 cells, so a smaller box is first
+        // copied into the residual with zeros around it.
+        input := dequant
+        if box_rows < 8 || box_columns < 8 {
+            for i: 0..7 {
+                for j: 0..7 {
+                    residual[i * 8 + j] = ifx i < box_rows && j < box_columns then dequant[i * 8 + j] else 0
+                }
+            }
+            input = residual
+        }
+        if InverseDct8x8(input, residual) {
+            AddResidualSamples(samples, stride, residual, width, height, tx_type, maximum)
+            return Error(DecodeOK)
+        }
+    }
+    // Both kernels leave samples and coefficients untouched on rejection,
+    // so unusual ranges still take the general specification path below.
+    if bit_depth == 8 && InverseTransformAdd8(dequant, width, height, tx_type, box_rows, box_columns,
+        samples, stride, *scratch.packed8) {
+        return Error(DecodeOK)
+    }
+    if bit_depth == 10 && InverseTransformAdd10(dequant, width, height, tx_type, box_rows, box_columns,
+        samples, stride, maximum, *scratch.packed10) {
+        return Error(DecodeOK)
+    }
     InverseRowPass(dequant, residual, width, height, shape.row_kind, shape.log2w, shape.rect, shape.row_range,
-        shape.row_shift, shape.column_low, shape.column_high, bit_depth <= 10, box_rows, box_columns, *scratch.lane)
+        shape.row_shift, shape.column_low, shape.column_high, bit_depth <= 10, box_rows, box_columns, *scratch.general.lane)
     InverseColumnPass(residual, width, height, shape.column_kind, shape.log2h, shape.column_range, box_rows,
-        *scratch.lane)
+        *scratch.general.lane)
     AddResidualSamples(samples, stride, residual, width, height, tx_type, maximum)
     return Error(DecodeOK)
+}
+
+// Whether every cell of the upper-left rows x columns box of a row-major
+// width-wide array lies in [-limit, limit); false too when the box is empty,
+// its columns are not a multiple of 4 or it does not fit.
+CoefficientsWithin :: (values: []s32, width: s32, rows: s64, columns: s64, limit: s32) -> bool #target {
+    w := cast(s64)width
+    if rows < 1 || columns < 4 || (columns & 3) != 0 || columns > w || values.count < (rows - 1) * w + columns {
+        return false
+    }
+    low := Simd.Zero(s32x4); high := Simd.Zero(s32x4)
+    for i: 0..rows - 1 {
+        row := values[i * w:i * w + columns]
+        j: s64 = 0
+        while j + 4 <= columns {
+            value := Simd.Load(s32x4, row, j)
+            low = Simd.Min(low, value); high = Simd.Max(high, value)
+            j += 4
+        }
+    }
+    return Simd.ReduceMin(low) >= -limit && Simd.ReduceMax(high) < limit
 }
 
 // Whether every sample of a width x height block is at most maximum; false

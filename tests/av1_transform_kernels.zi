@@ -1,0 +1,119 @@
+#import, file "../src/transform/inverse_transform.zi";
+#import, file "../src/transform/kernels_8bit.zi";
+
+// The 8-bit 16-bit-lane kernels of kernels_8bit.zi against InverseTransform2D
+// and AddResidual: every legal size and type, random boxes with garbage
+// outside them, prediction samples with garbage between rows, in place and
+// not, small values that must always be taken and range-filling values whose
+// rejections must leave everything as it was.
+
+KernelNext :: (seed: *u32) -> u32 {
+    seed.* = seed.* * 1664525 + 1013904223
+    return seed.* >> 8
+}
+
+KernelSide :: (log2: s64) -> s32 { return cast(s32)(cast(s64)1 << cast(u32)log2) }
+
+// Returns 0, or the first failure's code; accepted and rejected count the
+// blocks the kernels took and handed back.
+KernelCheck :: (accepted: *s64, rejected: *s64, quick: bool, last_case: *s64) -> s32 {
+    coefficients: [4096]s32; saved: [4096]s32; dequant: [4096]s32; residual: [4096]s32; output: [4096]s32; inplace: [4096]s32
+    prediction: [4608]u16; expected: [4608]u16; samples: [4608]u16
+    scratch: TransformKernelScratch
+    seed: u32 = 2463534242
+    for log2w: 2..6 { for log2h: 2..6 {
+        if log2w - log2h > 2 || log2h - log2w > 2 { continue }
+        w := KernelSide(log2w); h := KernelSide(log2h)
+        stride := cast(s64)w + 8
+        count := cast(s64)w * h
+        for tx_type: 0..15 {
+            if ValidateInverseTransform(w, h, cast(s32)tx_type, 8).code != DecodeOK { continue }
+            trials := ifx quick then 1 else ifx count >= 1024 then 12 else 40
+            for trial: 0..trials - 1 {
+                last_case.* = w * 1000000 + h * 10000 + tx_type * 100 + trial
+                kind := trial % 5
+                range: s64 = ifx kind == 0 then 48 else ifx kind == 1 then 400 else ifx kind == 2 then 3000 else 32767
+                top_rows := ifx h > 32 then 32 else cast(s64)h; top_columns := ifx w > 32 then 32 else cast(s64)w
+                rows := 4 * (1 + cast(s64)(KernelNext(*seed) % cast(u32)(top_rows / 4)))
+                columns := 4 * (1 + cast(s64)(KernelNext(*seed) % cast(u32)(top_columns / 4)))
+                for i: 0..count - 1 {
+                    r := i / w; c := i % w
+                    if r < rows && c < columns {
+                        value := cast(s64)(KernelNext(*seed) % cast(u32)(2 * range + 1)) - range
+                        // Sparse boxes: mostly zeros, as most decoded blocks are.
+                        if kind == 4 && (KernelNext(*seed) & 7) != 0 { value = 0 }
+                        if kind == 4 { value = value / 16 }
+                        coefficients[i] = cast(s32)value; dequant[i] = cast(s32)value
+                    } else {
+                        coefficients[i] = cast(s32)KernelNext(*seed) - 4000000; dequant[i] = 0
+                    }
+                }
+                if trial == 1 { dequant[0] = 32767; coefficients[0] = 32767 }
+                d := dequant[:count]
+                if InverseTransform2D(d, residual[:count], w, h, cast(s32)tx_type, 8).code != DecodeOK { return 1 }
+                for i: 0..(cast(s64)h - 1) * stride + w - 1 { prediction[i] = cast(u16)(KernelNext(*seed) & 255) }
+                span := (cast(s64)h - 1) * stride + w
+                for i: 0..span - 1 { expected[i] = prediction[i]; samples[i] = prediction[i] }
+                if AddResidual(expected[:span], cast(s32)stride, residual[:count], w, h, cast(s32)tx_type, 8).code != DecodeOK {
+                    return 2
+                }
+                for i: 0..count - 1 { saved[i] = coefficients[i] }
+                taken := InverseTransformAdd8(coefficients[:count], w, h, cast(s32)tx_type, rows, columns, samples[:span],
+                    stride, *scratch)
+                for i: 0..count - 1 { if coefficients[i] != saved[i] { return 21 } }
+                for i: 0..count - 1 { output[i] = -77; inplace[i] = coefficients[i] }
+                widened := InverseTransform8(coefficients[:count], output[:count], w, h, cast(s32)tx_type, rows, columns,
+                    *scratch)
+                again := InverseTransform8(inplace[:count], inplace[:count], w, h, cast(s32)tx_type, rows, columns,
+                    *scratch)
+                if taken != widened || taken != again { return 3 }
+                if taken {
+                    accepted.* += 1
+                    for i: 0..span - 1 { if samples[i] != expected[i] { return 4 } }
+                    for i: 0..count - 1 { if output[i] != residual[i] || inplace[i] != residual[i] { return 5 } }
+                } else {
+                    rejected.* += 1
+                    if kind == 0 || (kind == 1 && trial != 1) { return 6 }
+                    for i: 0..span - 1 { if samples[i] != prediction[i] { return 7 } }
+                    for i: 0..count - 1 { if output[i] != -77 || inplace[i] != coefficients[i] { return 8 } }
+                }
+            }
+        }
+    } }
+    // Shapes, types and boxes the kernels do not take are handed back.
+    for i: 0..4095 { samples[i] = 17; coefficients[i] = 23 }
+    if InverseTransformAdd8(coefficients[:256], 16, 16, 9, 33, 4, samples[:256], 16, *scratch) { return 9 }
+    if InverseTransformAdd8(coefficients[:256], 16, 16, 0, 0, 4, samples[:256], 16, *scratch) { return 10 }
+    if InverseTransformAdd8(coefficients[:1024], 32, 32, 1, 4, 4, samples[:1024], 32, *scratch) { return 11 }
+    if InverseTransformAdd8(coefficients[:256], 64, 4, 0, 4, 4, samples[:256], 64, *scratch) { return 12 }
+    if InverseTransformAdd8(coefficients[:256], 16, 16, 0, 4, 4, samples[:200], 16, *scratch) { return 13 }
+    if InverseTransformAdd8(coefficients[:256], 16, 16, 0, 3, 4, samples[:256], 16, *scratch) { return 14 }
+    if InverseTransformAdd8(coefficients[:256], 16, 16, 0, 4, 5, samples[:256], 16, *scratch) { return 15 }
+    if InverseTransformAdd8(coefficients[:256], 16, 16, 0, 4, 4, samples[:256], 9223372036854775807,
+        *scratch) { return 16 }
+    for i: 0..4095 { if samples[i] != 17 || coefficients[i] != 23 { return 22 } }
+    // A rejected input and an overflowing rotation both preserve every output.
+    for i: 0..255 { coefficients[i] = 0; output[i] = -77; samples[i] = 17 }
+    for trial: 0..2 {
+        coefficients[0] = ifx trial == 0 then 2147483647 else ifx trial == 1 then -2147483648 else 32000
+        coefficients[1] = ifx trial == 2 then 32000 else 0
+        if InverseTransformAdd8(coefficients[:16], 4, 4, 3, 4, 4, samples[:16], 4, *scratch) { return 17 }
+        if InverseTransform8(coefficients[:16], output[:16], 4, 4, 3, 4, 4, *scratch) { return 18 }
+        for i: 0..255 { if output[i] != -77 || samples[i] != 17 { return 19 } }
+    }
+    return 0
+}
+
+main :: () -> s32 {
+    accepted: s64; rejected: s64; last_case: s64
+    result := KernelCheck(*accepted, *rejected, false, *last_case)
+    if result != 0 { return result }
+    if accepted < 3000 || rejected < 100 { return 20 }
+    return 0
+}
+
+// Every size/type pair and the rejection cases without the longer random run.
+PortableMain :: () -> s32 {
+    accepted: s64; rejected: s64; last_case: s64
+    return KernelCheck(*accepted, *rejected, true, *last_case)
+}

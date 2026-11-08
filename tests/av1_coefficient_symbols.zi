@@ -1,0 +1,83 @@
+#import, file "../src/entropy/range.zi";
+using Codec :: #import "image_codec/api"
+
+// Straight specification walk, independent of the fixed-size search and
+// adaptation helpers. The native encoder oracle also checks ReadSymbol.
+ReferenceSymbol :: (decoder: *RangeDecoder, cdf: []u16) -> s32 {
+    if !RangeReady(decoder) { return 0 }
+    n := cast(s32)cdf.count - 1
+    value := cast(u32)(decoder.window >> 48)
+    high := decoder.range
+    low: u32
+    symbol: s32
+    while symbol < n {
+        low = (((decoder.range >> 8) * ((32768 - cast(u32)cdf[symbol]) >> 6)) >> 1) +
+            cast(u32)(4 * (n - symbol - 1))
+        if value >= low { break }
+        high = low; symbol += 1
+    }
+    decoder.range = high - low; decoder.window -= cast(u64)low << 48
+    RangeRenormalize(decoder)
+    if decoder.error.code != DecodeOK { return 0 }
+    if !decoder.disable_cdf_update {
+        rate: u32 = ifx n < 4 then 4 else 5
+        if cdf[n] > 15 { rate += 1 }
+        if cdf[n] > 31 { rate += 1 }
+        for i: 0..n - 2 {
+            current := cast(u32)cdf[i]
+            if i < symbol { current -= current >> rate }
+            else { current += (32768 - current) >> rate }
+            cdf[i] = cast(u16)current
+        }
+        if cdf[n] < 32 { cdf[n] += 1 }
+    }
+    return symbol
+}
+
+// The block reader checks the decoder once and then uses fixed-size CDFs.
+// Compare those paths at every successful symbol, including adaptation rate
+// transitions, repeated/endpoint probabilities and disabled adaptation.
+#program_export
+main :: () -> s32 {
+    counters: [5]u16 = .[0,15,16,31,32]
+    data: [16]u8
+    seed: u32 = 0x415631
+    for n: cast(s32)2..4 {
+        for counter: 0..4 { for distribution: 0..3 { for trial: 0..7 { for disabled: 0..1 {
+            reference: [5]u16; fixed: [5]u16
+            for i: 0..15 { seed = seed * 1664525 + 1013904223; data[i] = cast(u8)(seed >> 24) }
+            for i: 0..n - 2 {
+                reference[i] = cast(u16)(ifx distribution == 0 then (i + 1) * 32768 / n else
+                    ifx distribution == 1 then 0 else ifx distribution == 2 then 32768 else 16384)
+            }
+            reference[n - 1] = 32768; reference[n] = counters[counter]
+            for i: 0..4 { fixed[i] = reference[i] }
+            a := NewRange(BorrowBytes(data[:]), 0, data.count, disabled == 1)
+            b := NewRange(BorrowBytes(data[:]), 0, data.count, disabled == 1)
+            for symbol: 0..127 {
+                expected := ReferenceSymbol(*a, reference[:n + 1])
+                actual: s32
+                if n == 2 { actual = RangeSymbol2(*b, fixed[:3]) }
+                else if n == 3 { actual = RangeSymbol3(*b, fixed[:4]) }
+                else { actual = RangeSymbol4(*b, fixed[:5]) }
+                if a.error.code != b.error.code || a.error.offset != b.error.offset { return 1 }
+                // A failed block discards its adapted state. The fast paths
+                // may finish their current adaptation before returning error.
+                if a.error.code != DecodeOK { break }
+                if expected != actual { return 2 }
+                if a.range != b.range || a.window != b.window || a.count != b.count ||
+                    a.next != b.next || a.max_bits != b.max_bits { return 3 }
+                for i: 0..4 { if reference[i] != fixed[i] { return 4 } }
+            }
+        } } } }
+    }
+    // Raw signs and Golomb suffix bits have the same state as ReadLiteral.
+    for count: cast(s32)0..32 {
+        a := NewRange(BorrowBytes(data[:]), 0, data.count)
+        b := NewRange(BorrowBytes(data[:]), 0, data.count)
+        if ReadLiteral(*a, count) != RangeBits(*b, count) { return 5 }
+        if a.range != b.range || a.window != b.window || a.count != b.count ||
+            a.next != b.next || a.max_bits != b.max_bits || a.error.code != b.error.code { return 6 }
+    }
+    return 0
+}

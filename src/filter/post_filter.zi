@@ -52,7 +52,7 @@ PostFilterStrength :: (frame: *IntraFrame, header: *StillFrameHeader,
 // filtered together. Intra blocks filter every transform edge, so the
 // prediction-block edge test is not needed.
 PostDeblockEdge :: (frame: *IntraFrame, samples: []u16, header: *StillFrameHeader,
-    plane: s32, pass: s32, luma_row: s32, luma_column: s32, scratch: *DeblockScratch) -> DecodeError {
+    plane: s32, pass: s32, luma_row: s32, luma_column: s32) -> DecodeError {
     sx := IntraSubX(frame, plane); sy := IntraSubY(frame, plane)
     x := luma_column * 4; y := luma_row * 4
     if x >= frame.width || y >= frame.height || (pass == 0 && x == 0) || (pass == 1 && y == 0) {
@@ -81,7 +81,7 @@ PostDeblockEdge :: (frame: *IntraFrame, samples: []u16, header: *StillFrameHeade
     stride := cast(s64)frame.plane_stride[plane]
     line_step: s64 = ifx pass == 0 then stride else 1
     tap_step: s64 = ifx pass == 0 then 1 else stride
-    return FilterDeblockLinesIn(scratch, samples, PostIndex(frame, plane, xp, yp), line_step, tap_step, length,
+    return FilterDeblockLines(samples, PostIndex(frame, plane, xp, yp), line_step, tap_step, length,
         strength.block_limit, strength.limit, strength.threshold, frame.bit_depth)
 }
 
@@ -100,39 +100,58 @@ PostCdefPlane :: (frame: *IntraFrame, source: []u16, destination: []u16, plane: 
     sx := IntraSubX(frame, plane); sy := IntraSubY(frame, plane)
     x0 := (column * 4) >> sx; y0 := (row * 4) >> sy
     w := 8 >> sx; h := 8 >> sy
-    block: CdefPadded
-    // Away from the frame edges each padded row is w + 4 frame samples:
-    // eight, or eight and four.
+    destination_at := PostIndex(frame, plane, x0, y0)
+    // Away from the frame edges every neighbor is a frame sample, read in place.
     if x0 >= 2 && y0 >= 2 && (((x0 + w + 1) << sx) >> 2) < frame.mi_cols && (((y0 + h + 1) << sy) >> 2) < frame.mi_rows {
-        for i: 0..h + 3 {
-            line := PostIndex(frame, plane, x0 - 2, y0 + cast(s32)i - 2)
-            Simd.Store(block.samples[:], i * 16, Simd.Load(u16x8, source, line))
-            if w == 8 { Simd.StoreLow(block.samples[:], i * 16 + 8, Simd.LoadLow(u16x8, source, line + 8)) }
-        }
-    } else {
-        columns: [12]bool
-        for j: 0..w + 3 {
-            x := x0 + cast(s32)j - 2
-            columns[j] = x >= 0 && ((x << sx) >> 2) < frame.mi_cols
-        }
-        for i: 0..h + 3 {
-            y := y0 + cast(s32)i - 2
-            if y >= 0 && ((y << sy) >> 2) < frame.mi_rows {
-                line := PostIndex(frame, plane, x0 - 2, y)
-                for j: 0..w + 3 {
-                    block.samples[i * 16 + j] = ifx columns[j] then source[line + j] else cast(u16)CdefMissingSample
-                }
-            } else {
-                for j: 0..w + 3 { block.samples[i * 16 + j] = cast(u16)CdefMissingSample }
+        CdefFilterRows(source, PostIndex(frame, plane, x0 - 2, y0 - 2), cast(s64)frame.plane_stride[plane], w, h,
+            primary, secondary, damping, direction, frame.bit_depth, false, destination[destination_at:],
+            frame.plane_stride[plane])
+        return
+    }
+    block: CdefPadded
+    columns: [12]bool
+    for j: 0..w + 3 {
+        x := x0 + cast(s32)j - 2
+        columns[j] = x >= 0 && ((x << sx) >> 2) < frame.mi_cols
+    }
+    for i: 0..h + 3 {
+        y := y0 + cast(s32)i - 2
+        if y >= 0 && ((y << sy) >> 2) < frame.mi_rows {
+            line := PostIndex(frame, plane, x0 - 2, y)
+            for j: 0..w + 3 {
+                block.samples[i * 16 + j] = ifx columns[j] then source[line + j] else cast(u16)CdefMissingSample
             }
+        } else {
+            for j: 0..w + 3 { block.samples[i * 16 + j] = cast(u16)CdefMissingSample }
         }
     }
-    CdefFilterPadded(*block, w, h, primary, secondary, damping, direction, frame.bit_depth,
-        destination[PostIndex(frame, plane, x0, y0):], frame.plane_stride[plane])
+    CdefFilterRows(block.samples[:], 0, 16, w, h, primary, secondary, damping, direction, frame.bit_depth, true,
+        destination[destination_at:], frame.plane_stride[plane])
 }
 
 PostRestorationInput :: struct {
     plane: s32; end_x: s32; end_y: s32; stripe_start: s32; stripe_end: s32;
+}
+
+// Copy one restoration halo row. Only the frame edges repeat samples;
+// the interior is contiguous and can be copied on vectors.
+PostRestorationRow :: (source: []u16, output: []u16, x0: s32, width: s32) #target {
+    x := cast(s64)x0; w := cast(s64)width
+    if x < 0 || w < 1 || w > 64 || source.count < x + w || output.count < w + 6 { return }
+    first := ifx x >= 3 then x - 3 else 0
+    last := ifx x + w + 3 < source.count then x + w + 3 else source.count
+    leading := first - x + 3
+    input := source[first:last]
+    target := output[leading:leading + input.count]
+    wide := Simd.Lanes(u16xN)
+    j: s64 = 0
+    while j + wide <= input.count { Simd.Store(target, j, Simd.Load(u16xN, input, j)); j += wide }
+    while j + 8 <= input.count { Simd.Store(target, j, Simd.Load(u16x8, input, j)); j += 8 }
+    while j < input.count { target[j] = input[j]; j += 1 }
+    j = 0
+    while j < leading { output[j] = input[0]; j += 1 }
+    j = leading + input.count
+    while j < w + 6 { output[j] = input[input.count - 1]; j += 1 }
 }
 
 #scope_export
@@ -142,7 +161,6 @@ ApplyIntraLoopFilter :: (frame: *IntraFrame, samples: []u16, header: *StillFrame
     cancellation: *Cancellation = null) -> DecodeError {
     if frame == null || header == null || samples.count != frame.sample_count { return Error(InvalidInput) }
     if header.loop_filter_levels[0] == 0 && header.loop_filter_levels[1] == 0 { return Error(DecodeOK) }
-    scratch: DeblockScratch
     for plane_index: 0..frame.planes - 1 {
         plane := cast(s32)plane_index
         if plane > 0 && header.loop_filter_levels[1 + plane] == 0 { continue }
@@ -156,7 +174,7 @@ ApplyIntraLoopFilter :: (frame: *IntraFrame, samples: []u16, header: *StillFrame
                 if error.code != DecodeOK { return error }
                 column: s32 = 0
                 while column < frame.mi_cols {
-                    error = PostDeblockEdge(frame, samples, header, plane, pass, row, column, *scratch)
+                    error = PostDeblockEdge(frame, samples, header, plane, pass, row, column)
                     if error.code != DecodeOK { return error }
                     column += column_step
                 }
@@ -229,6 +247,8 @@ ApplyIntraRestoration :: (frame: *IntraFrame, deblocked: []u16, cdef: []u16, out
         (cdef.count != 0 && cdef.count != frame.sample_count) || output.count != frame.sample_count {
         return Error(InvalidInput)
     }
+    // Every used halo cell is overwritten for each block.
+    halo: [980]u16
     for plane_index: 0..frame.planes - 1 {
         plane := cast(s32)plane_index
         if frame.restoration_type[plane] == 0 { continue }
@@ -263,17 +283,15 @@ ApplyIntraRestoration :: (frame: *IntraFrame, deblocked: []u16, cdef: []u16, out
                 if kind != 0 {
                     // 7.17.6: rows inside the current stripe come from CDEF
                     // output, at most two rows beyond it from the deblocked
-                    // frame. Columns and each row's source resolve once.
-                    columns: [70]s32
-                    for j: 0..w + 5 { columns[j] = PostClip(x0 + cast(s32)j - 3, 0, input.end_x) }
-                    halo: [980]u16
+                    // frame. Each row's source resolves once, then its
+                    // contiguous interior is copied without an index table.
                     for i: 0..h + 5 {
                         cy := PostClip(y0 + cast(s32)i - 3, 0, input.end_y)
                         source := ifx cdef.count == 0 then deblocked else cdef
                         if cy < input.stripe_start { cy = PostMax(input.stripe_start - 2, cy); source = deblocked }
                         else if cy > input.stripe_end { cy = PostMin(input.stripe_end + 2, cy); source = deblocked }
                         line := PostIndex(frame, plane, 0, cy)
-                        for j: 0..w + 5 { halo[i * 70 + j] = source[line + columns[j]] }
+                        PostRestorationRow(source[line:line + input.end_x + 1], halo[i * 70:i * 70 + 70], x0, w)
                     }
                     // The unit's parameters were read in range, and the
                     // halo holds clipped samples: the kernels write the

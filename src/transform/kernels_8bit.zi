@@ -1,0 +1,655 @@
+// AV1 7.13.3 inverse transforms of 8-bit blocks on 16-bit lanes, as libaom
+// and dav1d run them: each s16x8 vector holds one value of eight rows or
+// columns, the 1D kernels are written out step by step for each length, and
+// the block stays in 16 bits between the passes. With 8-bit content the
+// row range (BitDepth + 8) and the column range are both 16 bits, so every
+// Hadamard clamp is a saturating add and every Round2 of the passes is an
+// exact MulHighRound. Only rotation and identity results can leave 16
+// bits; the kernels record the largest and smallest of them, and a block
+// in which one reaches either 16-bit bound returns false with nothing
+// written, so the caller then takes the general transform. Results are
+// bit-identical to InverseTransform2D and AddResidual in
+// inverse_transform.zi, on every target std/simd supports.
+Simd :: #import "std/simd"
+
+// One pass over eight rows or columns: v[k] holds value k of each, one per
+// lane. high and low collect the largest and smallest rotation, identity
+// and input values.
+KernelLanes :: struct { v: [64]s16x8; high: s16x8; low: s16x8; }
+
+// Eight vectors, for transposes.
+KernelOctet :: struct { v: [8]s16x8; }
+
+// The block between the passes, row-major at its full width; the caller
+// keeps it so no block clears it.
+TransformKernelScratch :: struct { block: [4096]s16; }
+
+// Lane pairs (first, second) for MulAddPairs.
+KernelPair :: (first: s32, second: s32) -> s16x8 #inline {
+    return Simd.Reinterpret(s16x8, Simd.Splat(s32x4, (first & 65535) | (second * 65536)))
+}
+
+// Round2 by 12 of two s32x4 halves, packed to 16 bits with saturation.
+KernelRound12 :: (low: s32x4, high: s32x4) -> s16x8 #inline {
+    round := Simd.Splat(s32x4, 2048)
+    return Simd.Narrow(s16x8, Simd.ShiftRight(Simd.Add(low, round), 12), Simd.ShiftRight(Simd.Add(high, round), 12))
+}
+
+KernelTrack :: (t: *KernelLanes, v: s16x8) #inline {
+    t.high = Simd.Max(t.high, v); t.low = Simd.Min(t.low, v)
+}
+
+// B(a, b, angle, flip) of 7.13.2.1 with c = cos128(angle), s = sin128(angle).
+KernelRotate :: (t: *KernelLanes, a: s64, b: s64, c: s32, s: s32, flip: bool) #inline {
+    p := t.v[a & 63]; q := t.v[b & 63]
+    low := Simd.InterleaveLow(p, q); high := Simd.InterleaveHigh(p, q)
+    cs := KernelPair(c, -s); sc := KernelPair(s, c)
+    x := KernelRound12(Simd.MulAddPairs(low, cs), Simd.MulAddPairs(high, cs))
+    y := KernelRound12(Simd.MulAddPairs(low, sc), Simd.MulAddPairs(high, sc))
+    t.high = Simd.Max(t.high, Simd.Max(x, y)); t.low = Simd.Min(t.low, Simd.Min(x, y))
+    if flip { t.v[a & 63] = y; t.v[b & 63] = x } else { t.v[a & 63] = x; t.v[b & 63] = y }
+}
+
+// H(a, b, flip) of 7.13.2.1 at a 16-bit range.
+KernelSum :: (t: *KernelLanes, a: s64, b: s64, flip: bool) #inline {
+    first := ifx flip then b else a; second := ifx flip then a else b
+    x := t.v[first & 63]; y := t.v[second & 63]
+    t.v[first & 63] = Simd.AddSat(x, y); t.v[second & 63] = Simd.SubSat(x, y)
+}
+
+KernelSwap :: (t: *KernelLanes, a: s64, b: s64) #inline {
+    x := t.v[a & 63]; t.v[a & 63] = t.v[b & 63]; t.v[b & 63] = x
+}
+
+// The inverse DCTs of 7.13.2.3, the bit-reversal permutation as swaps.
+KernelDct4 :: (t: *KernelLanes) #inline {
+    KernelSwap(t, 1, 2)
+    KernelRotate(t, 0, 1, 2896, 2896, true); KernelRotate(t, 2, 3, 1567, 3784, false)
+    KernelSum(t, 0, 3, false); KernelSum(t, 1, 2, false)
+}
+
+KernelDct8 :: (t: *KernelLanes) #inline {
+    KernelSwap(t, 1, 4); KernelSwap(t, 3, 6)
+    KernelRotate(t, 4, 7, 799, 4017, false); KernelRotate(t, 5, 6, 3406, 2276, false)
+    KernelRotate(t, 0, 1, 2896, 2896, true); KernelRotate(t, 2, 3, 1567, 3784, false)
+    KernelSum(t, 4, 5, false); KernelSum(t, 6, 7, true)
+    KernelSum(t, 0, 3, false); KernelSum(t, 1, 2, false)
+    KernelRotate(t, 6, 5, 2896, 2896, true)
+    KernelSum(t, 0, 7, false); KernelSum(t, 1, 6, false); KernelSum(t, 2, 5, false)
+    KernelSum(t, 3, 4, false)
+}
+
+KernelDct16 :: (t: *KernelLanes) #inline {
+    KernelSwap(t, 1, 8); KernelSwap(t, 2, 4); KernelSwap(t, 3, 12); KernelSwap(t, 5, 10); KernelSwap(t, 7, 14); KernelSwap(t, 11, 13)
+    KernelRotate(t, 8, 15, 401, 4076, false); KernelRotate(t, 9, 14, 3166, 2598, false); KernelRotate(t, 10, 13, 1931, 3612, false)
+    KernelRotate(t, 11, 12, 3920, 1189, false)
+    KernelRotate(t, 4, 7, 799, 4017, false); KernelRotate(t, 5, 6, 3406, 2276, false)
+    KernelSum(t, 8, 9, false); KernelSum(t, 10, 11, true); KernelSum(t, 12, 13, false)
+    KernelSum(t, 14, 15, true)
+    KernelRotate(t, 0, 1, 2896, 2896, true); KernelRotate(t, 2, 3, 1567, 3784, false)
+    KernelSum(t, 4, 5, false); KernelSum(t, 6, 7, true)
+    KernelRotate(t, 14, 9, 1567, 3784, true); KernelRotate(t, 13, 10, -3784, 1567, true)
+    KernelSum(t, 0, 3, false); KernelSum(t, 1, 2, false)
+    KernelRotate(t, 6, 5, 2896, 2896, true)
+    KernelSum(t, 8, 11, false); KernelSum(t, 9, 10, false); KernelSum(t, 12, 15, true)
+    KernelSum(t, 13, 14, true)
+    KernelSum(t, 0, 7, false); KernelSum(t, 1, 6, false); KernelSum(t, 2, 5, false)
+    KernelSum(t, 3, 4, false)
+    KernelRotate(t, 13, 10, 2896, 2896, true); KernelRotate(t, 12, 11, 2896, 2896, true)
+    KernelSum(t, 0, 15, false); KernelSum(t, 1, 14, false); KernelSum(t, 2, 13, false)
+    KernelSum(t, 3, 12, false); KernelSum(t, 4, 11, false); KernelSum(t, 5, 10, false)
+    KernelSum(t, 6, 9, false); KernelSum(t, 7, 8, false)
+}
+
+KernelDct32 :: (t: *KernelLanes) #inline {
+    KernelSwap(t, 1, 16); KernelSwap(t, 2, 8); KernelSwap(t, 3, 24); KernelSwap(t, 5, 20); KernelSwap(t, 6, 12); KernelSwap(t, 7, 28)
+    KernelSwap(t, 9, 18); KernelSwap(t, 11, 26); KernelSwap(t, 13, 22); KernelSwap(t, 15, 30); KernelSwap(t, 19, 25); KernelSwap(t, 23, 29)
+    KernelRotate(t, 16, 31, 201, 4091, false); KernelRotate(t, 17, 30, 3035, 2751, false); KernelRotate(t, 18, 29, 1751, 3703, false)
+    KernelRotate(t, 19, 28, 3857, 1380, false); KernelRotate(t, 20, 27, 995, 3973, false); KernelRotate(t, 21, 26, 3513, 2106, false)
+    KernelRotate(t, 22, 25, 2440, 3290, false); KernelRotate(t, 23, 24, 4052, 601, false)
+    KernelRotate(t, 8, 15, 401, 4076, false); KernelRotate(t, 9, 14, 3166, 2598, false); KernelRotate(t, 10, 13, 1931, 3612, false)
+    KernelRotate(t, 11, 12, 3920, 1189, false)
+    KernelSum(t, 16, 17, false); KernelSum(t, 18, 19, true); KernelSum(t, 20, 21, false)
+    KernelSum(t, 22, 23, true); KernelSum(t, 24, 25, false); KernelSum(t, 26, 27, true)
+    KernelSum(t, 28, 29, false); KernelSum(t, 30, 31, true)
+    KernelRotate(t, 4, 7, 799, 4017, false); KernelRotate(t, 5, 6, 3406, 2276, false)
+    KernelSum(t, 8, 9, false); KernelSum(t, 10, 11, true); KernelSum(t, 12, 13, false)
+    KernelSum(t, 14, 15, true)
+    KernelRotate(t, 30, 17, 799, 4017, true); KernelRotate(t, 29, 18, -4017, 799, true); KernelRotate(t, 26, 21, 3406, 2276, true)
+    KernelRotate(t, 25, 22, -2276, 3406, true)
+    KernelRotate(t, 0, 1, 2896, 2896, true); KernelRotate(t, 2, 3, 1567, 3784, false)
+    KernelSum(t, 4, 5, false); KernelSum(t, 6, 7, true)
+    KernelRotate(t, 14, 9, 1567, 3784, true); KernelRotate(t, 13, 10, -3784, 1567, true)
+    KernelSum(t, 16, 19, false); KernelSum(t, 17, 18, false); KernelSum(t, 20, 23, true)
+    KernelSum(t, 21, 22, true); KernelSum(t, 24, 27, false); KernelSum(t, 25, 26, false)
+    KernelSum(t, 28, 31, true); KernelSum(t, 29, 30, true)
+    KernelSum(t, 0, 3, false); KernelSum(t, 1, 2, false)
+    KernelRotate(t, 6, 5, 2896, 2896, true)
+    KernelSum(t, 8, 11, false); KernelSum(t, 9, 10, false); KernelSum(t, 12, 15, true)
+    KernelSum(t, 13, 14, true)
+    KernelRotate(t, 29, 18, 1567, 3784, true); KernelRotate(t, 28, 19, 1567, 3784, true); KernelRotate(t, 27, 20, -3784, 1567, true)
+    KernelRotate(t, 26, 21, -3784, 1567, true)
+    KernelSum(t, 0, 7, false); KernelSum(t, 1, 6, false); KernelSum(t, 2, 5, false)
+    KernelSum(t, 3, 4, false)
+    KernelRotate(t, 13, 10, 2896, 2896, true); KernelRotate(t, 12, 11, 2896, 2896, true)
+    KernelSum(t, 16, 23, false); KernelSum(t, 17, 22, false); KernelSum(t, 18, 21, false)
+    KernelSum(t, 19, 20, false); KernelSum(t, 24, 31, true); KernelSum(t, 25, 30, true)
+    KernelSum(t, 26, 29, true); KernelSum(t, 27, 28, true)
+    KernelSum(t, 0, 15, false); KernelSum(t, 1, 14, false); KernelSum(t, 2, 13, false)
+    KernelSum(t, 3, 12, false); KernelSum(t, 4, 11, false); KernelSum(t, 5, 10, false)
+    KernelSum(t, 6, 9, false); KernelSum(t, 7, 8, false)
+    KernelRotate(t, 27, 20, 2896, 2896, true); KernelRotate(t, 26, 21, 2896, 2896, true); KernelRotate(t, 25, 22, 2896, 2896, true)
+    KernelRotate(t, 24, 23, 2896, 2896, true)
+    KernelSum(t, 0, 31, false); KernelSum(t, 1, 30, false); KernelSum(t, 2, 29, false)
+    KernelSum(t, 3, 28, false); KernelSum(t, 4, 27, false); KernelSum(t, 5, 26, false)
+    KernelSum(t, 6, 25, false); KernelSum(t, 7, 24, false); KernelSum(t, 8, 23, false)
+    KernelSum(t, 9, 22, false); KernelSum(t, 10, 21, false); KernelSum(t, 11, 20, false)
+    KernelSum(t, 12, 19, false); KernelSum(t, 13, 18, false); KernelSum(t, 14, 17, false)
+    KernelSum(t, 15, 16, false)
+}
+
+KernelDct64 :: (t: *KernelLanes) #inline {
+    KernelSwap(t, 1, 32); KernelSwap(t, 2, 16); KernelSwap(t, 3, 48); KernelSwap(t, 4, 8); KernelSwap(t, 5, 40); KernelSwap(t, 6, 24)
+    KernelSwap(t, 7, 56); KernelSwap(t, 9, 36); KernelSwap(t, 10, 20); KernelSwap(t, 11, 52); KernelSwap(t, 13, 44); KernelSwap(t, 14, 28)
+    KernelSwap(t, 15, 60); KernelSwap(t, 17, 34); KernelSwap(t, 19, 50); KernelSwap(t, 21, 42); KernelSwap(t, 22, 26); KernelSwap(t, 23, 58)
+    KernelSwap(t, 25, 38); KernelSwap(t, 27, 54); KernelSwap(t, 29, 46); KernelSwap(t, 31, 62); KernelSwap(t, 35, 49); KernelSwap(t, 37, 41)
+    KernelSwap(t, 39, 57); KernelSwap(t, 43, 53); KernelSwap(t, 47, 61); KernelSwap(t, 55, 59)
+    KernelRotate(t, 32, 63, 101, 4095, false); KernelRotate(t, 33, 62, 2967, 2824, false); KernelRotate(t, 34, 61, 1660, 3745, false)
+    KernelRotate(t, 35, 60, 3822, 1474, false); KernelRotate(t, 36, 59, 897, 3996, false); KernelRotate(t, 37, 58, 3461, 2191, false)
+    KernelRotate(t, 38, 57, 2359, 3349, false); KernelRotate(t, 39, 56, 4036, 700, false); KernelRotate(t, 40, 55, 501, 4065, false)
+    KernelRotate(t, 41, 54, 3229, 2520, false); KernelRotate(t, 42, 53, 2019, 3564, false); KernelRotate(t, 43, 52, 3948, 1092, false)
+    KernelRotate(t, 44, 51, 1285, 3889, false); KernelRotate(t, 45, 50, 3659, 1842, false); KernelRotate(t, 46, 49, 2675, 3102, false)
+    KernelRotate(t, 47, 48, 4085, 301, false)
+    KernelRotate(t, 16, 31, 201, 4091, false); KernelRotate(t, 17, 30, 3035, 2751, false); KernelRotate(t, 18, 29, 1751, 3703, false)
+    KernelRotate(t, 19, 28, 3857, 1380, false); KernelRotate(t, 20, 27, 995, 3973, false); KernelRotate(t, 21, 26, 3513, 2106, false)
+    KernelRotate(t, 22, 25, 2440, 3290, false); KernelRotate(t, 23, 24, 4052, 601, false)
+    KernelSum(t, 32, 33, false); KernelSum(t, 34, 35, true); KernelSum(t, 36, 37, false)
+    KernelSum(t, 38, 39, true); KernelSum(t, 40, 41, false); KernelSum(t, 42, 43, true)
+    KernelSum(t, 44, 45, false); KernelSum(t, 46, 47, true); KernelSum(t, 48, 49, false)
+    KernelSum(t, 50, 51, true); KernelSum(t, 52, 53, false); KernelSum(t, 54, 55, true)
+    KernelSum(t, 56, 57, false); KernelSum(t, 58, 59, true); KernelSum(t, 60, 61, false)
+    KernelSum(t, 62, 63, true)
+    KernelRotate(t, 8, 15, 401, 4076, false); KernelRotate(t, 9, 14, 3166, 2598, false); KernelRotate(t, 10, 13, 1931, 3612, false)
+    KernelRotate(t, 11, 12, 3920, 1189, false)
+    KernelSum(t, 16, 17, false); KernelSum(t, 18, 19, true); KernelSum(t, 20, 21, false)
+    KernelSum(t, 22, 23, true); KernelSum(t, 24, 25, false); KernelSum(t, 26, 27, true)
+    KernelSum(t, 28, 29, false); KernelSum(t, 30, 31, true)
+    KernelRotate(t, 62, 33, 401, 4076, true); KernelRotate(t, 61, 34, -4076, 401, true); KernelRotate(t, 58, 37, 3166, 2598, true)
+    KernelRotate(t, 57, 38, -2598, 3166, true); KernelRotate(t, 54, 41, 1931, 3612, true); KernelRotate(t, 53, 42, -3612, 1931, true)
+    KernelRotate(t, 50, 45, 3920, 1189, true); KernelRotate(t, 49, 46, -1189, 3920, true)
+    KernelRotate(t, 4, 7, 799, 4017, false); KernelRotate(t, 5, 6, 3406, 2276, false)
+    KernelSum(t, 8, 9, false); KernelSum(t, 10, 11, true); KernelSum(t, 12, 13, false)
+    KernelSum(t, 14, 15, true)
+    KernelRotate(t, 30, 17, 799, 4017, true); KernelRotate(t, 29, 18, -4017, 799, true); KernelRotate(t, 26, 21, 3406, 2276, true)
+    KernelRotate(t, 25, 22, -2276, 3406, true)
+    KernelSum(t, 32, 35, false); KernelSum(t, 33, 34, false); KernelSum(t, 36, 39, true)
+    KernelSum(t, 37, 38, true); KernelSum(t, 40, 43, false); KernelSum(t, 41, 42, false)
+    KernelSum(t, 44, 47, true); KernelSum(t, 45, 46, true); KernelSum(t, 48, 51, false)
+    KernelSum(t, 49, 50, false); KernelSum(t, 52, 55, true); KernelSum(t, 53, 54, true)
+    KernelSum(t, 56, 59, false); KernelSum(t, 57, 58, false); KernelSum(t, 60, 63, true)
+    KernelSum(t, 61, 62, true)
+    KernelRotate(t, 0, 1, 2896, 2896, true); KernelRotate(t, 2, 3, 1567, 3784, false)
+    KernelSum(t, 4, 5, false); KernelSum(t, 6, 7, true)
+    KernelRotate(t, 14, 9, 1567, 3784, true); KernelRotate(t, 13, 10, -3784, 1567, true)
+    KernelSum(t, 16, 19, false); KernelSum(t, 17, 18, false); KernelSum(t, 20, 23, true)
+    KernelSum(t, 21, 22, true); KernelSum(t, 24, 27, false); KernelSum(t, 25, 26, false)
+    KernelSum(t, 28, 31, true); KernelSum(t, 29, 30, true)
+    KernelRotate(t, 61, 34, 799, 4017, true); KernelRotate(t, 60, 35, 799, 4017, true); KernelRotate(t, 59, 36, -4017, 799, true)
+    KernelRotate(t, 58, 37, -4017, 799, true); KernelRotate(t, 53, 42, 3406, 2276, true); KernelRotate(t, 52, 43, 3406, 2276, true)
+    KernelRotate(t, 51, 44, -2276, 3406, true); KernelRotate(t, 50, 45, -2276, 3406, true)
+    KernelSum(t, 0, 3, false); KernelSum(t, 1, 2, false)
+    KernelRotate(t, 6, 5, 2896, 2896, true)
+    KernelSum(t, 8, 11, false); KernelSum(t, 9, 10, false); KernelSum(t, 12, 15, true)
+    KernelSum(t, 13, 14, true)
+    KernelRotate(t, 29, 18, 1567, 3784, true); KernelRotate(t, 28, 19, 1567, 3784, true); KernelRotate(t, 27, 20, -3784, 1567, true)
+    KernelRotate(t, 26, 21, -3784, 1567, true)
+    KernelSum(t, 32, 39, false); KernelSum(t, 33, 38, false); KernelSum(t, 34, 37, false)
+    KernelSum(t, 35, 36, false); KernelSum(t, 40, 47, true); KernelSum(t, 41, 46, true)
+    KernelSum(t, 42, 45, true); KernelSum(t, 43, 44, true); KernelSum(t, 48, 55, false)
+    KernelSum(t, 49, 54, false); KernelSum(t, 50, 53, false); KernelSum(t, 51, 52, false)
+    KernelSum(t, 56, 63, true); KernelSum(t, 57, 62, true); KernelSum(t, 58, 61, true)
+    KernelSum(t, 59, 60, true)
+    KernelSum(t, 0, 7, false); KernelSum(t, 1, 6, false); KernelSum(t, 2, 5, false)
+    KernelSum(t, 3, 4, false)
+    KernelRotate(t, 13, 10, 2896, 2896, true); KernelRotate(t, 12, 11, 2896, 2896, true)
+    KernelSum(t, 16, 23, false); KernelSum(t, 17, 22, false); KernelSum(t, 18, 21, false)
+    KernelSum(t, 19, 20, false); KernelSum(t, 24, 31, true); KernelSum(t, 25, 30, true)
+    KernelSum(t, 26, 29, true); KernelSum(t, 27, 28, true)
+    KernelRotate(t, 59, 36, 1567, 3784, true); KernelRotate(t, 58, 37, 1567, 3784, true); KernelRotate(t, 57, 38, 1567, 3784, true)
+    KernelRotate(t, 56, 39, 1567, 3784, true); KernelRotate(t, 55, 40, -3784, 1567, true); KernelRotate(t, 54, 41, -3784, 1567, true)
+    KernelRotate(t, 53, 42, -3784, 1567, true); KernelRotate(t, 52, 43, -3784, 1567, true)
+    KernelSum(t, 0, 15, false); KernelSum(t, 1, 14, false); KernelSum(t, 2, 13, false)
+    KernelSum(t, 3, 12, false); KernelSum(t, 4, 11, false); KernelSum(t, 5, 10, false)
+    KernelSum(t, 6, 9, false); KernelSum(t, 7, 8, false)
+    KernelRotate(t, 27, 20, 2896, 2896, true); KernelRotate(t, 26, 21, 2896, 2896, true); KernelRotate(t, 25, 22, 2896, 2896, true)
+    KernelRotate(t, 24, 23, 2896, 2896, true)
+    KernelSum(t, 32, 47, false); KernelSum(t, 48, 63, true); KernelSum(t, 33, 46, false)
+    KernelSum(t, 49, 62, true); KernelSum(t, 34, 45, false); KernelSum(t, 50, 61, true)
+    KernelSum(t, 35, 44, false); KernelSum(t, 51, 60, true); KernelSum(t, 36, 43, false)
+    KernelSum(t, 52, 59, true); KernelSum(t, 37, 42, false); KernelSum(t, 53, 58, true)
+    KernelSum(t, 38, 41, false); KernelSum(t, 54, 57, true); KernelSum(t, 39, 40, false)
+    KernelSum(t, 55, 56, true)
+    KernelSum(t, 0, 31, false); KernelSum(t, 1, 30, false); KernelSum(t, 2, 29, false)
+    KernelSum(t, 3, 28, false); KernelSum(t, 4, 27, false); KernelSum(t, 5, 26, false)
+    KernelSum(t, 6, 25, false); KernelSum(t, 7, 24, false); KernelSum(t, 8, 23, false)
+    KernelSum(t, 9, 22, false); KernelSum(t, 10, 21, false); KernelSum(t, 11, 20, false)
+    KernelSum(t, 12, 19, false); KernelSum(t, 13, 18, false); KernelSum(t, 14, 17, false)
+    KernelSum(t, 15, 16, false)
+    KernelRotate(t, 55, 40, 2896, 2896, true); KernelRotate(t, 54, 41, 2896, 2896, true); KernelRotate(t, 53, 42, 2896, 2896, true)
+    KernelRotate(t, 52, 43, 2896, 2896, true); KernelRotate(t, 51, 44, 2896, 2896, true); KernelRotate(t, 50, 45, 2896, 2896, true)
+    KernelRotate(t, 49, 46, 2896, 2896, true); KernelRotate(t, 48, 47, 2896, 2896, true)
+    KernelSum(t, 0, 63, false); KernelSum(t, 1, 62, false); KernelSum(t, 2, 61, false)
+    KernelSum(t, 3, 60, false); KernelSum(t, 4, 59, false); KernelSum(t, 5, 58, false)
+    KernelSum(t, 6, 57, false); KernelSum(t, 7, 56, false); KernelSum(t, 8, 55, false)
+    KernelSum(t, 9, 54, false); KernelSum(t, 10, 53, false); KernelSum(t, 11, 52, false)
+    KernelSum(t, 12, 51, false); KernelSum(t, 13, 50, false); KernelSum(t, 14, 49, false)
+    KernelSum(t, 15, 48, false); KernelSum(t, 16, 47, false); KernelSum(t, 17, 46, false)
+    KernelSum(t, 18, 45, false); KernelSum(t, 19, 44, false); KernelSum(t, 20, 43, false)
+    KernelSum(t, 21, 42, false); KernelSum(t, 22, 41, false); KernelSum(t, 23, 40, false)
+    KernelSum(t, 24, 39, false); KernelSum(t, 25, 38, false); KernelSum(t, 26, 37, false)
+    KernelSum(t, 27, 36, false); KernelSum(t, 28, 35, false); KernelSum(t, 29, 34, false)
+    KernelSum(t, 30, 33, false); KernelSum(t, 31, 32, false)
+}
+
+KernelAdst8 :: (t: *KernelLanes) #inline {
+    x0 := t.v[7]; x1 := t.v[0]; x2 := t.v[5]; x3 := t.v[2]; x4 := t.v[3]; x5 := t.v[4]; x6 := t.v[1]; x7 := t.v[6]
+    t.v[0] = x0; t.v[1] = x1; t.v[2] = x2; t.v[3] = x3; t.v[4] = x4; t.v[5] = x5; t.v[6] = x6; t.v[7] = x7
+    KernelRotate(t, 0, 1, 401, 4076, true); KernelRotate(t, 2, 3, 1931, 3612, true); KernelRotate(t, 4, 5, 3166, 2598, true)
+    KernelRotate(t, 6, 7, 3920, 1189, true)
+    KernelSum(t, 0, 4, false); KernelSum(t, 1, 5, false); KernelSum(t, 2, 6, false)
+    KernelSum(t, 3, 7, false)
+    KernelRotate(t, 4, 5, 1567, 3784, true); KernelRotate(t, 7, 6, 3784, 1567, true)
+    KernelSum(t, 0, 2, false); KernelSum(t, 4, 6, false); KernelSum(t, 1, 3, false)
+    KernelSum(t, 5, 7, false)
+    KernelRotate(t, 2, 3, 2896, 2896, true); KernelRotate(t, 6, 7, 2896, 2896, true)
+    y0 := t.v[0]; y1 := t.v[4]; y2 := t.v[6]; y3 := t.v[2]; y4 := t.v[3]; y5 := t.v[7]; y6 := t.v[5]; y7 := t.v[1]
+    zero := Simd.Zero(s16x8)
+    t.v[0] = y0; t.v[1] = Simd.SubSat(zero, y1); t.v[2] = y2; t.v[3] = Simd.SubSat(zero, y3)
+    t.v[4] = y4; t.v[5] = Simd.SubSat(zero, y5); t.v[6] = y6; t.v[7] = Simd.SubSat(zero, y7)
+}
+
+KernelAdst16 :: (t: *KernelLanes) #inline {
+    x0 := t.v[15]; x1 := t.v[0]; x2 := t.v[13]; x3 := t.v[2]; x4 := t.v[11]; x5 := t.v[4]; x6 := t.v[9]; x7 := t.v[6]
+    x8 := t.v[7]; x9 := t.v[8]; x10 := t.v[5]; x11 := t.v[10]; x12 := t.v[3]; x13 := t.v[12]; x14 := t.v[1]; x15 := t.v[14]
+    t.v[0] = x0; t.v[1] = x1; t.v[2] = x2; t.v[3] = x3; t.v[4] = x4; t.v[5] = x5; t.v[6] = x6; t.v[7] = x7
+    t.v[8] = x8; t.v[9] = x9; t.v[10] = x10; t.v[11] = x11; t.v[12] = x12; t.v[13] = x13; t.v[14] = x14; t.v[15] = x15
+    KernelRotate(t, 0, 1, 201, 4091, true); KernelRotate(t, 2, 3, 995, 3973, true); KernelRotate(t, 4, 5, 1751, 3703, true)
+    KernelRotate(t, 6, 7, 2440, 3290, true); KernelRotate(t, 8, 9, 3035, 2751, true); KernelRotate(t, 10, 11, 3513, 2106, true)
+    KernelRotate(t, 12, 13, 3857, 1380, true); KernelRotate(t, 14, 15, 4052, 601, true)
+    KernelSum(t, 0, 8, false); KernelSum(t, 1, 9, false); KernelSum(t, 2, 10, false)
+    KernelSum(t, 3, 11, false); KernelSum(t, 4, 12, false); KernelSum(t, 5, 13, false)
+    KernelSum(t, 6, 14, false); KernelSum(t, 7, 15, false)
+    KernelRotate(t, 8, 9, 799, 4017, true); KernelRotate(t, 13, 12, 4017, 799, true); KernelRotate(t, 10, 11, 3406, 2276, true)
+    KernelRotate(t, 15, 14, 2276, 3406, true)
+    KernelSum(t, 0, 4, false); KernelSum(t, 8, 12, false); KernelSum(t, 1, 5, false)
+    KernelSum(t, 9, 13, false); KernelSum(t, 2, 6, false); KernelSum(t, 10, 14, false)
+    KernelSum(t, 3, 7, false); KernelSum(t, 11, 15, false)
+    KernelRotate(t, 4, 5, 1567, 3784, true); KernelRotate(t, 12, 13, 1567, 3784, true); KernelRotate(t, 7, 6, 3784, 1567, true)
+    KernelRotate(t, 15, 14, 3784, 1567, true)
+    KernelSum(t, 0, 2, false); KernelSum(t, 4, 6, false); KernelSum(t, 8, 10, false)
+    KernelSum(t, 12, 14, false); KernelSum(t, 1, 3, false); KernelSum(t, 5, 7, false)
+    KernelSum(t, 9, 11, false); KernelSum(t, 13, 15, false)
+    KernelRotate(t, 2, 3, 2896, 2896, true); KernelRotate(t, 6, 7, 2896, 2896, true); KernelRotate(t, 10, 11, 2896, 2896, true)
+    KernelRotate(t, 14, 15, 2896, 2896, true)
+    y0 := t.v[0]; y1 := t.v[8]; y2 := t.v[12]; y3 := t.v[4]; y4 := t.v[6]; y5 := t.v[14]; y6 := t.v[10]; y7 := t.v[2]
+    y8 := t.v[3]; y9 := t.v[11]; y10 := t.v[15]; y11 := t.v[7]; y12 := t.v[5]; y13 := t.v[13]; y14 := t.v[9]; y15 := t.v[1]
+    zero := Simd.Zero(s16x8)
+    t.v[0] = y0; t.v[1] = Simd.SubSat(zero, y1); t.v[2] = y2; t.v[3] = Simd.SubSat(zero, y3)
+    t.v[4] = y4; t.v[5] = Simd.SubSat(zero, y5); t.v[6] = y6; t.v[7] = Simd.SubSat(zero, y7)
+    t.v[8] = y8; t.v[9] = Simd.SubSat(zero, y9); t.v[10] = y10; t.v[11] = Simd.SubSat(zero, y11)
+    t.v[12] = y12; t.v[13] = Simd.SubSat(zero, y13); t.v[14] = y14; t.v[15] = Simd.SubSat(zero, y15)
+}
+// One output of the inverse ADST4 of 7.13.2.6, k0*x0 + k1*x1 + k2*x2 +
+// k3*x3 rounded by 12 bits, from lanes (x0, x1) in a, b and (x2, x3) in
+// c, d. Every sum fits 32 bits.
+KernelAdst4Output :: (t: *KernelLanes, a: s16x8, b: s16x8, c: s16x8, d: s16x8, k0: s32, k1: s32, k2: s32,
+    k3: s32) -> s16x8 #inline {
+    first := KernelPair(k0, k1); second := KernelPair(k2, k3)
+    v := KernelRound12(Simd.Add(Simd.MulAddPairs(a, first), Simd.MulAddPairs(c, second)),
+        Simd.Add(Simd.MulAddPairs(b, first), Simd.MulAddPairs(d, second)))
+    KernelTrack(t, v)
+    return v
+}
+
+KernelAdst4 :: (t: *KernelLanes) #inline {
+    a := Simd.InterleaveLow(t.v[0], t.v[1]); b := Simd.InterleaveHigh(t.v[0], t.v[1])
+    c := Simd.InterleaveLow(t.v[2], t.v[3]); d := Simd.InterleaveHigh(t.v[2], t.v[3])
+    t.v[0] = KernelAdst4Output(t, a, b, c, d, 1321, 3344, 3803, 2482)
+    t.v[1] = KernelAdst4Output(t, a, b, c, d, 2482, 3344, -1321, -3803)
+    t.v[2] = KernelAdst4Output(t, a, b, c, d, 3344, 0, -3344, 3344)
+    t.v[3] = KernelAdst4Output(t, a, b, c, d, 3803, -3344, 2482, -1321)
+}
+
+// The identity transforms of 7.13.2.15: x * 5793 / 4096 is x plus
+// MulHighRound by 1697 * 8, and x * 11586 / 4096 is 2x plus MulHighRound
+// by 3394 * 8. A result that saturates is out of range and recorded.
+KernelIdentity :: (t: *KernelLanes, n: s64) #inline {
+    for i: 0..n - 1 {
+        x := t.v[i & 63]
+        v := x
+        if n == 4 { v = Simd.AddSat(x, Simd.MulHighRound(x, Simd.Splat(s16x8, 13576))) }
+        else if n == 8 { v = Simd.AddSat(x, x) }
+        else if n == 16 { v = Simd.AddSat(Simd.AddSat(x, x), Simd.MulHighRound(x, Simd.Splat(s16x8, 27152))) }
+        else { v = Simd.AddSat(x, x); v = Simd.AddSat(v, v) }
+        KernelTrack(t, v)
+        t.v[i & 63] = v
+    }
+}
+
+// The 1D transform of kind (0 DCT, 1 ADST, 2 identity) and length n.
+KernelInverse1D :: (t: *KernelLanes, kind: s32, n: s64) #inline {
+    if kind == 2 { KernelIdentity(t, n); return }
+    if n == 4 { if kind == 0 { KernelDct4(t) } else { KernelAdst4(t) } }
+    else if n == 8 { if kind == 0 { KernelDct8(t) } else { KernelAdst8(t) } }
+    else if n == 16 { if kind == 0 { KernelDct16(t) } else { KernelAdst16(t) } }
+    else if n == 32 { KernelDct32(t) }
+    else { KernelDct64(t) }
+}
+
+// Transposes eight vectors of eight lanes.
+KernelTranspose :: (r0: s16x8, r1: s16x8, r2: s16x8, r3: s16x8, r4: s16x8, r5: s16x8, r6: s16x8, r7: s16x8,
+    out: *KernelOctet) #inline {
+    a0 := Simd.Reinterpret(s32x4, Simd.InterleaveLow(r0, r1)); a1 := Simd.Reinterpret(s32x4, Simd.InterleaveHigh(r0, r1))
+    a2 := Simd.Reinterpret(s32x4, Simd.InterleaveLow(r2, r3)); a3 := Simd.Reinterpret(s32x4, Simd.InterleaveHigh(r2, r3))
+    a4 := Simd.Reinterpret(s32x4, Simd.InterleaveLow(r4, r5)); a5 := Simd.Reinterpret(s32x4, Simd.InterleaveHigh(r4, r5))
+    a6 := Simd.Reinterpret(s32x4, Simd.InterleaveLow(r6, r7)); a7 := Simd.Reinterpret(s32x4, Simd.InterleaveHigh(r6, r7))
+    b0 := Simd.Reinterpret(s64x2, Simd.InterleaveLow(a0, a2)); b1 := Simd.Reinterpret(s64x2, Simd.InterleaveHigh(a0, a2))
+    b2 := Simd.Reinterpret(s64x2, Simd.InterleaveLow(a1, a3)); b3 := Simd.Reinterpret(s64x2, Simd.InterleaveHigh(a1, a3))
+    b4 := Simd.Reinterpret(s64x2, Simd.InterleaveLow(a4, a6)); b5 := Simd.Reinterpret(s64x2, Simd.InterleaveHigh(a4, a6))
+    b6 := Simd.Reinterpret(s64x2, Simd.InterleaveLow(a5, a7)); b7 := Simd.Reinterpret(s64x2, Simd.InterleaveHigh(a5, a7))
+    out.v[0] = Simd.Reinterpret(s16x8, Simd.InterleaveLow(b0, b4)); out.v[1] = Simd.Reinterpret(s16x8, Simd.InterleaveHigh(b0, b4))
+    out.v[2] = Simd.Reinterpret(s16x8, Simd.InterleaveLow(b1, b5)); out.v[3] = Simd.Reinterpret(s16x8, Simd.InterleaveHigh(b1, b5))
+    out.v[4] = Simd.Reinterpret(s16x8, Simd.InterleaveLow(b2, b6)); out.v[5] = Simd.Reinterpret(s16x8, Simd.InterleaveHigh(b2, b6))
+    out.v[6] = Simd.Reinterpret(s16x8, Simd.InterleaveLow(b3, b7)); out.v[7] = Simd.Reinterpret(s16x8, Simd.InterleaveHigh(b3, b7))
+}
+
+// Row `row` of the coefficients from column `at`, eight values packed to
+// 16 bits: zero past the box's rows, and its upper half zero when only
+// four columns remain in the box.
+KernelLoadRow :: (t: *KernelLanes, coefficients: []s32, w: s64, row: s64, at: s64, rows: s64,
+    columns: s64) -> s16x8 #inline {
+    if row >= rows { return Simd.Zero(s16x8) }
+    first := Simd.Load(s32x4, coefficients, row * w + at)
+    second := ifx at + 4 < columns then Simd.Load(s32x4, coefficients, row * w + at + 4) else Simd.Zero(s32x4)
+    v := Simd.Narrow(s16x8, first, second)
+    KernelTrack(t, v)
+    return v
+}
+
+// The row pass of a w-wide, h-high block: the box's rows eight at a time,
+// each group transposed into the lanes, transformed, rounded by the row
+// shift and transposed back into block. Rows past the box are never
+// written; the column pass knows they are zero.
+KernelRowsBody :: (t: *KernelLanes, coefficients: []s32, block: []s16, w: s64, h: s64, kind: s32, rect: bool,
+    shift: u32, rows: s64, columns: s64) -> bool #inline {
+    zero := Simd.Zero(s16x8)
+    t.high = Simd.Splat(s16x8, -32768); t.low = Simd.Splat(s16x8, 32767)
+    scale := Simd.Splat(s16x8, 23168); multiplier := Simd.Splat(s16x8, cast(s16)(ifx shift > 0 then 32768 >> shift else 16384))
+    octet: KernelOctet
+    i0: s64 = 0
+    while i0 < rows {
+        j0: s64 = 0
+        while j0 < columns {
+            KernelTranspose(KernelLoadRow(t, coefficients, w, i0, j0, rows, columns),
+                KernelLoadRow(t, coefficients, w, i0 + 1, j0, rows, columns),
+                KernelLoadRow(t, coefficients, w, i0 + 2, j0, rows, columns),
+                KernelLoadRow(t, coefficients, w, i0 + 3, j0, rows, columns),
+                KernelLoadRow(t, coefficients, w, i0 + 4, j0, rows, columns),
+                KernelLoadRow(t, coefficients, w, i0 + 5, j0, rows, columns),
+                KernelLoadRow(t, coefficients, w, i0 + 6, j0, rows, columns),
+                KernelLoadRow(t, coefficients, w, i0 + 7, j0, rows, columns), *octet)
+            for k: 0..7 { t.v[(j0 + k) & 63] = ifx rect then Simd.MulHighRound(octet.v[k], scale) else octet.v[k] }
+            j0 += 8
+        }
+        for j: j0..w - 1 { t.v[j & 63] = zero }
+        KernelInverse1D(t, kind, w)
+        if shift > 0 { for j: 0..w - 1 { t.v[j & 63] = Simd.MulHighRound(t.v[j & 63], multiplier) } }
+        j0 = 0
+        while j0 < w {
+            KernelTranspose(t.v[j0 & 63], t.v[(j0 + 1) & 63], t.v[(j0 + 2) & 63], t.v[(j0 + 3) & 63],
+                t.v[(j0 + 4) & 63], t.v[(j0 + 5) & 63], t.v[(j0 + 6) & 63], t.v[(j0 + 7) & 63], *octet)
+            for k: 0..7 {
+                if i0 + k < h {
+                    if w == 4 { Simd.StoreLow(block, (i0 + k) * 4, octet.v[k]) }
+                    else { Simd.Store(block, (i0 + k) * w + j0, octet.v[k]) }
+                }
+            }
+            j0 += 8
+        }
+        i0 += 8
+    }
+    return Simd.ReduceMax(t.high) < 32767 && Simd.ReduceMin(t.low) > -32768
+}
+
+// The column pass in place in block, eight columns at a time (four for a
+// 4-wide block), rows from `rows` rounded up to 8 on being zero, then
+// Round2 by 4.
+KernelColumnsBody :: (t: *KernelLanes, block: []s16, w: s64, h: s64, kind: s32, rows: s64) -> bool #inline {
+    zero := Simd.Zero(s16x8); sixteenth := Simd.Splat(s16x8, 2048)
+    t.high = Simd.Splat(s16x8, -32768); t.low = Simd.Splat(s16x8, 32767)
+    filled := (rows + 7) & -8
+    if filled > h { filled = h }
+    j0: s64 = 0
+    while j0 < w {
+        for i: 0..filled - 1 {
+            t.v[i & 63] = ifx w == 4 then Simd.LoadLow(s16x8, block, i * 4) else Simd.Load(s16x8, block, i * w + j0)
+        }
+        for i: filled..h - 1 { t.v[i & 63] = zero }
+        KernelInverse1D(t, kind, h)
+        for i: 0..h - 1 {
+            v := Simd.MulHighRound(t.v[i & 63], sixteenth)
+            if w == 4 { Simd.StoreLow(block, i * 4, v) } else { Simd.Store(block, i * w + j0, v) }
+        }
+        j0 += 8
+    }
+    return Simd.ReduceMax(t.high) < 32767 && Simd.ReduceMin(t.low) > -32768
+}
+
+KernelRows4 :: (coefficients: []s32, block: []s16, h: s64, kind: s32, rect: bool, shift: u32, rows: s64,
+    columns: s64) -> bool #target {
+    t: KernelLanes
+    return KernelRowsBody(*t, coefficients, block, 4, h, kind, rect, shift, rows, columns)
+}
+KernelRows8 :: (coefficients: []s32, block: []s16, h: s64, kind: s32, rect: bool, shift: u32, rows: s64,
+    columns: s64) -> bool #target {
+    t: KernelLanes
+    return KernelRowsBody(*t, coefficients, block, 8, h, kind, rect, shift, rows, columns)
+}
+KernelRows16 :: (coefficients: []s32, block: []s16, h: s64, kind: s32, rect: bool, shift: u32, rows: s64,
+    columns: s64) -> bool #target {
+    t: KernelLanes
+    return KernelRowsBody(*t, coefficients, block, 16, h, kind, rect, shift, rows, columns)
+}
+KernelRows32 :: (coefficients: []s32, block: []s16, h: s64, kind: s32, rect: bool, shift: u32, rows: s64,
+    columns: s64) -> bool #target {
+    t: KernelLanes
+    return KernelRowsBody(*t, coefficients, block, 32, h, kind, rect, shift, rows, columns)
+}
+KernelRows64 :: (coefficients: []s32, block: []s16, h: s64, kind: s32, rect: bool, shift: u32, rows: s64,
+    columns: s64) -> bool #target {
+    t: KernelLanes
+    return KernelRowsBody(*t, coefficients, block, 64, h, kind, rect, shift, rows, columns)
+}
+
+KernelColumns4 :: (block: []s16, w: s64, kind: s32, rows: s64) -> bool #target {
+    t: KernelLanes
+    return KernelColumnsBody(*t, block, w, 4, kind, rows)
+}
+KernelColumns8 :: (block: []s16, w: s64, kind: s32, rows: s64) -> bool #target {
+    t: KernelLanes
+    return KernelColumnsBody(*t, block, w, 8, kind, rows)
+}
+KernelColumns16 :: (block: []s16, w: s64, kind: s32, rows: s64) -> bool #target {
+    t: KernelLanes
+    return KernelColumnsBody(*t, block, w, 16, kind, rows)
+}
+KernelColumns32 :: (block: []s16, w: s64, kind: s32, rows: s64) -> bool #target {
+    t: KernelLanes
+    return KernelColumnsBody(*t, block, w, 32, kind, rows)
+}
+KernelColumns64 :: (block: []s16, w: s64, kind: s32, rows: s64) -> bool #target {
+    t: KernelLanes
+    return KernelColumnsBody(*t, block, w, 64, kind, rows)
+}
+
+// Adds the w x h block to 8-bit samples with Clip1, the block's rows
+// reversed when flip_rows and its columns when flip_columns.
+KernelAddBody :: (block: []s16, w: s64, h: s64, samples: []u16, stride: s64, flip_rows: bool,
+    flip_columns: bool) #inline {
+    zero := Simd.Zero(s16x8); top := Simd.Splat(s16x8, 255)
+    for i: 0..h - 1 {
+        line := (ifx flip_rows then h - 1 - i else i) * stride
+        if w == 4 {
+            v := Simd.LoadLow(s16x8, block, i * 4)
+            if flip_columns { v = Simd.Shuffle(v, 3, 2, 1, 0, 4, 5, 6, 7) }
+            pixels := Simd.Reinterpret(s16x8, Simd.LoadLow(u16x8, samples, line))
+            Simd.StoreLow(samples, line, Simd.Reinterpret(u16x8, Simd.Min(Simd.Max(Simd.AddSat(pixels, v), zero), top)))
+            continue
+        }
+        j0: s64 = 0
+        while j0 < w {
+            v := Simd.Load(s16x8, block, i * w + j0)
+            at := line + j0
+            if flip_columns { v = Simd.Shuffle(v, 7, 6, 5, 4, 3, 2, 1, 0); at = line + w - 8 - j0 }
+            pixels := Simd.Reinterpret(s16x8, Simd.Load(u16x8, samples, at))
+            Simd.Store(samples, at, Simd.Reinterpret(u16x8, Simd.Min(Simd.Max(Simd.AddSat(pixels, v), zero), top)))
+            j0 += 8
+        }
+    }
+}
+
+KernelAddBlock :: (block: []s16, w: s64, h: s64, samples: []u16, stride: s64, flip_rows: bool,
+    flip_columns: bool) #target {
+    KernelAddBody(block, w, h, samples, stride, flip_rows, flip_columns)
+}
+
+// Square 4/8/16 reconstruction uses one target dispatch and one local lane
+// buffer for both passes, letting the compiler keep the fixed 4x4 case in registers.
+KernelSquareBody :: (coefficients: []s32, samples: []u16, side: s64, stride: s64, tx_type: s32,
+    rows: s64, columns: s64, shift: u32, scratch: *TransformKernelScratch) -> bool #inline {
+    lane: KernelLanes
+    block := scratch.block[:side * side]
+    if !KernelRowsBody(*lane, coefficients, block, side, side, KernelRowKinds[tx_type], false, shift, rows, columns) {
+        return false
+    }
+    if !KernelColumnsBody(*lane, block, side, side, KernelColumnKinds[tx_type], rows) { return false }
+    flip_rows := tx_type == 4 || tx_type == 6 || tx_type == 8 || tx_type == 14
+    flip_columns := tx_type == 5 || tx_type == 6 || tx_type == 7 || tx_type == 15
+    KernelAddBody(block, side, side, samples, stride, flip_rows, flip_columns)
+    return true
+}
+
+KernelSquare4 :: (coefficients: []s32, samples: []u16, stride: s64, tx_type: s32,
+    scratch: *TransformKernelScratch) -> bool #target {
+    return KernelSquareBody(coefficients, samples, 4, stride, tx_type, 4, 4, 0, scratch)
+}
+KernelSquare8 :: (coefficients: []s32, samples: []u16, stride: s64, tx_type: s32, rows: s64,
+    columns: s64, scratch: *TransformKernelScratch) -> bool #target {
+    return KernelSquareBody(coefficients, samples, 8, stride, tx_type, rows, columns, 1, scratch)
+}
+KernelSquare16 :: (coefficients: []s32, samples: []u16, stride: s64, tx_type: s32, rows: s64,
+    columns: s64, scratch: *TransformKernelScratch) -> bool #target {
+    return KernelSquareBody(coefficients, samples, 16, stride, tx_type, rows, columns, 2, scratch)
+}
+
+// Widens the w x h block into the row-major s32 residual.
+KernelWidenBlock :: (block: []s16, w: s64, h: s64, residual: []s32) #target {
+    count := w * h
+    if w == 4 {
+        i: s64 = 0
+        while i < count { Simd.Store(residual, i, Simd.WidenLow(Simd.LoadLow(s16x8, block, i))); i += 4 }
+        return
+    }
+    i: s64 = 0
+    while i < count {
+        v := Simd.Load(s16x8, block, i)
+        Simd.Store(residual, i, Simd.WidenLow(v)); Simd.Store(residual, i + 4, Simd.WidenHigh(v))
+        i += 8
+    }
+}
+
+// Per-direction kinds for transform types 0..15 (0 DCT, 1 ADST, 2
+// identity), the flips, and Transform_Row_Shift by (log2W - 2) * 5 +
+// log2H - 2, as in inverse_transform.zi.
+KernelRowKinds :: s32.[0, 0, 1, 1, 0, 1, 1, 1, 1, 2, 2, 0, 2, 1, 2, 1]
+KernelColumnKinds :: s32.[0, 1, 0, 1, 1, 0, 1, 1, 1, 2, 0, 2, 1, 2, 1, 2]
+KernelRowShifts :: u32.[0, 0, 1, 0, 0, 0, 1, 1, 2, 0, 1, 1, 2, 1, 2, 0, 2, 1, 2, 1, 0, 0, 2, 1, 2]
+
+KernelLog2 :: (side: s32) -> s64 {
+    if side == 4 { return 2 }; if side == 8 { return 3 }; if side == 16 { return 4 }
+    if side == 32 { return 5 }; if side == 64 { return 6 }
+    return -1
+}
+
+// Both passes into scratch.block; false when the shape, type or box is not
+// one these kernels take, or a value leaves 16 bits.
+KernelTransform :: (coefficients: []s32, width: s32, height: s32, tx_type: s32, rows: s64, columns: s64,
+    scratch: *TransformKernelScratch) -> bool {
+    log2w := KernelLog2(width); log2h := KernelLog2(height)
+    if log2w < 0 || log2h < 0 || log2w - log2h > 2 || log2h - log2w > 2 || tx_type < 0 || tx_type > 15 { return false }
+    w := cast(s64)width; h := cast(s64)height
+    row_kind := KernelRowKinds[tx_type]; column_kind := KernelColumnKinds[tx_type]
+    if (row_kind == 1 && w > 16) || (row_kind == 2 && w > 32) || (column_kind == 1 && h > 16) ||
+        (column_kind == 2 && h > 32) {
+        return false
+    }
+    if rows < 4 || columns < 4 || rows > h || columns > w || rows > 32 || columns > 32 ||
+        (rows & 3) != 0 || (columns & 3) != 0 { return false }
+    box_rows := (rows + 3) & -4; box_columns := (columns + 3) & -4
+    if coefficients.count < (box_rows - 1) * w + box_columns { return false }
+    block := scratch.block[:w * h]
+    rect := log2w - log2h == 1 || log2h - log2w == 1
+    shift := KernelRowShifts[(log2w - 2) * 5 + log2h - 2]
+    ok := false
+    if w == 4 { ok = KernelRows4(coefficients, block, h, row_kind, rect, shift, box_rows, box_columns) }
+    else if w == 8 { ok = KernelRows8(coefficients, block, h, row_kind, rect, shift, box_rows, box_columns) }
+    else if w == 16 { ok = KernelRows16(coefficients, block, h, row_kind, rect, shift, box_rows, box_columns) }
+    else if w == 32 { ok = KernelRows32(coefficients, block, h, row_kind, rect, shift, box_rows, box_columns) }
+    else { ok = KernelRows64(coefficients, block, h, row_kind, rect, shift, box_rows, box_columns) }
+    if !ok { return false }
+    if h == 4 { return KernelColumns4(block, w, column_kind, box_rows) }
+    if h == 8 { return KernelColumns8(block, w, column_kind, box_rows) }
+    if h == 16 { return KernelColumns16(block, w, column_kind, box_rows) }
+    if h == 32 { return KernelColumns32(block, w, column_kind, box_rows) }
+    return KernelColumns64(block, w, column_kind, box_rows)
+}
+
+// AV1 7.12.3's reconstruction of one 8-bit lossy block: the inverse
+// transform of the coefficient box, then the type's flips and Clip1 added to
+// samples, which must be at most 255. coefficients is row-major at the full
+// width; only its upper-left rows x columns box (multiples of 4) is read,
+// and it is zero elsewhere. Returns false, with nothing
+// written, when the shape, type or box is not one these kernels take or an
+// intermediate leaves 16 bits; the caller then takes the general path.
+InverseTransformAdd8 :: (coefficients: []s32, width: s32, height: s32, tx_type: s32, rows: s64, columns: s64,
+    samples: []u16, stride: s64, scratch: *TransformKernelScratch) -> bool {
+    w := cast(s64)width; h := cast(s64)height
+    if w < 4 || w > 64 || h < 4 || h > 64 || stride < w || samples.count < w { return false }
+    if (samples.count - w) / stride < h - 1 { return false }
+    if w == h && (w == 4 || w == 8 || w == 16) {
+        if tx_type < 0 || tx_type > 15 || rows < 4 || rows > h || columns < 4 || columns > w ||
+            (rows & 3) != 0 || (columns & 3) != 0 { return false }
+        if coefficients.count < (rows - 1) * w + columns { return false }
+        if w == 4 { return KernelSquare4(coefficients, samples, stride, tx_type, scratch) }
+        if w == 8 { return KernelSquare8(coefficients, samples, stride, tx_type, rows, columns, scratch) }
+        return KernelSquare16(coefficients, samples, stride, tx_type, rows, columns, scratch)
+    }
+    if !KernelTransform(coefficients, width, height, tx_type, rows, columns, scratch) { return false }
+    flip_rows := tx_type == 4 || tx_type == 6 || tx_type == 8 || tx_type == 14
+    flip_columns := tx_type == 5 || tx_type == 6 || tx_type == 7 || tx_type == 15
+    KernelAddBlock(scratch.block[:w * h], w, h, samples, stride, flip_rows, flip_columns)
+    return true
+}
+
+// The unflipped row-major Residual of InverseTransform2D for an 8-bit block,
+// read from the coefficient box as InverseTransformAdd8 reads it. residual
+// holds width x height values and may alias coefficients. Returns false,
+// with nothing written, as InverseTransformAdd8 does.
+InverseTransform8 :: (coefficients: []s32, residual: []s32, width: s32, height: s32, tx_type: s32, rows: s64,
+    columns: s64, scratch: *TransformKernelScratch) -> bool {
+    w := cast(s64)width; h := cast(s64)height
+    if w < 4 || w > 64 || h < 4 || h > 64 || residual.count < w * h { return false }
+    if !KernelTransform(coefficients, width, height, tx_type, rows, columns, scratch) { return false }
+    KernelWidenBlock(scratch.block[:w * h], w, h, residual)
+    return true
+}

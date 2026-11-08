@@ -16,8 +16,8 @@ inter, intra-only or hidden frames reject with
 `UnsupportedCapability`. Output matches pinned libaom bit-exactly on the local
 corpus described below, including 275 of the 279 KEY temporal units in
 libaom's pinned decoder test vectors. That is not a full AV1 conformance
-claim. The scalar decoder is still several times slower than libaom and dav1d
-(see Performance baseline below). The avif package imports this package as a dependency; its
+claim. Performance varies by clip (see Performance baseline below). The
+avif package imports this package as a dependency; its
 facade still uses the bridge by default.
 
 Product codec code is handwritten `.zi`. Generated C/Go and portable `.zx`
@@ -108,7 +108,9 @@ in the specification order:
   mapping. Samples outside the frame's MI grid are treated as missing.
 - Loop restoration reads CDEF output inside 64-row stripes. Rows beyond a
   stripe come from the deblocked frame, as the specification requires. It
-  applies each unit's Wiener or self-guided filter.
+  applies each unit's Wiener or self-guided filter. One halo buffer is reused
+  across blocks; each row copies its contiguous samples on SIMD vectors and
+  repeats only the samples beyond the frame edges.
 
 Each enabled filter adds one frame-sized sample buffer to the reserved working
 bytes; identity filters allocate nothing. This function calls no native codec.
@@ -162,12 +164,12 @@ Embedded arrays are intentionally counted again in those separate copies.
 The bound adds 32KiB for scalar helpers and at most six recursive partition
 frames, plus 12,288 bytes for Gaussian-table temporaries. Grain stripe scratch
 is frame heap, `GrainScratchCount(width)` s16 cells reserved with the frame.
-The current logical codec bound is 458,690 bytes.
+The current logical codec bound is 450,898 bytes.
 
 The native local test recompiles the actual generated translation units with
 `-O2 -fstack-usage`. Summing every nonrecursive function frame together and
 adding six extra copies of the largest recursive frame gives a separate native
-stack bound, currently 583,000 bytes. Both bounds must fit the 1MiB reservation for the local test to pass. Exact sizes,
+stack bound, currently 744,736 bytes. Both bounds must fit the 1MiB reservation for the local test to pass. Exact sizes,
 copy counts, function evidence and commands are saved in the engine's memory
 receipt. This derivation covers the current scalar intra path, including
 whole-frame grain, and must be recomputed when scratch or kernels expand.
@@ -233,10 +235,11 @@ tests/av1_scalar_kernels.sh` compares 387 signed impulse/random WHT vectors
 against the integer specification and the pinned scalar libaom kernel.
 Both suites run source/saved IR through C, Go, direct VM and ASan/UBSan.
 
-`predict/intra_predict.zi` is the scalar reference for all thirteen intra
+`predict/intra_predict.zi` implements all thirteen intra
 modes at every transform size from 4x4 to 64x64: DC, vertical/horizontal,
 the three directional zones with edge filtering and upsampling, the Smooth
 family, Paeth, the recursive filter-intra predictor and CfL application.
+DC, vertical, horizontal, Smooth and Paeth run on `std/simd` vectors.
 `build-queue -- sh tests/av1_intra_predict.sh` compares it with libaom's
 reconintra functions at all 19 sizes and 8/10/12 bits on source/saved C, Go,
 direct VM and sanitizers.
@@ -432,11 +435,13 @@ unavailable neighbors, and returns a block with stride 8. Center samples must
 be real samples. Bounds, source depth, strengths, direction and damping are
 validated before filtering; errors and cancellation return no committed samples.
 The primary strength accepts the intermediate high-bit-depth values produced
-by normative luma variance adjustment. `CdefFilterPadded` is the filter alone for a validated block padded to 16
-samples per row, written at any output stride; the frame CDEF pass uses it.
-It filters eight samples per `std/simd` `s16x8` vector and is a `#target`
-procedure, so native x86-64 C picks SSE2, SSSE3, SSE4.1 or AVX2 at run time;
-every target gives the same bits.
+by normative luma variance adjustment. `CdefFilterRows` is the filter alone,
+reading a validated block with its halo at any input stride and writing at any
+output stride. Away from the frame edges the frame CDEF pass runs it on the
+frame samples in place; edge blocks pass a buffer padded to 16 samples per row
+with the unavailable markers. It filters sixteen samples per `std/simd`
+`s16x16` vector and is a `#target` procedure, so native x86-64 C picks SSE2,
+SSSE3, SSE4.1 or AVX2 at run time; every target gives the same bits.
 `CdefDirectionOf` is the direction search alone for an 8x8 block of real
 samples, also used by the frame pass.
 
@@ -446,7 +451,9 @@ of the pinned specification. Coverage includes all eight directions, 8/10/12-bit
 samples, four 4/8 block shapes, all 16 missing-halo masks, syntax strengths and
 every between-scale primary strength at higher bit depths. The vectors exercise
 14,326 changed samples. Malformed input, cancellation and inactive output cells
-are verified too.
+are verified too. `CdefFilterRows` must match `FilterCdefBlock` on random
+blocks read in place at a wide stride and from padded windows, leaving every
+sample outside the block unchanged.
 
 `filter/wiener.zi` provides allocation-free `FilterWienerBlock` for blocks up to 8x8.
 It consumes a caller-resolved three-pixel halo and separate horizontal and
@@ -770,8 +777,18 @@ Any failure clears the residual or leaves the samples unchanged; neither
 function allocates. `ReconstructTransformBlock` does both for the frame
 decoder, given the box that holds a block's coefficients. Its passes read
 only that box, rounded up to multiples of 4. A DCT_DCT block with only a DC
-coefficient adds one constant without running either pass. It runs in place
-in the decoder's Dequant buffer, with lanes the tile keeps. Transform-set legality belongs to `transform/transform_type.zi`;
+coefficient adds one constant without running either pass. An 8-bit 8x8
+DCT_DCT block runs `transform/dct8x8.zi`, a typed `#asm` kernel with SSSE3,
+AArch64 and NEON bodies beside a portable Ziran body that gives the same bits;
+it hands back to the general passes when an intermediate leaves 16 bits. The
+box is checked against the Dequant range on vectors. Other 8-bit blocks use
+`transform/kernels_8bit.zi` on eight 16-bit lanes, and 10-bit blocks use
+`transform/kernels_highbit.zi` on four 32-bit lanes. Their written-out passes
+fuse residual addition, flips and clipping, and reject unsupported intermediate
+ranges before changing the samples. Rejected blocks and 12-bit blocks use the
+general passes. `ReconstructionScratch` retains the packed blocks and the
+general lane in the tile; `InverseTransform2D` keeps its separate reference
+path. Transform-set legality belongs to `transform/transform_type.zi`;
 these kernels accept every computable direction/length combination.
 
 `build-queue -- sh tests/av1_inverse_transform.sh` builds the pinned libaom
@@ -786,8 +803,17 @@ input, aliasing, ignored high-frequency cells, flips, clipping and cancellation.
 `ReconstructTransformBlock` must match `InverseTransform2D` then `AddResidual`
 on every size and depth. Cases include DC-only boxes (DCT_DCT and other types,
 small and extreme DCs) and random boxes of small and range-filling values
-under random legal types, with garbage outside each rounded box.
+under random legal types, with garbage outside each rounded box. The 8x8
+kernel must match an s64 reference of both passes, separate and in place, and
+hand back exactly the inputs whose intermediates leave 16 bits; the vector
+range check must agree with a scalar one at every box edge.
+The suite also runs the standalone 8-bit and 10-bit kernel tests across native
+SIMD tiers 1–4, saved IR, Go and the portable VM, including dirty coefficient
+boxes, aliased residuals and unchanged outputs when a kernel rejects.
 Source and saved IR run in C, Go and the direct VM, and under ASan/UBSan. The
+C forms are also built with `-DZIRAN_ASM_CHECK`, which runs every assembly
+variant beside its portable body and fails on a difference, at the native
+tier and with SSE2 forced. The
 frame decoder calls these kernels for every lossy transform block.
 
 ## Reproducible local tests
@@ -971,14 +997,50 @@ Then, on Ziran giving each `#target` clone its own tier's copy of every
 - `filter/deblock.zi`: the frame keeps its filter taps, so no edge clears
   them.
 
-It now takes 5 to 117 ms per frame, the medians of the fastest of three
-benchmark runs on a busy machine: 0.8 to 2.2 times libaom and 1.5 to 4.6 times
-dav1d. The screen-content clip decodes faster than libaom. Entropy decoding is
-the largest remaining cost. The generated C still bounds-checks indices it
+Then, on Ziran's typed `#asm` blocks and wider vectors:
+
+- `transform/dct8x8.zi`: 8-bit 8x8 DCT_DCT blocks run both passes in one
+  SSSE3 or NEON kernel, and the coefficient box is range-checked on vectors.
+- `filter/cdef.zi`: the filter reads the frame in place away from its edges
+  and runs sixteen samples per `s16x16` vector.
+- `predict/intra_predict.zi`: DC, vertical, horizontal, Smooth and Paeth
+  prediction, the edge copy and the edge check run on vectors.
+- `predict/cfl.zi`: CfL reads the reconstructed luma in place and averages
+  and applies it on vectors.
+
+The packed transform kernels additionally use retained 16-bit or 32-bit blocks
+and fuse sample addition. The 8-bit 4x4, 8x8 and 16x16 square paths retain
+their lanes across both passes. The frame loop filter calls the packed deblocking
+kernel directly, and loop restoration copies halo interiors on vectors into a
+reused buffer.
+
+Coefficient decoding also uses packed neighbor contexts, loops specialized by
+transform class and direct two-, three- and four-symbol CDF paths.
+
+On 2026-11-07, the decoder took 4.1 to 98.1 ms per frame on the
+Ryzen 9 9950X, using the package's pinned Ziran toolchain, GCC 14.2, `-O3`,
+one thread and CPU 2. These are medians
+from one benchmark run on a busy machine; every sample hash matched both
+native decoders:
+
+| Clip | Authored (ms) | libaom (ms) | dav1d (ms) | Authored / libaom |
+| --- | ---: | ---: | ---: | ---: |
+| 1080p 8-bit 4:2:0 q20 | 98.12 | 87.23 | 40.94 | 1.12 |
+| 1080p 8-bit 4:2:0 q40 | 35.69 | 19.03 | 8.80 | 1.87 |
+| 1080p 10-bit 4:2:0 q30 | 92.38 | 65.95 | 36.61 | 1.40 |
+| 720p 8-bit 4:4:4 q30 | 66.76 | 52.82 | 29.01 | 1.26 |
+| 720p 8-bit 4:2:0 screen q30 | 23.59 | 32.38 | 16.44 | 0.73 |
+| 352x288 8-bit 4:2:0 q30 | 4.12 | 3.22 | 1.63 | 1.28 |
+
+The screen-content clip decodes faster than libaom. The other five remain
+above the target of at most libaom's time; the largest gap is 1.87 times
+libaom, and authored times are 1.4 to 4.1 times dav1d. The generated C still
+bounds-checks indices it
 cannot prove, such as row times stride, and calls the symbol decoder out of
-line. CDEF, the inverse transforms, deblocking and self-guided restoration are
-the only hand-written SIMD paths; no thread, other machine, cold start or
-energy figure has been measured.
+line. The 8x8 inverse DCT is the only assembly; CDEF, the inverse transforms,
+deblocking, self-guided restoration and the simple intra predictors and CfL
+are the `std/simd` paths. No thread, other machine, cold start or energy
+figure has been measured.
 
 ## Specification and provenance
 
