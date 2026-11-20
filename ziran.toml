@@ -3,14 +3,14 @@ name = "av1"
 module_roots = ["src"]
 
 [toolchain]
-git = "https://github.com/ziranlang/ziran.git"
+git = "https://git.waozi.xyz/ziranlang/ziran.git"
 ref = "9f42cf010fc48bec9fa8aa87d928fe032f2c719f"
 
 [exports]
 decoder = "src/decoder.zi"
 
 [dependencies.image_codec]
-git = "https://github.com/ziranlang/image-codec.git"
+git = "https://git.waozi.xyz/ziranlang/image-codec.git"
 ref = "360553150917f352e49e1beb78917370792ccaef"
 
 # Test oracle only; no product module links it.

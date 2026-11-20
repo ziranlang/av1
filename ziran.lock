@@ -2,14 +2,6 @@
   "format": 1,
   "packages": [
     {
-      "commit": "360553150917f352e49e1beb78917370792ccaef",
-      "dependencies": {},
-      "id": "p69c0e968ae5735d9",
-      "name": "image-codec",
-      "ref": "360553150917f352e49e1beb78917370792ccaef",
-      "url": "https://github.com/ziranlang/image-codec.git"
-    },
-    {
       "commit": "b141d9c45db236335351c8a4b2a14b3ade27c937",
       "dependencies": {},
       "id": "p74ab3cb6eb3b86fa",
@@ -26,16 +18,24 @@
       "ref": "54706fc6bc0cdecab7e9593974a4039cc038fca7",
       "source": true,
       "url": "https://github.com/videolan/dav1d.git"
+    },
+    {
+      "commit": "360553150917f352e49e1beb78917370792ccaef",
+      "dependencies": {},
+      "id": "pfe0d72921e7aaac1",
+      "name": "image-codec",
+      "ref": "360553150917f352e49e1beb78917370792ccaef",
+      "url": "https://git.waozi.xyz/ziranlang/image-codec.git"
     }
   ],
   "root": {
-    "dependencies": {"dav1d": "pb24767b9eb34d961", "image_codec": "p69c0e968ae5735d9", "libaom": "p74ab3cb6eb3b86fa"},
+    "dependencies": {"dav1d": "pb24767b9eb34d961", "image_codec": "pfe0d72921e7aaac1", "libaom": "p74ab3cb6eb3b86fa"},
     "dependency_refs": {"dav1d": "54706fc6bc0cdecab7e9593974a4039cc038fca7", "image_codec": "360553150917f352e49e1beb78917370792ccaef", "libaom": "b141d9c45db236335351c8a4b2a14b3ade27c937"},
     "name": "av1"
   },
   "toolchain": {
     "commit": "9f42cf010fc48bec9fa8aa87d928fe032f2c719f",
     "ref": "9f42cf010fc48bec9fa8aa87d928fe032f2c719f",
-    "url": "https://github.com/ziranlang/ziran.git"
+    "url": "https://git.waozi.xyz/ziranlang/ziran.git"
   }
 }
