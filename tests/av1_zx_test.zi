@@ -1,0 +1,73 @@
+// Unified pure-Ziran AV1 test suite for the ZX native target.
+// Compiles once and runs all self-contained AV1 unit, kernel, filter, grain,
+// transform, syntax, entropy, and decoder parity suites without Bash/Python glue.
+EngineParity :: #import "av1_engine_parity";
+ObuRange :: #import "av1_obu_range";
+Headers :: #import "av1_headers";
+KeyHeaders :: #import "av1_key_headers";
+EntropyTiles :: #import "av1_entropy_tiles";
+CoeffSymbols :: #import "av1_coefficient_symbols";
+CoeffBlock :: #import "av1_coefficient_block";
+CoeffCdfData :: #import "av1_coefficient_cdf_data";
+CoeffCdfs :: #import "av1_coefficient_cdfs";
+CoeffContext :: #import "av1_coefficient_context";
+CoeffNeighbors :: #import "av1_coefficient_neighbors";
+CoeffScan :: #import "av1_coefficient_scan";
+Quantization :: #import "av1_quantization";
+ScalarKernels :: #import "av1_scalar_kernels";
+TransformType :: #import "av1_transform_type";
+InverseTransform :: #import "av1_inverse_transform";
+TransformKernels :: #import "av1_transform_kernels";
+TransformKernelsHighbit :: #import "av1_transform_kernels_highbit";
+IntraPredict :: #import "av1_intra_predict";
+FilterIntra :: #import "av1_filter_intra";
+Palette :: #import "av1_palette";
+Deblock :: #import "av1_deblock";
+Cdef :: #import "av1_cdef";
+Wiener :: #import "av1_wiener";
+Sgr :: #import "av1_sgr";
+GrainParams :: #import "av1_grain_params";
+GrainScaling :: #import "av1_grain_scaling";
+GrainNoise :: #import "av1_grain_noise";
+GrainApply :: #import "av1_grain_apply";
+
+#program_export
+main :: () -> s32 {
+    if EngineParity.main() != 0 { return 1 }
+    if ObuRange.main() != 0 { return 2 }
+    if Headers.main() != 0 { return 3 }
+    if KeyHeaders.KeyHeaderBoundaries() != 0 { return 4 }
+    if EntropyTiles.main() != 0 { return 5 }
+    if CoeffSymbols.main() != 0 { return 6 }
+    if CoeffBlock.CoefficientBlockBoundaries() != 0 { return 7 }
+    if CoeffCdfData.CDFDataBoundaries() != 0 { return 8 }
+    if CoeffCdfs.CDFBoundaries() != 0 { return 9 }
+    if CoeffContext.ContextBoundaries() != 0 { return 10 }
+    if CoeffNeighbors.CoefficientNeighborBoundaries() != 0 { return 11 }
+    if CoeffScan.ScanBoundaries() != 0 { return 12 }
+    if Quantization.QuantizationBoundaries() != 0 { return 13 }
+    if ScalarKernels.ScalarKernelBounds() != 0 { return 14 }
+    if TransformType.TransformTypeBoundaries() != 0 { return 15 }
+    if InverseTransform.InverseTransformBoundaries() != 0 { return 16 }
+    if InverseTransform.CoefficientRanges() != 0 { return 17 }
+    if InverseTransform.Dct8Kernel() != 0 { return 18 }
+    if InverseTransform.VectorResidualRows() != 0 { return 19 }
+    if InverseTransform.BoxReconstruction() != 0 { return 20 }
+    if TransformKernels.PortableMain() != 0 { return 21 }
+    if TransformKernelsHighbit.PortableMain() != 0 { return 22 }
+    if IntraPredict.IntraIndexSweep() != 0 { return 23 }
+    if IntraPredict.IntraPredictBoundaries() != 0 { return 24 }
+    if IntraPredict.CflBoundaries() != 0 { return 25 }
+    if FilterIntra.FilterIntraBoundaries() != 0 { return 26 }
+    if Palette.PaletteBoundaries() != 0 { return 27 }
+    if Deblock.DeblockBoundaries() != 0 { return 28 }
+    if Deblock.DeblockLinesBoundaries() != 0 { return 29 }
+    if Cdef.CdefBoundaries() != 0 { return 30 }
+    if Wiener.WienerBoundaries() != 0 { return 31 }
+    if Sgr.SgrBoundaries() != 0 { return 32 }
+    if GrainParams.GrainParameterBounds() != 0 { return 33 }
+    if GrainScaling.GrainScalingBounds() != 0 { return 34 }
+    if GrainNoise.GrainNoiseBounds() != 0 { return 35 }
+    if GrainApply.GrainApplyBounds() != 0 { return 36 }
+    return 0
+}
