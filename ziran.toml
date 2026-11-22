@@ -1,6 +1,6 @@
 [package]
 name = "av1"
-module_roots = ["src"]
+module_roots = ["src", "src/decode", "src/entropy", "src/filter", "src/grain", "src/predict", "src/syntax", "src/transform"]
 
 [toolchain]
 git = "https://git.waozi.xyz/ziranlang/ziran.git"
