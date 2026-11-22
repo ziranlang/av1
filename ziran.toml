@@ -4,14 +4,14 @@ module_roots = ["src"]
 
 [toolchain]
 git = "https://git.waozi.xyz/ziranlang/ziran.git"
-ref = "9f42cf010fc48bec9fa8aa87d928fe032f2c719f"
+ref = "5db3d3c39425d5dfe4bfe4a84e6f6e2e5a810ad0"
 
 [exports]
 decoder = "src/decoder.zi"
 
 [dependencies.image_codec]
 git = "https://git.waozi.xyz/ziranlang/image-codec.git"
-ref = "360553150917f352e49e1beb78917370792ccaef"
+ref = "3017f0d1cc56975aa29c600a1f55a62e1193cf7b"
 
 # Test oracle only; no product module links it.
 [dependencies.libaom]

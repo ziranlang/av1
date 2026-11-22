@@ -2,6 +2,15 @@
   "format": 1,
   "packages": [
     {
+      "commit": "3017f0d1cc56975aa29c600a1f55a62e1193cf7b",
+      "checked": {"profile": "default", "sha256": "977dd8832c2c660bbc40ff20d704557939cccf6818c29b3d9402d737590d869d", "toolchain": "pb6607dd27b15499f"},
+      "dependencies": {},
+      "id": "p115fee450ee07367",
+      "name": "image-codec",
+      "ref": "3017f0d1cc56975aa29c600a1f55a62e1193cf7b",
+      "url": "https://git.waozi.xyz/ziranlang/image-codec.git"
+    },
+    {
       "commit": "b141d9c45db236335351c8a4b2a14b3ade27c937",
       "dependencies": {},
       "id": "p74ab3cb6eb3b86fa",
@@ -18,24 +27,16 @@
       "ref": "54706fc6bc0cdecab7e9593974a4039cc038fca7",
       "source": true,
       "url": "https://github.com/videolan/dav1d.git"
-    },
-    {
-      "commit": "360553150917f352e49e1beb78917370792ccaef",
-      "dependencies": {},
-      "id": "pfe0d72921e7aaac1",
-      "name": "image-codec",
-      "ref": "360553150917f352e49e1beb78917370792ccaef",
-      "url": "https://git.waozi.xyz/ziranlang/image-codec.git"
     }
   ],
   "root": {
-    "dependencies": {"dav1d": "pb24767b9eb34d961", "image_codec": "pfe0d72921e7aaac1", "libaom": "p74ab3cb6eb3b86fa"},
-    "dependency_refs": {"dav1d": "54706fc6bc0cdecab7e9593974a4039cc038fca7", "image_codec": "360553150917f352e49e1beb78917370792ccaef", "libaom": "b141d9c45db236335351c8a4b2a14b3ade27c937"},
+    "dependencies": {"dav1d": "pb24767b9eb34d961", "image_codec": "p115fee450ee07367", "libaom": "p74ab3cb6eb3b86fa"},
+    "dependency_refs": {"dav1d": "54706fc6bc0cdecab7e9593974a4039cc038fca7", "image_codec": "3017f0d1cc56975aa29c600a1f55a62e1193cf7b", "libaom": "b141d9c45db236335351c8a4b2a14b3ade27c937"},
     "name": "av1"
   },
   "toolchain": {
-    "commit": "9f42cf010fc48bec9fa8aa87d928fe032f2c719f",
-    "ref": "9f42cf010fc48bec9fa8aa87d928fe032f2c719f",
+    "commit": "5db3d3c39425d5dfe4bfe4a84e6f6e2e5a810ad0",
+    "ref": "5db3d3c39425d5dfe4bfe4a84e6f6e2e5a810ad0",
     "url": "https://git.waozi.xyz/ziranlang/ziran.git"
   }
 }

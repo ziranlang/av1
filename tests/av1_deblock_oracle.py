@@ -122,6 +122,21 @@ def reference(source,length,blimit,limit,threshold,depth):
     return output,[bool(enabled),hev,flat,wide]
 
 
+def write_vectors(root, out, groups):
+    out.mkdir(parents=True, exist_ok=True)
+    module = os.path.relpath(root/'src/filter/deblock.zi', out)
+    bounds = os.path.relpath(root/'tests/av1_deblock.zi', out)
+    lines = ['#import, file "'+module+'";', '#import, file "'+bounds+'";', 'using Codec :: #import "image_codec/api"',
+             '#program_export', 'main :: () -> s32 {', '    if DeblockBoundaries() != 0 { return 99 }',
+             '    if DeblockLinesBoundaries() != 0 { return 98 }']
+    for name, code, _ in groups:
+        lines.append(f'    if {name}() != 0 {{ return {code} }}')
+    lines += ['    return 0', '}']
+    for name, _, body in groups:
+        lines += [f'{name} :: () -> s32 {{', *body, '    return 0', '}']
+    (out/'av1_deblock_vectors.zi').write_text('\n'.join(lines)+'\n')
+
+
 def main():
     parser = argparse.ArgumentParser()
     for name in ('root','out','aom'):
@@ -197,40 +212,43 @@ def main():
             raise SystemExit(f'native/spec four-line deblock disagreement at {i}')
     if mixed == 0:
         raise SystemExit('four-line deblock segments never mix line decisions')
-    module = os.path.relpath(a.root/'src/filter/deblock.zi',a.out)
-    bounds = os.path.relpath(a.root/'tests/av1_deblock.zi',a.out)
-    lines = ['#import, file "'+module+'";','#import, file "'+bounds+'";','using Codec :: #import "image_codec/api"',
-             '#program_export','main :: () -> s32 {','    if DeblockBoundaries() != 0 { return 99 }',
-             '    if DeblockLinesBoundaries() != 0 { return 98 }']
-    groups = (len(cases)+15)//16
-    for group in range(groups):
-        lines.append(f'    if Group{group}() != 0 {{ return {group+1} }}')
-    line_groups = (len(segments)+15)//16
-    for group in range(line_groups):
-        lines.append(f'    if Lines{group}() != 0 {{ return {groups+group+1} }}')
-    lines += ['    return 0','}']
-    for group in range(groups):
-        lines.append(f'Group{group} :: () -> s32 {{')
+    edge_groups = []
+    for group in range((len(cases)+15)//16):
+        body = []
         for c in cases[group*16:(group+1)*16]:
             checks = ' || '.join('result.'+name+' != '+str(flag).lower() for name,flag in zip(('filter_enabled','high_variance','flat','wide'),c['flags']))
-            lines += ['    {','        input: [16]u16 = .['+','.join(map(str,c['source']))+']',
-                      f'        result := FilterDeblockEdge(input[:], {c["length"]}, {c["blimit"]}, {c["limit"]}, {c["threshold"]}, {c["depth"]})',
-                      '        expected: [16]u16 = .['+','.join(map(str,c['expected']))+']',
-                      f'        if result.error.code != DecodeOK || {checks} {{ return 1 }}',
-                      '        for j: 0..15 { if result.samples[j] != expected[j] { return 2 } }','    }']
-        lines += ['    return 0','}']
-    for group in range(line_groups):
-        lines.append(f'Lines{group} :: () -> s32 {{')
+            body += ['    {','        input: [16]u16 = .['+','.join(map(str,c['source']))+']',
+                     f'        result := FilterDeblockEdge(input[:], {c["length"]}, {c["blimit"]}, {c["limit"]}, {c["threshold"]}, {c["depth"]})',
+                     '        expected: [16]u16 = .['+','.join(map(str,c['expected']))+']',
+                     f'        if result.error.code != DecodeOK || {checks} {{ return 1 }}',
+                     '        for j: 0..15 { if result.samples[j] != expected[j] { return 2 } }','    }']
+        edge_groups.append((f'Group{group}', group+1, body))
+    line_groups = []
+    for group in range((len(segments)+15)//16):
+        body = []
         for c in segments[group*16:(group+1)*16]:
-            lines += ['    {','        lines: [64]u16 = .['+','.join(map(str,sum(c['lines'],[])))+']',
-                      '        expected: [64]u16 = .['+','.join(map(str,c['expected']))+']',
-                      f'        if DeblockLinesCase(lines[:], expected[:], {c["length"]}, {c["blimit"]}, {c["limit"]}, {c["threshold"]}, {c["depth"]}) != 0 {{ return 1 }}',
-                      '    }']
-        lines += ['    return 0','}']
-    (a.out/'av1_deblock_vectors.zi').write_text('\n'.join(lines)+'\n')
+            body += ['    {','        lines: [64]u16 = .['+','.join(map(str,sum(c['lines'],[])))+']',
+                     '        expected: [64]u16 = .['+','.join(map(str,c['expected']))+']',
+                     f'        if DeblockLinesCase(lines[:], expected[:], {c["length"]}, {c["blimit"]}, {c["limit"]}, {c["threshold"]}, {c["depth"]}) != 0 {{ return 1 }}',
+                     '    }']
+        line_groups.append((f'Lines{group}', len(edge_groups)+group+1, body))
+    write_vectors(a.root, a.out, edge_groups + line_groups)
+
+    # Engine lowering must fit its allocation budget. Keep each bundle to at
+    # most 768 edges and 256 segments, using the same bodies as the full test.
+    shards = []
+    edge_chunk, line_chunk = 48, 16
+    starts = zip(range(0, len(edge_groups), edge_chunk), range(0, len(line_groups), line_chunk), strict=True)
+    for shard, (edge, line) in enumerate(starts):
+        directory = f'engine-{shard}'
+        groups = edge_groups[edge:edge+edge_chunk] + line_groups[line:line+line_chunk]
+        write_vectors(a.root, a.out/directory, groups)
+        shards.append(dict(directory=directory, vectors=min(16*edge_chunk, len(cases)-16*edge),
+                           line_segments=min(16*line_chunk, len(segments)-16*line)))
     (a.out/'oracle.json').write_text(json.dumps(dict(revision=PIN,library_sha256=digest(library),host_sha256=hashlib.sha256(HOST.encode()).hexdigest(),
         lines_host_sha256=hashlib.sha256(LINES_HOST.encode()).hexdigest(),
         vectors=len(cases),line_segments=len(segments),mixed_decision_segments=mixed,depths=[8,10,12],filter_lengths=[4,6,8,14],native_orientations=['horizontal','vertical'],coverage=counts,
+        engine_shards=shards,
         scope='standalone edge masks/narrow/wide math, one line and four-line segments; no frame boundary/threshold scheduling or encoded-frame conformance'),indent=2)+'\n')
     print(f'Pinned deblock oracle: {len(cases)} vectors, {len(segments)} four-line segments ({mixed} with mixed line decisions), '
           f'horizontal/vertical parity, {counts["changed_samples"]} changed samples')
