@@ -59,7 +59,7 @@ for form in source saved; do
     printf 'package main\nfunc main() { if r := Av1ConformanceVectors_Main(); r != 0 { panic(r) } }\n' > "$group/$form-go/main.go"
     (cd "$group/$form-go" && GO111MODULE=off go build -o run . && ./run)
     "$ziran" bundle --entry "$module:main" "$@" -o "$group/$form.zx" "$input"
-    test "$("$bin/zi2zx" run --vm "$group/$form.zx")" = 0
+    test "$("$bin/zi2zx" run --backend engine "$group/$form.zx")" = 0
 done
 CFLAGS='-O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer' LDFLAGS='-fsanitize=address,undefined' \
     "$ziran" build --target=c --exe --entry "$module:main" --root "$group" \
@@ -93,7 +93,7 @@ python3 - "$out" <<'PY'
 import json,pathlib,sys
 out=pathlib.Path(sys.argv[1]);receipt=json.loads((out/'oracle.json').read_text())
 receipt.update(command='build-queue -- sh tests/av1_conformance.sh',exit_code=0,
-    forms=['source','saved IR'],targets=['C','Go','zi2zx run --vm'],sanitizers=['ASan','UBSan'],sanitizer_optimization='-O1')
+    forms=['source','saved IR'],targets=['C','Go','zi2zx run --backend engine'],sanitizers=['ASan','UBSan'],sanitizer_optimization='-O1')
 (out/'receipt.json').write_text(json.dumps(receipt,indent=2)+'\n')
 PY
 printf '%s\n' 'AV1 conformance: pinned libaom test-vector KEY units bit-exact or UnsupportedCapability as pinned, source/saved C/Go/VM + ASan/UBSan passed'

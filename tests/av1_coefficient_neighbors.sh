@@ -34,7 +34,7 @@ while IFS= read -r module; do
         "$ziran" build --target=c --exe --entry "$module:main" "$@" -o "$out/$module/$form" "$input"
         "$out/$module/$form/$module"
         "$ziran" bundle --entry "$module:main" "$@" -o "$out/$module/$form.zx" "$input"
-        test "$("$bin/zi2zx" run --vm "$out/$module/$form.zx")" = 0
+        test "$("$bin/zi2zx" run --backend engine "$out/$module/$form.zx")" = 0
         "$ziran" build --target=go --pkg main --entry "$module:main" "$@" -o "$out/$module/$form-go" "$input"
         printf 'package main\nfunc main() { if Av1CoefficientNeighborVectors%s_Main() != 0 { panic("AV1 coefficient neighbor contexts") } }\n' "${module##*_}" > "$out/$module/$form-go/main.go"
         (cd "$out/$module/$form-go" && GO111MODULE=off go build -o run . && ./run)
@@ -57,7 +57,7 @@ for name,expected in inputs.items():
         for block in iter(lambda:f.read(1024*1024),b''):h.update(block)
     if h.hexdigest()!=expected:raise SystemExit('Coefficient neighbor input changed during run: '+name)
 receipt.update(command='build-queue -- sh tests/av1_coefficient_neighbors.sh',exit_code=0,
-    forms=['source','saved IR'],targets=['C','Go','zi2zx run --vm'],sanitizers=['ASan','UBSan'],sanitizer_optimization='-O0',
+    forms=['source','saved IR'],targets=['C','Go','zi2zx run --backend engine'],sanitizers=['ASan','UBSan'],sanitizer_optimization='-O0',
     inputs=inputs,inputs_unchanged=True,native_invalid_descriptors=38,native_empty_spans=True,native_abi_optimization='-O1')
 (out/'receipt.json').write_text(json.dumps(receipt,indent=2)+'\n')
 PY

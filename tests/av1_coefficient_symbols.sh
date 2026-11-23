@@ -13,7 +13,7 @@ for form in source saved; do
     "$ziran" build --target=c --exe --entry "$module:main" "$@" -o "$out/$form" "$input"
     "$out/$form/$module"
     "$ziran" bundle --entry "$module:main" "$@" -o "$out/$form.zx" "$input"
-    test "$("$bin/zi2zx" run --vm "$out/$form.zx")" = 0
+    test "$("$bin/zi2zx" run --backend engine "$out/$form.zx")" = 0
     "$ziran" build --target=go --pkg main --entry "$module:main" "$@" -o "$out/$form-go" "$input"
     printf 'package main\nfunc main() { if Av1CoefficientSymbols_Main() != 0 { panic("AV1 coefficient symbols") } }\n' > "$out/$form-go/main.go"
     (cd "$out/$form-go" && GO111MODULE=off go build -o run . && ./run)

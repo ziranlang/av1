@@ -44,7 +44,7 @@ while IFS= read -r module; do
         "$out/$module/$form-asm-check/$module"
         ZIRAN_SIMD_TIER=1 "$out/$module/$form-asm-check/$module"
         "$ziran" bundle --entry "$module:main" "$@" -o "$out/$module/$form.zx" "$input"
-        test "$("$bin/zi2zx" run --vm "$out/$module/$form.zx")" = 0
+        test "$("$bin/zi2zx" run --backend engine "$out/$module/$form.zx")" = 0
         "$ziran" build --target=go --pkg main --entry "$module:main" "$@" -o "$out/$module/$form-go" "$input"
         printf 'package main\nfunc main() { if Av1InverseTransformVectors%s_Main() != 0 { panic("AV1 inverse transforms") } }\n' "${module##*_}" > "$out/$module/$form-go/main.go"
         (cd "$out/$module/$form-go" && GO111MODULE=off go build -o run . && ./run)
@@ -64,7 +64,7 @@ for name,expected in inputs.items():
         for block in iter(lambda:f.read(1024*1024),b''):h.update(block)
     if h.hexdigest()!=expected:raise SystemExit('Inverse transform input changed during run: '+name)
 receipt.update(command='build-queue -- sh tests/av1_inverse_transform.sh',exit_code=0,
-    forms=['source','saved IR'],targets=['C','C -DZIRAN_ASM_CHECK','Go','zi2zx run --vm'],sanitizers=['ASan','UBSan'],sanitizer_optimization='-O0',
+    forms=['source','saved IR'],targets=['C','C -DZIRAN_ASM_CHECK','Go','zi2zx run --backend engine'],sanitizers=['ASan','UBSan'],sanitizer_optimization='-O0',
     inputs=inputs,inputs_unchanged=True,
     scope='scalar 2D inverse transforms and flipped Clip1 addition against pinned libaom; frame integration pending')
 (out/'receipt.json').write_text(json.dumps(receipt,indent=2)+'\n')
